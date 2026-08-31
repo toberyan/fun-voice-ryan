@@ -13,10 +13,13 @@ from fun_voice.preflight import (
     RECOVERY_TOKENS,
     STATUS_FAIL,
     STATUS_PASS,
+    CheckResult,
     PreflightReport,
     check_vllm_xpu_decoder,
+    check_worker_health,
     detect_cpu_fallback,
     load_nano_engine,
+    probe_worker_health,
     run_preflight,
 )
 
@@ -125,8 +128,13 @@ def _run(**kwargs: Any) -> PreflightReport:
         engine = kwargs.pop("engine")
     short = kwargs.pop("short", "short.wav")
     long = kwargs.pop("long", "long.wav")
+    worker_health = kwargs.pop("worker_health", None)
     return run_preflight(
-        torch=torch, engine=engine, short_sample=short, long_sample=long
+        torch=torch,
+        engine=engine,
+        short_sample=short,
+        long_sample=long,
+        worker_health=worker_health,
     )
 
 
@@ -273,3 +281,109 @@ def test_load_nano_engine_passes_triton_attn_backend(
     assert captured["device"] == "xpu:0"
     assert captured["dtype"] == "bf16"
     assert captured["vllm_kwargs"] == {"attention_backend": "TRITON_ATTN"}
+
+
+def test_check_worker_health_pass() -> None:
+    result = check_worker_health(
+        {
+            "status": "ok",
+            "version": "1.0",
+            "model_ready": True,
+            "xpu_ready": True,
+            "device": "xpu",
+            "last_error": None,
+        }
+    )
+    assert result.status == STATUS_PASS
+    assert result.detail["device"] == "xpu"
+
+
+def test_check_worker_health_fails_when_model_not_ready() -> None:
+    result = check_worker_health(
+        {
+            "status": "ok",
+            "version": "1.0",
+            "model_ready": False,
+            "xpu_ready": True,
+            "device": "xpu",
+            "last_error": "worker/internal",
+        }
+    )
+    assert result.status == STATUS_FAIL
+
+
+class _FakeConn:
+    def __init__(self, response: bytes) -> None:
+        self._response = response
+        self.sent = bytearray()
+
+    def settimeout(self, _timeout: float) -> None:
+        pass
+
+    def connect(self, _path: str) -> None:
+        pass
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.extend(data)
+
+    def recv(self, _n: int) -> bytes:
+        if self._response:
+            chunk = self._response
+            self._response = b""
+            return chunk
+        return b""
+
+    def __enter__(self) -> _FakeConn:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+
+def test_probe_worker_health_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _FakeConn(
+        b'{"status":"ok","model_ready":true,"xpu_ready":true,"device":"xpu"}\n'
+    )
+    monkeypatch.setattr("socket.socket", lambda *a, **k: conn)
+    result = probe_worker_health("/tmp/fake.sock")
+    assert result.status == STATUS_PASS
+    assert result.detail["device"] == "xpu"
+    assert conn.sent == b'{"op":"health"}\n'
+
+
+def test_probe_worker_health_connection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingConn(_FakeConn):
+        def connect(self, _path: str) -> None:
+            raise ConnectionRefusedError("no worker")
+
+    monkeypatch.setattr("socket.socket", lambda *a, **k: _FailingConn(b""))
+    result = probe_worker_health("/tmp/fake.sock")
+    assert result.status == STATUS_FAIL
+    assert result.detail["error_class"] == "ConnectionRefusedError"
+
+
+def test_probe_worker_health_requires_xdg_runtime_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    result = probe_worker_health()
+    assert result.status == STATUS_FAIL
+    assert result.detail["reason"] == "XDG_RUNTIME_DIR not set"
+
+
+def test_run_preflight_ready_false_when_worker_unhealthy() -> None:
+    worker_health = CheckResult("worker_health", STATUS_FAIL, {"reason": "down"})
+    report = _run(worker_health=worker_health)
+    assert report.ready is False
+    assert report.worker_health is not None
+    assert report.worker_health.status == STATUS_FAIL
+
+
+def test_run_preflight_ready_true_when_worker_healthy() -> None:
+    worker_health = CheckResult("worker_health", STATUS_PASS, {})
+    report = _run(worker_health=worker_health)
+    assert report.ready is True
+    assert report.worker_health is not None
+    assert report.worker_health.status == STATUS_PASS

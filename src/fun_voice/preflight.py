@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,11 @@ DECODE_TOKENS_60S = 256
 RECOVERY_TOKENS = 64
 PROBE_BYTES = 1 << 20  # 1 MiB allocator probe
 
+# Worker health probe (only exercised with --require-live-worker).
+WORKER_SOCKET_RELATIVE = "fun-voice-ryan/worker.sock"
+WORKER_HEALTH_TIMEOUT_S = 5.0
+WORKER_HEALTH_MAX_BYTES = 64 * 1024
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -56,7 +63,6 @@ class CheckResult:
     status: str
     detail: dict[str, Any] = field(default_factory=dict)
 
-
 @dataclass(frozen=True)
 class PreflightReport:
     """Aggregate of all hard-gate checks plus the overall ready verdict."""
@@ -64,13 +70,17 @@ class PreflightReport:
     device: str
     checks: tuple[CheckResult, ...]
     ready: bool
+    worker_health: CheckResult | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "device": self.device,
             "ready": self.ready,
             "checks": [asdict(check) for check in self.checks],
         }
+        if self.worker_health is not None:
+            data["worker_health"] = asdict(self.worker_health)
+        return data
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
@@ -233,6 +243,74 @@ def check_no_cpu_fallback(engine: Any) -> CheckResult:
     )
 
 
+def check_worker_health(response: Mapping[str, Any]) -> CheckResult:
+    """Convert a worker health response into a pass/fail check (pure)."""
+    detail: dict[str, Any] = {
+        "status": response.get("status"),
+        "version": response.get("version"),
+        "model_ready": response.get("model_ready"),
+        "xpu_ready": response.get("xpu_ready"),
+        "device": response.get("device"),
+        "last_error": response.get("last_error"),
+    }
+    ok = (
+        response.get("status") == "ok"
+        and response.get("model_ready") is True
+        and response.get("xpu_ready") is True
+    )
+    return CheckResult("worker_health", STATUS_PASS if ok else STATUS_FAIL, detail)
+
+
+def _read_socket_line(conn: socket.socket) -> bytes:
+    """Read one newline-terminated line from ``conn`` (bounded)."""
+    buf = bytearray()
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return bytes(buf)
+        buf.extend(chunk)
+        if len(buf) > WORKER_HEALTH_MAX_BYTES:
+            raise RuntimeError("worker health response too large")
+        if b"\n" in buf:
+            line, _sep, _rest = buf.partition(b"\n")
+            return bytes(line)
+
+
+def probe_worker_health(
+    socket_path: str | Path | None = None,
+    *,
+    timeout: float = WORKER_HEALTH_TIMEOUT_S,
+) -> CheckResult:
+    """Probe the worker Unix socket ``op=health`` endpoint; never raises.
+
+    ``socket_path`` defaults to ``$XDG_RUNTIME_DIR/fun-voice-ryan/worker.sock``.
+    Connection, framing, and protocol failures become a fail ``CheckResult``.
+    """
+    if socket_path is None:
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if not xdg:
+            return CheckResult(
+                "worker_health", STATUS_FAIL, {"reason": "XDG_RUNTIME_DIR not set"}
+            )
+        socket_path = Path(xdg) / WORKER_SOCKET_RELATIVE
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(str(socket_path))
+            conn.sendall(b'{"op":"health"}\n')
+            line = _read_socket_line(conn)
+        response = json.loads(line.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "worker_health", STATUS_FAIL, {"error_class": type(exc).__name__}
+        )
+    if not isinstance(response, dict):
+        return CheckResult(
+            "worker_health", STATUS_FAIL, {"error_class": "ProtocolError"}
+        )
+    return check_worker_health(response)
+
+
 def _attempt_oom_allocations(
     torch: Any, device: str, total: int | None
 ) -> tuple[int | None, str | None]:
@@ -301,8 +379,14 @@ def run_preflight(
     short_sample: str | Path,
     long_sample: str | Path,
     device: str = DEVICE,
+    worker_health: CheckResult | None = None,
 ) -> PreflightReport:
-    """Run all nine hard-gate checks and return the aggregate report."""
+    """Run all nine hard-gate checks and return the aggregate report.
+
+    ``worker_health`` (only set under ``--require-live-worker``) is an
+    independent extra check: it does not join the nine hard gates but does
+    gate ``ready``.
+    """
     checks: list[CheckResult] = [
         check_xpu_visible(torch),
         check_vllm_xpu_decoder(engine, torch, device=device),
@@ -319,7 +403,14 @@ def run_preflight(
         check_oom_survives(engine, torch, short_sample, device=device),
     ]
     ready = all(check.status == STATUS_PASS for check in checks)
-    return PreflightReport(device=device, checks=tuple(checks), ready=ready)
+    if worker_health is not None:
+        ready = ready and worker_health.status == STATUS_PASS
+    return PreflightReport(
+        device=device,
+        checks=tuple(checks),
+        ready=ready,
+        worker_health=worker_health,
+    )
 
 
 def load_nano_engine(
@@ -370,10 +461,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.35)
     parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument(
+        "--require-live-worker",
+        action="store_true",
+        help="also probe the live worker socket and require a healthy response",
+    )
     return parser
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    worker_health: CheckResult | None = None
+    if args.require_live_worker:
+        worker_health = probe_worker_health()
     try:
         import torch
 
@@ -390,6 +489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             short_sample=args.short,
             long_sample=args.long,
             device=args.device,
+            worker_health=worker_health,
         )
     except Exception as exc:  # noqa: BLE001
         # Turn any load/run failure into a structured fail report instead of a
@@ -401,6 +501,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for name in CHECK_NAMES
             ),
             ready=False,
+            worker_health=worker_health,
         )
         print(f"preflight error: {type(exc).__name__}: {exc}", file=sys.stderr)
 
@@ -410,6 +511,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for check in report.checks:
         print(f"{check.name}: {check.status}")
+    if report.worker_health is not None:
+        print(f"{report.worker_health.name}: {report.worker_health.status}")
     return 0 if report.ready else 1
 
 
