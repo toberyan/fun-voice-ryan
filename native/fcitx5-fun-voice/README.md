@@ -24,6 +24,11 @@ only. When installing manually, the expected locations are:
 - `~/.local/lib/fcitx5/fcitx5-fun-voice.so`
 - `~/.local/share/fcitx5/addon/fcitx5-fun-voice.conf`
 
+The `Library=` field must be an **absolute** path (without the `.so` suffix):
+Deepin 25's fcitx5 does not resolve a bare relative `Library=` against
+`~/.local/lib/fcitx5`. `scripts/install-user.sh` substitutes `@FCITX_LIB@` with
+the absolute path at install time.
+
 ## Runtime socket
 
 On startup the addon creates `$XDG_RUNTIME_DIR/fun-voice-ryan-fcitx.sock`:
