@@ -58,7 +58,11 @@ def test_data_types_are_frozen() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         seg.text = "改写"
     snap = FocusSnapshot(
-        active_window=1, process_name="app", input_focus=1, monotonic_ns=0
+        active_window=1,
+        process_name="app",
+        input_focus=1,
+        monotonic_ns=0,
+        window_pid=4242,
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         snap.monotonic_ns = 1

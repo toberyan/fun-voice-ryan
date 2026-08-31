@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Fun Voice Ryan 本地语音输入助手"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["python-xlib"]
 
 [project.scripts]
 fun-voice-daemon = "fun_voice.daemon:main"
@@ -47,5 +47,7 @@ module = [
     "funasr.*",
     "modelscope",
     "modelscope.*",
+    "Xlib",
+    "Xlib.*",
 ]
 ignore_missing_imports = true
