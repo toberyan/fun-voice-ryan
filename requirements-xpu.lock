@@ -229,7 +229,7 @@ torchvision==0.28.0+xpu
 tqdm==4.70.0
 transformers==5.16.1
 triton-xpu==3.7.2
-triton==3.8.0
+triton==3.7.2+xpu
 truststore==0.10.4
 typer==0.27.2
 typing-extensions==4.16.0

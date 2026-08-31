@@ -21,6 +21,7 @@ FUNASR_TARBALL="${ROOT_DIR}/.funasr-src.tar.gz"
 PYPI_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
 XPU_INDEX="https://download.pytorch.org/whl/xpu"
 VLLM_INDEX="https://wheels.vllm.ai/nightly/xpu"
+TRITON_SHIM_INDEX="https://wheels.vllm.ai/xpu"
 
 log() { printf '[create-xpu-env] %s\n' "$*"; }
 
@@ -65,6 +66,28 @@ if [[ ! -f "${FUNASR_SRC}/funasr/__init__.py" ]]; then
 fi
 log "安装 FunASR @ ${FUNASR_COMMIT} + modelscope..."
 install_xpu "${FUNASR_SRC}" modelscope
+
+# --- 3.4 triton XPU shim 修复 ------------------------------------------------
+# xgrammar 0.2.3 的 Requires-Dist: triton 会把 PyPI 的 NVIDIA-only triton 3.8.0
+# 拉进环境,其 libtriton.so 不含 intel 后端,覆盖 triton-xpu 3.7.2 的实现,导致
+# vLLM kernel warm-up 在 vllm/v1/worker/block_table.py:195 报
+# "function is not subscriptable"。按 vLLM XPU 文档固定 wheels.vllm.ai/xpu 的
+# triton==3.7.2+xpu shim(纯元数据,Requires-Dist: triton-xpu==3.7.2),透明解析
+# 到真正的 Intel XPU 实现。
+log "应用 triton XPU shim 修复 (triton==3.7.2+xpu)..."
+TRITON_VER="$("${PYTHON}" -c "import importlib.metadata as m; print(m.version('triton'))" 2>/dev/null || true)"
+if [[ "${TRITON_VER}" != "3.7.2+xpu" ]]; then
+    "${UV}" pip uninstall triton --python "${PYTHON}" >/dev/null 2>&1 || true
+    "${UV}" pip install --reinstall-package triton-xpu --no-deps \
+        --python "${PYTHON}" \
+        --index-url "${XPU_INDEX}" \
+        triton-xpu==3.7.2
+    "${UV}" pip install --no-deps --python "${PYTHON}" \
+        --index-url "${TRITON_SHIM_INDEX}" \
+        triton==3.7.2+xpu
+else
+    log "triton shim 已就绪,跳过"
+fi
 
 # --- 3.5 vLLM oneCCL 单卡 warm-up 修复 --------------------------------------
 # vLLM 0.28.0 的 XPUWorker.init_device() 在 world_size==1 时仍做一次 oneCCL
@@ -147,6 +170,28 @@ elif old in text:
 else:
     raise SystemExit("显存探测代码模式未匹配,请检查 vllm 版本")
 PY
+
+# --- 3.7 triton Intel 后端 Level Zero 头文件与库链接修复 -----------------------
+# triton-xpu 的 Intel 后端首次 JIT 编译 driver.c(spirv_utils)时需要
+# <level_zero/ze_api.h> 与 libze_loader.so(通常由 level-zero-dev 提供)。本机只
+# 装了 libze1/libze-intel-gpu1 运行时(无头文件),且不允许 sudo 装 level-zero-dev。
+# 此处从 oneapi-src/level-zero(v1.21.9,匹配 libze1 1.21.9)下载头文件并入
+# .venv/include/level_zero/,并创建 .venv/lib/libze_loader.so 软链。
+LZ_VER="1.21.9"
+if [[ ! -f "${VENV_DIR}/include/level_zero/ze_api.h" ]]; then
+    log "部署 Level Zero 头文件 (v${LZ_VER})..."
+    LZ_TARBALL="${ROOT_DIR}/.level-zero-headers.tar.gz"
+    curl -fsSL "https://codeload.github.com/oneapi-src/level-zero/tar.gz/refs/tags/v${LZ_VER}" \
+        -o "${LZ_TARBALL}"
+    mkdir -p "${VENV_DIR}/include/level_zero"
+    tar xzf "${LZ_TARBALL}" -C "${VENV_DIR}/include/level_zero" --strip-components=2 \
+        "level-zero-${LZ_VER}/include"
+    rm -f "${LZ_TARBALL}"
+fi
+if [[ ! -e "${VENV_DIR}/lib/libze_loader.so" ]]; then
+    log "创建 libze_loader.so 软链..."
+    ln -sf /usr/lib/x86_64-linux-gnu/libze_loader.so.1 "${VENV_DIR}/lib/libze_loader.so"
+fi
 
 # --- 4. 版本与设备信息 ------------------------------------------------------
 log "版本与设备信息:"

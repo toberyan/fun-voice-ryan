@@ -44,7 +44,6 @@ CHECK_NAMES: tuple[str, ...] = (
 DECODE_TOKENS_10S = 128
 DECODE_TOKENS_60S = 256
 RECOVERY_TOKENS = 64
-OOM_PROBE_TOKENS = 1 << 20  # far beyond max_model_len / reserved KV cache
 PROBE_BYTES = 1 << 20  # 1 MiB allocator probe
 
 
@@ -257,30 +256,26 @@ def check_oom_survives(
     """Induce OOM, then prove the worker still serves a short decode.
 
     Never switches to CPU; a CPU fallback here is a failure.
+
+    OOM is induced with a direct allocator probe (allocate past total device
+    memory). The former "oversized decode request" probe was removed: vLLM
+    0.28.0 does not reject max_tokens > max_model_len (it clamps instead), and
+    a large max_tokens makes the V1 scheduler hang reserving KV cache blocks
+    when it follows a long decode.
     """
     detail: dict[str, Any] = {"total_memory": _total_memory(torch)}
-    oom_observed = False
 
-    # 1. Oversized decode request (exceeds reserved KV cache / max_model_len).
-    try:
-        engine.generate([str(short_sample)], max_new_tokens=OOM_PROBE_TOKENS)
-    except Exception as exc:
-        oom_observed = True
-        detail["oversized_request_error"] = type(exc).__name__
-
-    # 2. Direct allocator OOM: allocate beyond total device memory.
+    # Direct allocator OOM: allocate beyond total device memory.
     size, error = _attempt_oom_allocations(torch, device, _total_memory(torch))
     if error is not None:
-        oom_observed = True
         detail["allocator_oom"] = error
         detail["allocator_oom_bytes"] = size
-
-    if not oom_observed:
+    else:
         return CheckResult(
             "oom_survives", STATUS_FAIL, {**detail, "reason": "no OOM induced"}
         )
 
-    # 3. Prove the worker still serves a short decode.
+    # Prove the worker still serves a short decode.
     try:
         results = engine.generate([str(short_sample)], max_new_tokens=RECOVERY_TOKENS)
     except Exception as exc:
@@ -334,8 +329,15 @@ def load_nano_engine(
     gpu_memory_utilization: float = 0.35,
     max_model_len: int = 4096,
     enforce_eager: bool = True,
+    attention_backend: str = "TRITON_ATTN",
 ) -> Any:
-    """Load Fun-ASR-Nano via FunASR's official vLLM calling convention on XPU."""
+    """Load Fun-ASR-Nano via FunASR's official vLLM calling convention on XPU.
+
+    ``attention_backend`` defaults to ``TRITON_ATTN``: vllm-xpu-kernels 0.1.14.1
+    ships CUTLASS FlashAttention kernels only for XE2/XE3 architectures, which
+    raises ``Only XE2/XE3 cutlass kernel is supported currently`` on the Xe-LPG+
+    iGPU (Arc 130T/140T, device_id 0x7D51). Triton attention runs on the Intel
+    XPU triton backend (triton==3.7.2+xpu shim) and covers this device."""
     from funasr.models.fun_asr_nano.inference_vllm import FunASRNanoVLLM
 
     return FunASRNanoVLLM.from_pretrained(
@@ -347,6 +349,7 @@ def load_nano_engine(
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         enforce_eager=enforce_eager,
+        vllm_kwargs={"attention_backend": attention_backend},
     )
 
 

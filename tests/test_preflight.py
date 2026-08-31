@@ -10,7 +10,6 @@ from fun_voice.preflight import (
     CHECK_NAMES,
     DECODE_TOKENS_10S,
     DECODE_TOKENS_60S,
-    OOM_PROBE_TOKENS,
     RECOVERY_TOKENS,
     STATUS_FAIL,
     STATUS_PASS,
@@ -108,8 +107,6 @@ class _FakeNanoEngine:
     def generate(
         self, inputs: list[str], max_new_tokens: int = 512, **kwargs: Any
     ) -> list[dict]:
-        if max_new_tokens >= OOM_PROBE_TOKENS:
-            raise _FakeOOMError("fake OOM (oversized request)")
         if max_new_tokens in self._fail_tokens:
             raise RuntimeError("fake decode failure")
         return [{"key": "sample", "text": "hello world"}]

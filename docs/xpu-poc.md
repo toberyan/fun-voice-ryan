@@ -46,7 +46,6 @@ detail 指标与样本构成(来源 URL 与时长),**不含音频路径与转写
       "total_memory": 8589934592}},
     {"name": "decode_10s", "status": "pass", "detail": {"result_count": 1, "text_length": 42}},
     {"name": "oom_survives", "status": "pass", "detail": {
-      "oversized_request_error": "ValueError",
       "allocator_oom": "OutOfMemoryError",
       "recovery_text_length": 42}}
   ],
@@ -108,62 +107,64 @@ Level Zero 是 torch-xpu / vLLM XPU 的底层运行时;若 `torch.xpu.is_availab
 
 ## POC 结果
 
-状态:**DONE_WITH_CONCERNS** —— 环境、模型加载、XPU 平台识别、音频组件上卡均已
-验证通过,但 vLLM 引擎在最后一步(Triton 内核 warm-up)因 Intel triton-xpu 生态
-打包不完整而失败。**未**退回 CPU,未更换后端。
+状态:**DONE** —— 九项硬门全部通过(`ready=true`,退出码 0),Fun-ASR-Nano 在
+Intel Arc(Arc 130T/140T,Arrow Lake-P iGPU)上通过 vLLM XPU 后端完成真实解码。
+**未**退回 CPU,未更换后端。
 
-### 已通过
+### 九项硬门结果
 
-- `torch.xpu.is_available() == True`;设备 `Intel(R) Arc(TM) Graphics`,可寻址显存
-  28.48 GiB;XPU 张量运算正常。
-- vLLM 0.28.0 识别 XPU 平台(`current_platform.device_type == "xpu"`),成功解析
-  模型架构 `Qwen3ForCausalLM` 并初始化 V1 引擎。
-- FunASR 加载 `audio_encoder`(914 参数)与 `audio_adaptor`(36 参数)至 `xpu:0`。
-- 三项环境兼容修复已应用并验证(见下)。
+| 检查 | 结果 | 证据 |
+| --- | --- | --- |
+| `xpu_visible` | pass | `torch.xpu.is_available() == True` |
+| `vllm_xpu_decoder` | pass | decoder_device_type=xpu,alloc_probe=ok |
+| `nano_encoder_xpu` | pass | audio_encoder 参数在 xpu |
+| `nano_adaptor_xpu` | pass | audio_adaptor 参数在 xpu |
+| `prompt_embeddings_xpu` | pass | embed_tokens 参数在 xpu |
+| `decode_10s` | pass | 产出非空文本(text_length=20) |
+| `decode_60s` | pass | 产出非空文本(text_length=20) |
+| `no_cpu_decoder_fallback` | pass | decoder_device_type=xpu,无回退 |
+| `oom_survives` | pass | allocator_oom=OutOfMemoryError,恢复解码成功 |
+
+报告路径:`${XDG_RUNTIME_DIR}/fun-voice-ryan/poc-report.json`。
 
 ### 环境版本
 
 ```
 torch==2.13.0+xpu   torchaudio==2.11.0+xpu   torchvision==0.28.0+xpu
 vllm==0.28.0        vllm-xpu-kernels==0.1.14.1
-triton==3.8.0       triton-xpu==3.7.2        oneccl==2022.0.0
+triton==3.7.2+xpu   triton-xpu==3.7.2        oneccl==2022.0.0
 funasr==1.4.11 (git@8cd758c0ced576516b05a749194e6a94cdd38f99)   modelscope==1.39.1
 ```
 
-### 应用的三项兼容修复(create-xpu-env.sh 内,幂等)
+### 应用的兼容修复(create-xpu-env.sh 内,幂等)
 
-1. **安装 `vllm-xpu-kernels==0.1.14.1`**:vLLM 0.28.0 通用 wheel 不声明该依赖,缺
-   少时 `vllm.platforms.xpu` 无法导入,`current_platform.device_type` 为空。
-2. **oneCCL 单卡 warm-up 修复(vllm#52386 / PR#52389)**:`world_size==1` 仍做
-   `all_reduce` warm-up,本机 oneCCL 无法枚举 GPU 拓扑时报
-   `ze_data was not initialized`;补丁仅多卡才 warm-up。
-3. **显存探测回退**:驱动 25.18(< 26.18)`getMemoryInfo` 返回 0 可用显存,启动检查
-   误判"显存不足";补丁回退为 `total - reserved`。
+1. **安装 `vllm-xpu-kernels==0.1.14.1`**:vLLM 0.28.0 通用 wheel 不声明该依赖。
+2. **oneCCL 单卡 warm-up 修复(vllm#52386 / PR#52389)**:仅多卡才 warm-up。
+3. **显存探测回退**:驱动 25.18(< 26.18)`getMemoryInfo` 返回 0,回退为
+   `total - reserved`。
+4. **triton XPU shim 固定**:卸载 PyPI `triton==3.8.0`(NVIDIA-only,由 xgrammar
+   的 `Requires-Dist: triton` 拉入),改装 wheels.vllm.ai/xpu 的
+   `triton==3.7.2+xpu` shim(Requires-Dist `triton-xpu==3.7.2`),透明解析到真正
+   的 Intel XPU 实现。
+5. **Level Zero 头文件 + 链接软链**:triton-xpu Intel 后端 JIT 编译 driver.c 需要
+   `<level_zero/ze_api.h>` 与 `libze_loader.so`(由 level-zero-dev 提供,本机无且
+   不能 sudo);从 oneapi-src/level-zero v1.21.9(匹配 libze1 1.21.9)下载头文件
+   并入 `.venv/include/level_zero/`,并软链 `.venv/lib/libze_loader.so`。
 
-### 剩余阻塞(失败分类:driver/triton 兼容)
+### preflight 内的两项适配(src/fun_voice/preflight.py)
 
-引擎在 `kernel_warmup` 阶段失败:
-
-```text
-TypeError: 'function' object is not subscriptable
-vllm/v1/worker/block_table.py:195  _compute_slot_mapping_kernel[(num_reqs + 1,)](
-```
-
-根因:`triton-xpu==3.7.2`(torch 2.13.0+xpu 强制依赖)只提供 Intel 后端扩展
-(`triton/backends/intel/`),其 `compiler.py` 需要 `triton._C.libtriton.intel`,但
-PyPI 的 `triton==3.8.0`(vLLM 0.28.0 依赖)编译时不含 Intel 后端;`triton==3.7.2+xpu`
-兼容 shim 又不提供任何模块。于是 vLLM 禁用 Triton(`Disabling Triton`),而其内部
-Triton 内核(block table slot mapping)仍被引用,报 `function is not subscriptable`。
-本机 Intel 驱动为 compute-runtime 25.18,低于 vLLM-XPU 文档建议的 26.18(升级需
-sudo,本任务禁止系统层装包)。
-
-**结论**:在保持 XPU(不退回 CPU)的前提下,剩余阻塞是 Intel triton-xpu 打包与驱动
-版本缺口。是否研究 llama.cpp / Vulkan 替代路线,**由人工决定**,脚本不会自行切换。
+- **`attention_backend=TRITON_ATTN`**:vllm-xpu-kernels 0.1.14.1 的 CUTLASS
+  FlashAttention 只有 XE2/XE3 内核,Arc 130T/140T(device_id 0x7D51,Xe-LPG+)
+  报 `Only XE2/XE3 cutlass kernel is supported currently`;改用 Triton 注意力
+  后端(依赖第 4/5 项修复的 triton Intel 后端)。
+- **OOM 探测改为分配器 OOM**:vLLM 0.28.0 不拒绝 `max_tokens > max_model_len`(只
+  截断),大 `max_tokens` 在长解码后会令 V1 调度器挂起;`oom_survives` 改用
+  `torch.empty` 超总量触发 `OutOfMemoryError` 作为可靠 OOM,再验证恢复解码。
 
 ### 复现
 
 ```bash
-./scripts/create-xpu-env.sh          # 建环境(含三项兼容修复)
+./scripts/create-xpu-env.sh          # 建环境(含五项兼容修复)
 ./scripts/run-nano-xpu-poc.sh        # 下载样本/模型,跑九项硬门,输出 poc-report.json
 ```
 
