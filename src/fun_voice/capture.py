@@ -491,4 +491,3 @@ class PipeWireRecorder:
         self._close_current_shard()
         self._bytes = 0
         self._notified = False
-
