@@ -35,6 +35,11 @@ SYSTEMD_SERVICES=(fun-voice-worker.service fun-voice-daemon.service)
 
 POC_REPORT="${XDG_RUNTIME_DIR:-}/fun-voice-ryan/poc-report.json"
 
+# Source artifacts (validated up front so a missing file fails before any write).
+FCITX_SO="${ROOT}/build/fcitx/fcitx5-fun-voice.so"
+FCITX_CONF="${ROOT}/native/fcitx5-fun-voice/fcitx5-fun-voice.conf"
+DESKTOP_SRC="${ROOT}/systemd/fun-voice-session.desktop"
+FCITX_LIB_ABS="${FCITX_LIB_DIR}/fcitx5-fun-voice"  # no ".so"; fcitx5 appends it
 log() { printf '[install-user] %s\n' "$*"; }
 die() { printf '[install-user] ERROR(%s): %s\n' "$1" "$2" >&2; exit 1; }
 
@@ -67,11 +72,25 @@ if [[ "${POC_READY}" != "True" ]]; then
 fi
 log "XPU POC report ready=true — proceeding"
 
+# --- 0b. Source validation (fail fast, before any write) -------------------
+for script in "${CONSOLE_SCRIPTS[@]}"; do
+    [[ -f "${ROOT}/.venv/bin/${script}" ]] \
+        || die "source" "console script missing: ${ROOT}/.venv/bin/${script}"
+done
+for unit in "${SYSTEMD_UNITS[@]}"; do
+    [[ -f "${ROOT}/systemd/${unit}" ]] \
+        || die "source" "systemd unit missing: ${ROOT}/systemd/${unit}"
+done
+[[ -f "${FCITX_SO}" ]] \
+    || die "source" "fcitx addon .so missing: ${FCITX_SO} (build it first)"
+[[ -f "${FCITX_CONF}" ]] || die "source" "fcitx addon conf missing: ${FCITX_CONF}"
+[[ -f "${DESKTOP_SRC}" ]] || die "source" "desktop entry missing: ${DESKTOP_SRC}"
+log "all source artifacts present"
+
 # --- 1. Console scripts -> ~/.local/bin ------------------------------------
 mkdir -p "${BIN_DIR}" || die "mkdir" "cannot create ${BIN_DIR}"
 for script in "${CONSOLE_SCRIPTS[@]}"; do
     src="${ROOT}/.venv/bin/${script}"
-    [[ -f "${src}" ]] || die "source" "console script missing: ${src}"
     install_file "${src}" "${BIN_DIR}/${script}" 755
 done
 log "installed console scripts into ${BIN_DIR}"
@@ -79,28 +98,19 @@ log "installed console scripts into ${BIN_DIR}"
 # --- 2. systemd units -> ~/.config/systemd/user ----------------------------
 for unit in "${SYSTEMD_UNITS[@]}"; do
     src="${ROOT}/systemd/${unit}"
-    [[ -f "${src}" ]] || die "source" "systemd unit missing: ${src}"
     install_file "${src}" "${SYSTEMD_USER_DIR}/${unit}" 644
 done
 log "installed systemd units into ${SYSTEMD_USER_DIR}"
 
 # --- 3. Fcitx addon (.so + .conf) ------------------------------------------
-FCITX_SO="${ROOT}/build/fcitx/fcitx5-fun-voice.so"
-FCITX_CONF="${ROOT}/native/fcitx5-fun-voice/fcitx5-fun-voice.conf"
-FCITX_LIB_ABS="${FCITX_LIB_DIR}/fcitx5-fun-voice"  # no ".so"; fcitx5 appends it
-[[ -f "${FCITX_SO}" ]] \
-    || die "source" "fcitx addon .so missing: ${FCITX_SO} (build it first)"
-[[ -f "${FCITX_CONF}" ]] || die "source" "fcitx addon conf missing: ${FCITX_CONF}"
 install_file "${FCITX_SO}" "${FCITX_LIB_DIR}/fcitx5-fun-voice.so" 644
 FCITX_CONF_TMP="$(mktemp)"
-sed "s|@FCITX_LIB@|${FCITX_LIB_ABS}|g" "${FCITX_CONF}" > "${FCITX_CONF_TMP}"
+sed "s|^Library=.*|Library=${FCITX_LIB_ABS}|" "${FCITX_CONF}" > "${FCITX_CONF_TMP}"
 install_file "${FCITX_CONF_TMP}" "${FCITX_ADDON_DIR}/fcitx5-fun-voice.conf" 644
 rm -f "${FCITX_CONF_TMP}"
 log "installed fcitx addon (${FCITX_LIB_DIR}, ${FCITX_ADDON_DIR})"
 
 # --- 4. Autostart desktop entry --------------------------------------------
-DESKTOP_SRC="${ROOT}/systemd/fun-voice-session.desktop"
-[[ -f "${DESKTOP_SRC}" ]] || die "source" "desktop entry missing: ${DESKTOP_SRC}"
 DESKTOP_TMP="$(mktemp)"
 sed "s|@REPO_ROOT@|${ROOT}|g" "${DESKTOP_SRC}" > "${DESKTOP_TMP}"
 install_file "${DESKTOP_TMP}" "${AUTOSTART_DIR}/fun-voice-session.desktop" 644

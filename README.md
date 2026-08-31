@@ -48,6 +48,12 @@ scripts/install-user.sh
 `.conf` 写入 `~/.local/lib/fcitx5/` 与 `~/.local/share/fcitx5/addon/`；登录自启
 入口写入 `~/.config/autostart/`。脚本幂等，可重复执行。
 
+> [!IMPORTANT]
+> 安装的 console script（shebang）与 autostart `Exec` 都指向**仓库与 `.venv`
+> 的绝对路径**（当前为 `~/workspace/fun-voice-ryan`）。**移动或删除仓库目录后
+> 语音输入会静默失效**；如仓库路径变更，请先 `scripts/uninstall-user.sh` 再在新
+> 位置重新安装。
+
 ## 使用
 
 1. 重新登录 DDE 会话（或手动 `systemctl --user start fun-voice-worker fun-voice-daemon`）。

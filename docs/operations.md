@@ -39,6 +39,11 @@ Fun Voice Ryan 的安装、运行与故障排查。安装脚本为 `scripts/inst
 设备 `xpu:0`、dtype `bf16`、`gpu_memory_utilization=0.35`。未来若引入配置文件，
 将落在 `~/.config/fun-voice-ryan/`，卸载默认保留。
 
+> 另请注意：安装后的 console script（shebang）与 autostart `Exec` 都指向
+> **仓库与 `.venv` 的绝对路径**（当前 `~/workspace/fun-voice-ryan`）。**移动或
+> 删除仓库目录会使语音输入静默失效**；仓库路径变更时请先
+> `scripts/uninstall-user.sh`，再在新位置重新安装。
+
 ## 4. 隐私说明
 
 - **不持久化录音或转写文本**：短音频只驻留内存；超过阈值才在
