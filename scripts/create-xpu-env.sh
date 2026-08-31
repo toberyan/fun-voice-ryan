@@ -47,7 +47,7 @@ install_xpu() {
 
 # --- 2. vLLM + torch/torchaudio + XPU kernels -------------------------------
 log "安装 vllm + vllm-xpu-kernels + torch/torchaudio (XPU)..."
-install_xpu vllm vllm-xpu-kernels==0.1.14.1 torchaudio
+install_xpu vllm==0.28.0 vllm-xpu-kernels==0.1.14.1 torchaudio
 
 # --- 3. FunASR @ pinned commit + modelscope ---------------------------------
 FUNASR_SRC="${ROOT_DIR}/.funasr-src"
@@ -181,7 +181,8 @@ LZ_VER="1.21.9"
 if [[ ! -f "${VENV_DIR}/include/level_zero/ze_api.h" ]]; then
     log "部署 Level Zero 头文件 (v${LZ_VER})..."
     LZ_TARBALL="${ROOT_DIR}/.level-zero-headers.tar.gz"
-    curl -fsSL "https://codeload.github.com/oneapi-src/level-zero/tar.gz/refs/tags/v${LZ_VER}" \
+    curl -fsSL --retry 6 --retry-delay 3 --retry-all-errors \
+        "https://codeload.github.com/oneapi-src/level-zero/tar.gz/refs/tags/v${LZ_VER}" \
         -o "${LZ_TARBALL}"
     mkdir -p "${VENV_DIR}/include/level_zero"
     tar xzf "${LZ_TARBALL}" -C "${VENV_DIR}/include/level_zero" --strip-components=2 \
@@ -190,7 +191,20 @@ if [[ ! -f "${VENV_DIR}/include/level_zero/ze_api.h" ]]; then
 fi
 if [[ ! -e "${VENV_DIR}/lib/libze_loader.so" ]]; then
     log "创建 libze_loader.so 软链..."
-    ln -sf /usr/lib/x86_64-linux-gnu/libze_loader.so.1 "${VENV_DIR}/lib/libze_loader.so"
+    ZE_LOADER_SO="$(ldconfig -p 2>/dev/null | awk '$1 == "libze_loader.so.1" { print $NF; exit }' || true)"
+    if [[ -z "${ZE_LOADER_SO}" ]]; then
+        for cand in /usr/lib/x86_64-linux-gnu /usr/lib64 /lib/x86_64-linux-gnu /usr/lib; do
+            if [[ -f "${cand}/libze_loader.so.1" ]]; then
+                ZE_LOADER_SO="${cand}/libze_loader.so.1"
+                break
+            fi
+        done
+    fi
+    if [[ -n "${ZE_LOADER_SO}" && -f "${ZE_LOADER_SO}" ]]; then
+        ln -sf "${ZE_LOADER_SO}" "${VENV_DIR}/lib/libze_loader.so"
+    else
+        log "警告:未找到系统 libze_loader.so.1,跳过软链(triton Intel 后端 JIT 编译可能失败)"
+    fi
 fi
 
 # --- 4. 版本与设备信息 ------------------------------------------------------

@@ -13,6 +13,8 @@
 #   5. 把样本构成(仅来源 URL 与时长,不含音频路径/转写文本)并入报告。
 #
 # 退出码:0=全部硬门通过;非 0=任一失败或环境/样本缺失(绝不静默退回 CPU)。
+
+set -euo pipefail
 MODELS_ROOT="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/models"
 # modelscope 1.39.x 缓存布局:${MODELSCOPE_CACHE}/models/<owner>--<name>/snapshots/<revision>
 NANO_MODEL_DIR="${MODELS_ROOT}/models/FunAudioLLM--Fun-ASR-Nano-2512/snapshots/master"
@@ -46,7 +48,6 @@ while [[ $# -gt 0 ]]; do
         --long) LONG_SAMPLE="$2"; shift 2 ;;
         --model-dir) MODEL_DIR_ARG="$2"; shift 2 ;;
         --skip-model-download) SKIP_MODEL=1; shift ;;
-        --samples-missing) shift ;;  # 样本由脚本自动生成,保留兼容旧参数
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -112,6 +113,7 @@ else
             || die "样本重采样失败: ${url}"
         dur="$(ffprobe -v error -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 "${norm}")"
+        [[ "${dur}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "样本时长探测失败: ${url}"
         comp+=("{\"source\":\"${url}\",\"language\":\"${lang}\",\"duration_s\":${dur}}")
         norm_files+=("${norm}")
         idx=$((idx + 1))
@@ -174,19 +176,5 @@ with open(report_path, "w", encoding="utf-8") as fh:
 print(f"[run-nano-xpu-poc] report: {report_path}")
 PY
 fi
-
-# --- 6. 汇总(只打印状态,不打印音频路径/转写文本)----------------------------
-"${PYTHON}" - "${REPORT}" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as fh:
-    report = json.load(fh)
-ready = bool(report.get("ready"))
-print(f"[run-nano-xpu-poc] ready={ready}")
-for check in report.get("checks", []):
-    print(f"  {check['name']}: {check['status']}")
-sys.exit(0 if ready else 1)
-PY
 
 exit "${preflight_rc}"

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -113,14 +114,14 @@ def get_decoder_device_type(engine: Any) -> str | None:
 
 
 def detect_cpu_fallback(engine: Any) -> str | None:
-    """Return a reason string when the decoder fell back to CPU, else ``None``."""
-    vllm_engine = getattr(engine, "vllm_engine", None)
-    for obj in (vllm_engine, engine):
-        if obj is None:
-            continue
-        for flag in ("cpu_fallback", "fell_back_to_cpu", "is_cpu"):
-            if getattr(obj, flag, False):
-                return f"engine flag {flag!r} indicates cpu fallback"
+    """Return a reason string when the decoder fell back to CPU, else ``None``.
+
+    vLLM 0.28.0 exposes no dedicated "CPU fallback" engine attribute, so only the
+    resolved decoder device type is consulted (``get_decoder_device_type`` reads
+    the engine's device_type / model_config.device / current_platform.device_type).
+    Engine log keywords are not inspected here: they are written to the process
+    logger and are not programmatically reachable from this call site.
+    """
     if get_decoder_device_type(engine) == "cpu":
         return "decoder device type is cpu"
     return None
@@ -176,13 +177,14 @@ def check_vllm_xpu_decoder(
     }
     detail["memory_before"] = _xpu_memory_stats(torch)
     probe = "ok"
+    tensor = None
     try:
         tensor = torch.empty(PROBE_BYTES, dtype=torch.uint8, device=device)
-        del tensor
     except Exception as exc:
         probe = f"failed:{type(exc).__name__}"
-    detail["alloc_probe"] = probe
     detail["memory_after"] = _xpu_memory_stats(torch)
+    del tensor
+    detail["alloc_probe"] = probe
     detail["total_memory"] = _total_memory(torch)
     ok = device_type == EXPECTED_DEVICE_TYPE and probe == "ok"
     return CheckResult(
@@ -370,26 +372,38 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=4096)
     return parser
 
-
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    try:
+        import torch
 
-    import torch
+        engine = load_nano_engine(
+            args.model_dir,
+            device=args.device,
+            dtype=args.dtype,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+        )
+        report = run_preflight(
+            torch=torch,
+            engine=engine,
+            short_sample=args.short,
+            long_sample=args.long,
+            device=args.device,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Turn any load/run failure into a structured fail report instead of a
+        # bare traceback, so the POC harness always gets a parseable JSON.
+        report = PreflightReport(
+            device=args.device,
+            checks=tuple(
+                CheckResult(name, STATUS_FAIL, {"error": type(exc).__name__})
+                for name in CHECK_NAMES
+            ),
+            ready=False,
+        )
+        print(f"preflight error: {type(exc).__name__}: {exc}", file=sys.stderr)
 
-    engine = load_nano_engine(
-        args.model_dir,
-        device=args.device,
-        dtype=args.dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
-    )
-    report = run_preflight(
-        torch=torch,
-        engine=engine,
-        short_sample=args.short,
-        long_sample=args.long,
-        device=args.device,
-    )
     report_path = Path(args.report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report.to_json() + "\n", encoding="utf-8")

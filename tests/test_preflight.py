@@ -14,6 +14,9 @@ from fun_voice.preflight import (
     STATUS_FAIL,
     STATUS_PASS,
     PreflightReport,
+    check_vllm_xpu_decoder,
+    detect_cpu_fallback,
+    load_nano_engine,
     run_preflight,
 )
 
@@ -83,9 +86,8 @@ class _FakeTorch:
 
 
 class _FakeVLLMEngine:
-    def __init__(self, device_type: str = "xpu", cpu_fallback: bool = False) -> None:
+    def __init__(self, device_type: str = "xpu") -> None:
         self.device_type = device_type
-        self.cpu_fallback = cpu_fallback
 
 
 class _FakeNanoEngine:
@@ -96,17 +98,16 @@ class _FakeNanoEngine:
         adaptor_type: str = "xpu",
         embed_type: str = "xpu",
         device_type: str = "xpu",
-        cpu_fallback: bool = False,
         fail_tokens: set[int] | None = None,
     ) -> None:
         self.audio_encoder = _FakeModule(encoder_type)
         self.audio_adaptor = _FakeModule(adaptor_type)
         self.embed_tokens = _FakeModule(embed_type)
-        self.vllm_engine = _FakeVLLMEngine(device_type, cpu_fallback)
+        self.vllm_engine = _FakeVLLMEngine(device_type)
         self._fail_tokens = fail_tokens or set()
     def generate(
         self, inputs: list[str], max_new_tokens: int = 512, **kwargs: Any
-    ) -> list[dict]:
+    ) -> list[dict[str, str]]:
         if max_new_tokens in self._fail_tokens:
             raise RuntimeError("fake decode failure")
         return [{"key": "sample", "text": "hello world"}]
@@ -174,7 +175,7 @@ def test_check_names_are_the_nine_hard_gates() -> None:
         (
             "no_cpu_decoder_fallback",
             _FakeTorch(),
-            _FakeNanoEngine(cpu_fallback=True),
+            _FakeNanoEngine(device_type="cpu"),
         ),
         (
             "oom_survives",
@@ -218,3 +219,55 @@ def test_oom_check_records_recovery_length_not_text() -> None:
     assert oom.status == STATUS_PASS
     assert oom.detail["recovery_text_length"] == len("hello world")
     assert "hello world" not in report.to_json()
+
+
+def test_vllm_xpu_decoder_alloc_probe_failure() -> None:
+    """A failing allocation probe marks the decoder check as fail."""
+
+    class _FailingAllocTorch(_FakeTorch):
+        def empty(self, size: int, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("alloc boom")
+
+    result = check_vllm_xpu_decoder(_FakeNanoEngine(), _FailingAllocTorch())
+    assert result.status == STATUS_FAIL
+    assert result.detail["alloc_probe"] == "failed:RuntimeError"
+    assert result.detail["decoder_device_type"] == "xpu"
+
+
+def test_detect_cpu_fallback_cpu_device() -> None:
+    """A decoder resolved to ``cpu`` must be reported as a CPU fallback."""
+    assert detect_cpu_fallback(_FakeNanoEngine(device_type="cpu")) == (
+        "decoder device type is cpu"
+    )
+    assert detect_cpu_fallback(_FakeNanoEngine()) is None
+
+
+def test_load_nano_engine_passes_triton_attn_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """load_nano_engine forwards attention_backend=TRITON_ATTN via vllm_kwargs."""
+    import sys
+    import types
+
+    captured: dict[str, Any] = {}
+
+    class _FakeFunASRNanoVLLM:
+        @classmethod
+        def from_pretrained(cls, **kwargs: Any) -> object:
+            captured.update(kwargs)
+            return object()
+
+    leaf = types.ModuleType("funasr.models.fun_asr_nano.inference_vllm")
+    setattr(leaf, "FunASRNanoVLLM", _FakeFunASRNanoVLLM)
+    for pkg_name in ("funasr", "funasr.models", "funasr.models.fun_asr_nano"):
+        monkeypatch.setitem(sys.modules, pkg_name, types.ModuleType(pkg_name))
+    monkeypatch.setitem(
+        sys.modules, "funasr.models.fun_asr_nano.inference_vllm", leaf
+    )
+
+    engine = load_nano_engine("/fake/model-dir")
+    assert engine is not None
+    assert captured["model"] == "/fake/model-dir"
+    assert captured["device"] == "xpu:0"
+    assert captured["dtype"] == "bf16"
+    assert captured["vllm_kwargs"] == {"attention_backend": "TRITON_ATTN"}

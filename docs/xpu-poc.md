@@ -57,6 +57,7 @@ detail 指标与样本构成(来源 URL 与时长),**不含音频路径与转写
 ```
 
 成功判据:JSON 顶层 `ready == true`,九项 `status == "pass"`。
+`memory_before` / `memory_after` 分别记录 1 MiB 探测分配前与分配中(尚未释放)的显存占用。
 
 ## 失败分类
 
