@@ -9,6 +9,9 @@ on every path.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
+
 import pytest
 
 from fun_voice.capture import CaptureError
@@ -52,9 +55,11 @@ class FakeGuard:
         snapshots: list[FocusSnapshot] | None = None,
         *,
         error: X11Error | None = None,
+        c_down: bool = True,
     ) -> None:
         self._snapshots = list(snapshots) if snapshots else [SNAPSHOT]
         self._error = error
+        self.c_down = c_down
         self.captures = 0
 
     def capture(self) -> FocusSnapshot:
@@ -72,6 +77,9 @@ class FakeGuard:
             and a.input_focus == b.input_focus
             and a.window_pid == b.window_pid
         )
+
+    def c_is_down(self) -> bool:
+        return self.c_down
 
 
 class FakeRecorder:
@@ -203,6 +211,8 @@ class Harness:
         clipboard: FakeClipboard | None = None,
         injector: FakeInjector | None = None,
         worker: FakeWorker | None = None,
+        monotonic: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.guard = guard if guard is not None else FakeGuard()
         self.recorder = recorder if recorder is not None else FakeRecorder()
@@ -231,6 +241,8 @@ class Harness:
             injector=self.injector,
             notifier=self.notifier,
             worker=self.worker,
+            monotonic=monotonic if monotonic is not None else time.monotonic,
+            sleep=sleep if sleep is not None else time.sleep,
         )
 
     @property
@@ -277,6 +289,36 @@ def test_start_notifies_recording() -> None:
     h.daemon.start_if_idle()
     assert NOTIFY_RECORDING in h.notifier.messages
 
+
+def test_start_confirms_c_is_still_pressed() -> None:
+    h = Harness(guard=FakeGuard(c_down=True))
+    assert h.daemon.start_if_idle() == "started"
+    assert h.daemon.state is DaemonState.RECORDING
+
+
+def test_start_cancels_when_c_not_pressed() -> None:
+    values = iter([0.0, 1.0])
+    h = Harness(
+        guard=FakeGuard(c_down=False),
+        monotonic=lambda: next(values),
+        sleep=lambda _secs: None,
+    )
+    assert h.daemon.start_if_idle() == "cancelled"
+    assert h.daemon.state is DaemonState.IDLE
+    assert h.recorder.cancel_calls == 1
+    assert h.recorder.start_calls == 0
+    assert h.notifier.messages == []  # cancel is silent
+
+
+@pytest.mark.parametrize(
+    "bad_state", [DaemonState.TRANSCRIBING, DaemonState.COMMITTING]
+)
+def test_stop_while_transcribing_or_committing_is_noop(bad_state: DaemonState) -> None:
+    h = Harness()
+    h.daemon._state = bad_state
+    h.daemon.stop()
+    assert h.recorder.stop_calls == 0
+    assert h.worker.transcriptions == []
 
 @pytest.mark.parametrize(
     "bad_state",

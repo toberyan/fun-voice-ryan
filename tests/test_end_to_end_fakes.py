@@ -24,12 +24,14 @@ from fun_voice import daemon as daemon_mod
 from fun_voice.bridge import send_request
 from fun_voice.capture import CaptureError
 from fun_voice.contracts import (
+    FCITX_CHUNK_MAX_BYTES,
     CaptureArtifact,
     CommitResult,
     DaemonState,
     ErrorCode,
     FocusSnapshot,
     Transcription,
+    split_utf8,
 )
 from fun_voice.daemon import (
     NOTIFY_CLIPBOARD_FAILED,
@@ -68,9 +70,11 @@ class FakeGuard:
         snapshots: list[FocusSnapshot] | None = None,
         *,
         error: X11Error | None = None,
+        c_down: bool = True,
     ) -> None:
         self._snapshots = list(snapshots) if snapshots else [SNAPSHOT]
         self._error = error
+        self.c_down = c_down
         self.captures = 0
 
     def capture(self) -> FocusSnapshot:
@@ -88,6 +92,9 @@ class FakeGuard:
             and a.input_focus == b.input_focus
             and a.window_pid == b.window_pid
         )
+
+    def c_is_down(self) -> bool:
+        return self.c_down
 
 
 class FakeRecorder:
@@ -351,6 +358,65 @@ def test_long_text_reject_never_injects_partial_text() -> None:
     assert h.daemon.state is DaemonState.IDLE
 
 
+class ChunkingFakeFcitx:
+    """Models the real FcitxClient chunking: split on UTF-8 boundaries, reject
+    at a caller-chosen chunk, and record only the chunks sent before it."""
+
+    def __init__(self, reject_at: int = 3) -> None:
+        self.reject_at = reject_at
+        self.sent_chunks: list[str] = []
+        self.commits: list[tuple[str, str]] = []
+
+    def start_focus(self) -> str:
+        return "tok-123"
+
+    def commit(self, focus_token: str, text: str) -> CommitResult:
+        self.commits.append((focus_token, text))
+        chunks = split_utf8(text, FCITX_CHUNK_MAX_BYTES)
+        for index, chunk in enumerate(chunks, start=1):
+            if index >= self.reject_at:
+                return CommitResult(
+                    committed=False,
+                    method="fcitx",
+                    error=ErrorCode("fcitx", "stale-focus"),
+                )
+            self.sent_chunks.append(chunk)
+        return CommitResult(committed=True, method="fcitx")
+
+    def close(self) -> None:
+        pass
+
+
+def test_long_text_reject_sends_only_prefix_chunks() -> None:
+    long_text = "你" * 30000  # > 64 KiB → multiple 8 KiB chunks
+    fcitx = ChunkingFakeFcitx(reject_at=3)
+    guard = FakeGuard()
+    recorder = FakeRecorder()
+    notifier = FakeNotifier()
+    injector = FakeInjector()
+    daemon = VoiceDaemon(
+        guard=guard,
+        recorder=recorder,
+        fcitx_factory=lambda: fcitx,
+        clipboard=FakeClipboard(),
+        injector=injector,
+        notifier=notifier,
+        worker=_TextWorker(long_text),
+    )
+    assert daemon.start_if_idle() == "started"
+    daemon.stop()
+    assert daemon.state is DaemonState.IDLE
+    # Rejected at chunk 3 → exactly the first two chunks were sent.
+    assert len(fcitx.sent_chunks) == 2
+    assert "".join(fcitx.sent_chunks) != long_text
+    # The daemon never injects partial text via XTEST or a retry.
+    assert injector.pastes == 0
+    assert fcitx.commits == [("tok-123", long_text)]
+    assert (
+        NOTIFY_RECOGNITION_FAILED.format(category="fcitx.stale-focus")
+        in notifier.messages
+    )
+
 def test_no_token_records_and_uses_xtest_only() -> None:
     h = Harness(fcitx=FakeFcitx(token=None))
     _record(h, "你好")
@@ -504,6 +570,74 @@ def test_daemon_rejects_non_owner(monkeypatch, tmp_path: Path) -> None:
         _send(path, {"op": "start_if_idle"})
         assert h.daemon.state is DaemonState.IDLE  # request was ignored
     finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _request(path: Path, message: dict[str, str], timeout: float = 2.0) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(timeout)
+        client.connect(str(path))
+        client.sendall(json.dumps(message).encode("utf-8") + b"\n")
+        data = bytearray()
+        while b"\n" not in data:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+    return json.loads(bytes(data).decode("utf-8"))
+
+
+class BlockingWorker:
+    """Blocks inside ``transcribe`` until released, to hold the daemon lock."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.transcriptions: list[CaptureArtifact] = []
+
+    def transcribe(self, artifact: CaptureArtifact) -> Transcription:
+        self.transcriptions.append(artifact)
+        self.started.set()
+        self.release.wait(timeout=10.0)
+        return Transcription(text="你好", segments=())
+
+    def close(self) -> None:
+        pass
+
+
+def test_start_if_idle_rejected_promptly_during_transcription(tmp_path: Path) -> None:
+    worker = BlockingWorker()
+    recorder = FakeRecorder()
+    guard = FakeGuard()
+    notifier = FakeNotifier()
+    daemon = VoiceDaemon(
+        guard=guard,
+        recorder=recorder,
+        fcitx_factory=lambda: FakeFcitx(),
+        clipboard=FakeClipboard(),
+        injector=FakeInjector(),
+        notifier=notifier,
+        worker=worker,
+    )
+    path = tmp_path / "daemon.sock"
+    server = DaemonServer(path, daemon, uid=os.getuid())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert _request(path, {"op": "start_if_idle"})["status"] == "started"
+        # Stop blocks inside transcribe; fire-and-forget so we do not wait on it.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(path))
+            client.sendall(b'{"op":"stop"}\n')
+        worker.started.wait(timeout=2.0)
+        # While transcription is blocked, a new start_if_idle is rejected now.
+        started = time.monotonic()
+        response = _request(path, {"op": "start_if_idle"}, timeout=2.0)
+        assert response["status"] == "busy"
+        assert time.monotonic() - started < 1.0
+    finally:
+        worker.release.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

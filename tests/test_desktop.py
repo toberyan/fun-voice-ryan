@@ -441,10 +441,10 @@ def test_focus_guard_is_same_compares_focus_identity_only() -> None:
         active_window=1, process_name="app", input_focus=2, monotonic_ns=100,
         window_pid=9,
     )
-    # Timestamp and Fcitx token differ, but focus identity is unchanged.
+    # The timestamp differs, but the focus identity is unchanged.
     b = FocusSnapshot(
         active_window=1, process_name="app", input_focus=2, monotonic_ns=999,
-        window_pid=9, focus_token="tok",
+        window_pid=9,
     )
     assert guard.is_same(a, b)
 

@@ -30,6 +30,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -82,6 +83,11 @@ WORKER_RESPONSE_TIMEOUT_SECONDS = 130.0
 FUN_VOICE_WORKER_SERVICE = "fun-voice-worker.service"
 SOCKET_BACKLOG = 4
 
+# Hold-to-talk confirmation: after the bridge reports C down, the daemon must
+# confirm C is still physically held within this window before recording.
+C_CONFIRM_TIMEOUT_SECONDS = 0.5
+C_CONFIRM_POLL_SECONDS = 0.05
+
 
 # --- Structured worker errors ------------------------------------------------
 
@@ -124,6 +130,8 @@ class FocusGuard(Protocol):
 
     def is_same(self, a: FocusSnapshot, b: FocusSnapshot) -> bool: ...
 
+    def c_is_down(self) -> bool: ...
+
 
 class Recorder(Protocol):
     def start(self) -> None: ...
@@ -159,6 +167,23 @@ class WorkerClient(Protocol):
     def transcribe(self, artifact: CaptureArtifact) -> Transcription: ...
 
     def close(self) -> None: ...
+
+
+class _NullFcitx:
+    """No-op Fcitx stand-in used when the client cannot be constructed."""
+
+    def start_focus(self) -> None:
+        return None
+
+    def commit(self, focus_token: str, text: str) -> CommitResult:
+        return CommitResult(
+            committed=False,
+            method="fcitx",
+            error=ErrorCode("fcitx", "unavailable"),
+        )
+
+    def close(self) -> None:
+        pass
 
 
 # --- Notifier (notify-send) --------------------------------------------------
@@ -318,6 +343,8 @@ class VoiceDaemon:
         notifier: Notifier,
         worker: WorkerClient,
         auto_stop_event: threading.Event | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._guard = guard
         self._recorder = recorder
@@ -327,8 +354,11 @@ class VoiceDaemon:
         self._notifier = notifier
         self._worker = worker
         self._auto_stop_event = auto_stop_event
+        self._monotonic = monotonic
+        self._sleep = sleep
         self._state = DaemonState.IDLE
         self._session: _Session | None = None
+        self._lock = threading.Lock()
 
     @property
     def state(self) -> DaemonState:
@@ -336,69 +366,112 @@ class VoiceDaemon:
 
     # --- Requests ------------------------------------------------------------
 
-    def dispatch(self, message: Mapping[str, Any]) -> None:
+    def dispatch(self, message: Mapping[str, Any]) -> str:
         op = message.get("op")
         if op == "start_if_idle":
-            self.start_if_idle()
-        elif op == "stop":
+            return self.start_if_idle()
+        if op == "stop":
             self.stop()
-        else:
-            logger.warning("ignoring unknown op: %r", op)
+            return "ok"
+        logger.warning("ignoring unknown op: %r", op)
+        return "error"
 
     def start_if_idle(self) -> str:
-        """Start recording if idle; returns ``"started"`` / ``"busy"`` / ``"error"``."""
-        if self._state is not DaemonState.IDLE:
-            logger.info("start_if_idle ignored: state=%s", self._state.value)
+        """Start recording if idle; ``"started"`` / ``"busy"`` / ``"error"`` /
+        ``"cancelled"``."""
+        if not self._lock.acquire(blocking=False):
+            logger.info("start_if_idle rejected: session already in progress")
             return "busy"
-
         try:
-            snapshot = self._guard.capture()
-        except X11Error:
-            logger.warning("start failed: X11 focus capture unavailable")
-            self._notify(NOTIFY_RECOGNITION_FAILED.format(category="x11"))
-            return "error"
+            if self._state is not DaemonState.IDLE:
+                logger.info("start_if_idle ignored: state=%s", self._state.value)
+                return "busy"
 
-        fcitx = self._fcitx_factory()
-        token: str | None = None
-        try:
-            token = fcitx.start_focus()
-        except FcitxCommitError:
-            token = None  # decision: still record; clipboard + XTEST only
+            try:
+                snapshot = self._guard.capture()
+            except X11Error:
+                logger.warning("start failed: X11 focus capture unavailable")
+                self._notify(NOTIFY_RECOGNITION_FAILED.format(category="x11"))
+                return "error"
 
-        self._session = _Session(snapshot=snapshot, token=token, fcitx=fcitx)
-        try:
-            self._recorder.start()
-        except CaptureError:
-            logger.warning("start failed: capture could not start")
-            self._cleanup()
-            self._notify(NOTIFY_RECOGNITION_FAILED.format(category="capture"))
-            return "error"
+            # Hold-to-talk gate: confirm C is still held before recording.
+            if not self._confirm_c_pressed():
+                logger.info("start_if_idle cancelled: C not held in window")
+                self._recorder.cancel()
+                self._cleanup()
+                return "cancelled"
 
-        self._state = DaemonState.RECORDING
-        logger.info("state -> recording")
-        self._notify(NOTIFY_RECORDING)
-        return "started"
+            try:
+                fcitx = self._fcitx_factory()
+            except Exception:
+                logger.warning("fcitx client unavailable; XTEST-only commit")
+                fcitx = _NullFcitx()
+            token: str | None = None
+            try:
+                token = fcitx.start_focus()
+            except FcitxCommitError:
+                token = None  # decision: still record; clipboard + XTEST only
+
+            self._session = _Session(snapshot=snapshot, token=token, fcitx=fcitx)
+            try:
+                self._recorder.start()
+            except CaptureError:
+                logger.warning("start failed: capture could not start")
+                self._cleanup()
+                self._notify(NOTIFY_RECOGNITION_FAILED.format(category="capture"))
+                return "error"
+
+            self._state = DaemonState.RECORDING
+            logger.info("state -> recording")
+            self._notify(NOTIFY_RECORDING)
+            return "started"
+        finally:
+            self._lock.release()
+
+    def _confirm_c_pressed(self) -> bool:
+        """Return ``True`` when C is still held within the confirmation window."""
+        deadline = self._monotonic() + C_CONFIRM_TIMEOUT_SECONDS
+        while True:
+            try:
+                if self._guard.c_is_down():
+                    return True
+            except X11Error:
+                return False
+            if self._monotonic() >= deadline:
+                return False
+            self._sleep(C_CONFIRM_POLL_SECONDS)
 
     def stop(self) -> None:
         """Handle a bridge ``stop`` (key released); only acts while RECORDING."""
-        if self._state is not DaemonState.RECORDING:
-            logger.info("stop ignored: state=%s", self._state.value)
+        if not self._lock.acquire(blocking=False):
             return
-        self._notify(NOTIFY_TRANSCRIBING)
-        self._transcribe_and_commit()
+        try:
+            if self._state is not DaemonState.RECORDING:
+                logger.info("stop ignored: state=%s", self._state.value)
+                return
+            self._notify(NOTIFY_TRANSCRIBING)
+            self._transcribe_and_commit()
+        finally:
+            self._lock.release()
 
     def handle_auto_stop(self) -> None:
         """Handle the recorder's 30-minute auto-stop (limit reached)."""
-        if self._state is not DaemonState.RECORDING:
+        if not self._lock.acquire(blocking=False):
             return
-        self._notify(NOTIFY_LIMIT_REACHED)
-        self._transcribe_and_commit()
+        try:
+            if self._state is not DaemonState.RECORDING:
+                return
+            self._notify(NOTIFY_LIMIT_REACHED)
+            self._transcribe_and_commit()
+        finally:
+            self._lock.release()
 
     def shutdown(self) -> None:
         """Final teardown: cleanup any session and close long-lived resources."""
-        self._cleanup()
-        with contextlib.suppress(Exception):
-            self._worker.close()
+        with self._lock:
+            self._cleanup()
+            with contextlib.suppress(Exception):
+                self._worker.close()
 
     # --- Pipeline ------------------------------------------------------------
 
@@ -575,7 +648,7 @@ def peer_uid(conn: socket.socket) -> int | None:
 
 
 class DaemonRequestHandler(socketserver.StreamRequestHandler):
-    """Handle one JSON-line request per connection (fire-and-forget)."""
+    """Handle one JSON-line request and reply with a one-line status."""
 
     def handle(self) -> None:
         server = cast("DaemonServer", self.server)
@@ -595,11 +668,22 @@ class DaemonRequestHandler(socketserver.StreamRequestHandler):
             message = decode_message(line)
         except ProtocolError:
             return
-        server.daemon.dispatch(message)
+        status = server.daemon.dispatch(message)
+        with contextlib.suppress(OSError):
+            conn.sendall(encode_message({"status": status}) + b"\n")
 
 
-class DaemonServer(socketserver.UnixStreamServer):
-    """Single-threaded Unix socket server; rejects non-owner clients."""
+class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """Concurrent Unix socket server; rejects non-owner clients.
+
+    Each connection is handled in its own thread so a long-running
+    transcription never blocks ``accept``: a ``start_if_idle`` arriving while a
+    session is in flight is rejected immediately (the state machine lock is
+    non-blocking) instead of queueing in the backlog.
+    """
+
+    daemon_threads = False
+    block_on_close = True
 
     def __init__(
         self,
@@ -624,14 +708,17 @@ class DaemonServer(socketserver.UnixStreamServer):
     def service_actions(self) -> None:
         """Poll the recorder's 30-minute auto-stop signal every loop iteration.
 
-        ``BaseServer.serve_forever`` calls this after each request (and after
-        every ``poll_interval`` timeout), so the auto-stop runs in the server's
-        own thread and never races the state machine.
+        The pipeline runs on a short-lived worker thread so the accept loop
+        stays responsive; the state machine lock serializes it against any
+        concurrent request.
         """
         event = self._auto_stop_event
         if event is not None and event.is_set():
             event.clear()
-            self.daemon.handle_auto_stop()
+            thread = threading.Thread(
+                target=self.daemon.handle_auto_stop, daemon=True
+            )
+            thread.start()
 
 
 def _unlink_socket(path: Path) -> None:

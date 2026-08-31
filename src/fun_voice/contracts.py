@@ -87,15 +87,13 @@ class FocusSnapshot:
     ``active_window`` is the ``_NET_ACTIVE_WINDOW`` id, ``input_focus`` the
     current X input-focus window, ``window_pid`` the ``_NET_WM_PID`` of the
     active window and ``process_name`` its resolved process name. ``monotonic_ns``
-    is a capture timestamp (excluded from equality comparisons). ``focus_token``
-    is the Fcitx token attached by the daemon after capture.
+    is a capture timestamp (excluded from equality comparisons).
     """
 
     active_window: int | None
     process_name: str | None
     input_focus: int | None
     monotonic_ns: int
-    focus_token: str | None = None
     window_pid: int | None = None
 
 @dataclass(frozen=True)
