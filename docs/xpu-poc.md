@@ -127,6 +127,23 @@ Intel Arc(Arc 130T/140T,Arrow Lake-P iGPU)上通过 vLLM XPU 后端完成真实�
 
 报告路径:`${XDG_RUNTIME_DIR}/fun-voice-ryan/poc-report.json`。
 
+### 观察:decode_10s / decode_60s 转写长度相同
+
+`decode_10s` 与 `decode_60s` 的 `result_count` 均为 1、`text_length` 均为 20:
+
+- `result_count` 是**批大小**(preflight 每次只传 1 个样本 → 1 个结果),不是 VAD
+  分段数。preflight 走 `FunASRNanoVLLM.generate`(inference_vllm.py,**无 VAD**,
+  整段音频作为单一序列送入 LLM);VAD 分段只在独立的 `FunASRNanoVLLMPipeline`
+  (inference_vllm_pipeline.py)中实现,preflight 未调用,故报告不含 VAD 分段的
+  `start_ms`/`end_ms`。
+- 已实测:60s 样本时长确为 60.00s,且音频编码器完整处理——fbank/encoder/adaptor
+  帧数 10s=167、60s=1000(约 6 倍)。但 LLM 转写文本长度两者均约 20 字符,即
+  60s(4 个开源片段循环拼接)未产出更长转写,属模型对长/重复音频的行为,机制待查。
+
+此观察不撤销 POC 结论,但影响后续 Task 6/8 对 VAD 分段与长音频转写的验收预期:
+`decode_60s` 只验证"60s 样本产出非空文本",未验证 VAD 分段数或分段级时间戳。
+
+
 ### 环境版本
 
 ```
