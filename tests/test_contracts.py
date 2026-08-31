@@ -240,3 +240,50 @@ def test_build_commit_frames_splits_long_text() -> None:
         assert len(parsed.text.encode("utf-8")) <= FCITX_CHUNK_MAX_BYTES
         reassembled.append(parsed.text)
     assert "".join(reassembled) == text
+
+
+def test_parse_commit_frame_rejects_invalid_utf8() -> None:
+    with pytest.raises(ProtocolError):
+        parse_commit_frame(b"COMMIT tok 1 1\n\xff\xfe")
+
+
+def test_parse_commit_frame_rejects_sequence_out_of_range() -> None:
+    with pytest.raises(ProtocolError):
+        parse_commit_frame(b"COMMIT tok 3 2\ntext")
+    with pytest.raises(ProtocolError):
+        parse_commit_frame(b"COMMIT tok 0 1\ntext")
+
+
+def test_parse_fcitx_response_rejects_invalid_utf8() -> None:
+    with pytest.raises(ProtocolError):
+        parse_fcitx_response(b"REJECT \xff")
+
+
+def test_parse_fcitx_response_rejects_prefix_impostors() -> None:
+    with pytest.raises(ProtocolError):
+        parse_fcitx_response(b"REJECTED")
+    with pytest.raises(ProtocolError):
+        parse_fcitx_response(b"ERRORS")
+
+
+def test_split_utf8_handles_astral_codepoints() -> None:
+    text = "😀" * 10  # 40 UTF-8 bytes total, 4 bytes per codepoint
+    chunks = split_utf8(text, max_bytes=9)
+    assert "".join(chunks) == text
+    for chunk in chunks:
+        assert len(chunk.encode("utf-8")) <= 9
+
+
+def test_split_utf8_single_codepoint_exceeding_limit_is_kept() -> None:
+    # A 4-byte astral codepoint cannot fit in max_bytes=3; it is kept intact
+    # (the chunk may exceed the limit) rather than split.
+    assert split_utf8("😀a", max_bytes=3) == ["😀", "a"]
+
+
+def test_encode_commit_frame_rejects_empty_token() -> None:
+    with pytest.raises(ValueError):
+        encode_commit_frame("", 1, 1, "text")
+
+
+def test_build_commit_frames_empty_text_returns_no_frames() -> None:
+    assert build_commit_frames("tok", "") == []

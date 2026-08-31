@@ -197,8 +197,11 @@ class CommitFrame:
 def encode_commit_frame(
     focus_token: str, sequence: int, total: int, text: str
 ) -> bytes:
+    """Encode a single Fcitx COMMIT frame (header line + UTF-8 body)."""
     if sequence < 1 or total < 1 or sequence > total:
         raise ValueError("sequence/total must satisfy 1 <= sequence <= total")
+    if not focus_token:
+        raise ValueError("focus_token must not be empty")
     if any(c in focus_token for c in (" ", "\n", "\r")):
         raise ValueError("focus_token must not contain whitespace")
     body = text.encode("utf-8")
@@ -218,7 +221,12 @@ def parse_commit_frame(frame: bytes) -> CommitFrame:
     header, sep, body = frame.partition(b"\n")
     if not sep:
         raise ProtocolError("COMMIT frame is missing its header line")
-    parts = header.decode("utf-8").split(" ", 3)
+    try:
+        header_text = header.decode("utf-8")
+        body_text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("COMMIT frame is not valid UTF-8") from exc
+    parts = header_text.split(" ", 3)
     if len(parts) != 4 or parts[0] != "COMMIT":
         raise ProtocolError(f"malformed COMMIT header: {header!r}")
     try:
@@ -226,16 +234,21 @@ def parse_commit_frame(frame: bytes) -> CommitFrame:
         total = int(parts[3])
     except ValueError as exc:
         raise ProtocolError(f"malformed COMMIT sequence/total: {header!r}") from exc
+    if not (1 <= sequence <= total):
+        raise ProtocolError(f"invalid COMMIT sequence/total: {sequence}/{total}")
     return CommitFrame(
-        focus_token=parts[1], sequence=sequence, total=total, text=body.decode("utf-8")
+        focus_token=parts[1], sequence=sequence, total=total, text=body_text
     )
 
 
 def split_utf8(text: str, max_bytes: int = FCITX_CHUNK_MAX_BYTES) -> list[str]:
     """Split ``text`` into ordered chunks, each at most ``max_bytes`` UTF-8 bytes.
 
-    Chunks are cut only on Unicode codepoint boundaries, so a multi-byte
-    character is never split across two chunks. Returns ``[]`` for empty text.
+    Chunks are cut on Unicode codepoint (not grapheme cluster) boundaries, so
+    a multi-byte character is never split across two chunks. If a single
+    codepoint itself exceeds ``max_bytes``, that chunk will exceed the limit
+    (UTF-8 encodes one codepoint in at most 4 bytes, so this cannot happen at
+    the default 8 KiB threshold). Returns ``[]`` for empty text.
     """
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
@@ -260,8 +273,11 @@ def build_commit_frames(focus_token: str, text: str) -> list[bytes]:
 
     A text line that fits the 64 KiB limit is sent as a single frame. Longer
     text (or a frame that would overflow) is split into chunks of at most
-    8 KiB on Unicode boundaries, numbered ``1..total``.
+    8 KiB on Unicode boundaries, numbered ``1..total``. Empty ``text`` yields
+    no frames.
     """
+    if not text:
+        return []
     body = text.encode("utf-8")
     if len(body) <= FCITX_TEXT_LINE_MAX_BYTES:
         header = f"COMMIT {focus_token} 1 1\n".encode()
@@ -281,13 +297,15 @@ def parse_fcitx_response(line: bytes) -> FcitxResponse:
         raise MessageTooLarge(f"response exceeds {MAX_MESSAGE_BYTES} bytes")
     if b"\n" in line or b"\r" in line:
         raise ProtocolError("Fcitx response must be a single line")
-    text = line.decode("utf-8").strip()
+    try:
+        text = line.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("Fcitx response is not valid UTF-8") from exc
+    text = text.strip()
     if text == "OK":
         return FcitxResponse(status="ok")
-    if text.startswith("REJECT"):
-        reason = text.split(" ", 1)[1].strip() if " " in text else ""
-        return FcitxResponse(status="reject", reason=reason)
-    if text.startswith("ERROR"):
-        code = text.split(" ", 1)[1].strip() if " " in text else ""
-        return FcitxResponse(status="error", code=code)
+    if text == "REJECT" or text.startswith("REJECT "):
+        return FcitxResponse(status="reject", reason=text[7:].strip())
+    if text == "ERROR" or text.startswith("ERROR "):
+        return FcitxResponse(status="error", code=text[6:].strip())
     raise ProtocolError(f"unknown Fcitx response: {text!r}")
