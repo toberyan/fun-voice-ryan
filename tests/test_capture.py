@@ -183,10 +183,14 @@ def test_already_exited_normally_accepted(tmp_path: Path) -> None:
 
 
 def test_abnormal_exit_code_raises(tmp_path: Path) -> None:
-    recorder, _, _ = make_recorder(tmp_path, data=pcm_bytes(1000), exit_code=42)
+    notifications: list[str] = []
+    recorder, _, _ = make_recorder(
+        tmp_path, data=pcm_bytes(1000), exit_code=42, notifier=notifications.append
+    )
     recorder.start()
     with pytest.raises(CaptureError, match="exited abnormally"):
         recorder.stop()
+    assert notifications == []
 
 
 # --- Memory vs shard storage --------------------------------------------------

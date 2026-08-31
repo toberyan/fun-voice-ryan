@@ -12,8 +12,9 @@ accumulates the bytes subject to a hard memory bound:
   ``0600`` and bounded to ``SHARD_BYTES``.  The directory only ever holds the
   current task's shards and is removed when the artifact is handed off.
 
-``stop()`` finalizes by concatenating memory and shards into an anonymous memfd
-(never a named file) and returns a :class:`~fun_voice.contracts.CaptureArtifact`.
+``stop()`` finalizes by concatenating memory and shards into an unlinked
+tmpfs-backed ``TemporaryFile`` (never a named file) and returns a
+:class:`~fun_voice.contracts.CaptureArtifact`.
 
 Privacy red lines (never violated):
 
@@ -167,7 +168,6 @@ class PipeWireRecorder:
         self._bytes = 0
         self._started_mono = 0.0
         self._notified = False
-        self._auto_stopped = False
 
         self._backing_files: list[BinaryIO] = []
 
@@ -353,7 +353,6 @@ class PipeWireRecorder:
             self._notifier(message)
 
     def _auto_stop(self) -> None:
-        self._auto_stopped = True
         self._stop_event.set()
         proc = self._proc
         if proc is not None and proc.poll() is None:
@@ -474,5 +473,4 @@ class PipeWireRecorder:
         self._close_current_shard()
         self._bytes = 0
         self._notified = False
-        self._auto_stopped = False
 
