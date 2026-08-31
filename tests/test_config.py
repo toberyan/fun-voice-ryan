@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from fun_voice.config import (
+    DAEMON_SOCKET_NAME,
     DIRECTORY_MODE,
     FCITX_SOCKET_NAME,
     FILE_MODE,
@@ -56,6 +57,7 @@ def test_runtime_paths_layout(tmp_path: Path) -> None:
     paths = build_runtime_paths(runtime_dir)
     assert paths.runtime_dir == runtime_dir
     assert paths.worker_socket == runtime_dir / WORKER_SOCKET_NAME
+    assert paths.daemon_socket == runtime_dir / DAEMON_SOCKET_NAME
     assert paths.fcitx_socket == tmp_path / FCITX_SOCKET_NAME
 
 
@@ -65,4 +67,5 @@ def test_resolved_paths_are_private_and_expected(
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     paths = build_runtime_paths(resolve_runtime_dir(uid=os.getuid()))
     assert paths.worker_socket == tmp_path / RUNTIME_DIR_NAME / WORKER_SOCKET_NAME
+    assert paths.daemon_socket == tmp_path / RUNTIME_DIR_NAME / DAEMON_SOCKET_NAME
     assert paths.fcitx_socket == tmp_path / FCITX_SOCKET_NAME

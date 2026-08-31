@@ -22,12 +22,13 @@ FILE_MODE = 0o600
 """Mode for temporary PCM shards."""
 
 SOCKET_MODE = 0o600
-"""Mode for the worker and Fcitx Unix sockets."""
+"""Mode for the worker, daemon and Fcitx Unix sockets."""
 
 # --- Path names -------------------------------------------------------------
 
 RUNTIME_DIR_NAME = "fun-voice-ryan"
 WORKER_SOCKET_NAME = "worker.sock"
+DAEMON_SOCKET_NAME = "daemon.sock"
 FCITX_SOCKET_NAME = "fun-voice-ryan-fcitx.sock"
 
 
@@ -45,8 +46,6 @@ class Config:
 
     hotkey: str = "<Super>C"
     audio_source: str = "default"
-    memory_threshold_minutes: int = 10
-    max_recording_minutes: int = 30
     input_method: str = "fcitx5"
     commit_timeout_ms: int = 500
     allow_x11_paste_fallback: bool = True
@@ -64,12 +63,13 @@ class RuntimePaths:
     """Resolved private runtime paths under the user's XDG_RUNTIME_DIR.
 
     ``runtime_dir`` doubles as the directory for temporary PCM shards and is
-    created with mode ``DIRECTORY_MODE``; ``worker_socket`` and ``fcitx_socket``
-    are created with mode ``SOCKET_MODE``.
+    created with mode ``DIRECTORY_MODE``; ``worker_socket``, ``daemon_socket``
+    and ``fcitx_socket`` are created with mode ``SOCKET_MODE``.
     """
 
     runtime_dir: Path
     worker_socket: Path
+    daemon_socket: Path
     fcitx_socket: Path
 
 
@@ -115,12 +115,13 @@ def resolve_runtime_dir(
 def build_runtime_paths(runtime_dir: Path) -> RuntimePaths:
     """Build the runtime paths rooted at ``runtime_dir``.
 
-    The worker socket lives inside the private runtime directory; the Fcitx
-    socket is a sibling at the XDG_RUNTIME_DIR top level, matching the addon
-    contract (``fun-voice-ryan-fcitx.sock``).
+    The worker and daemon sockets live inside the private runtime directory;
+    the Fcitx socket is a sibling at the XDG_RUNTIME_DIR top level, matching the
+    addon contract (``fun-voice-ryan-fcitx.sock``).
     """
     return RuntimePaths(
         runtime_dir=runtime_dir,
         worker_socket=runtime_dir / WORKER_SOCKET_NAME,
+        daemon_socket=runtime_dir / DAEMON_SOCKET_NAME,
         fcitx_socket=runtime_dir.parent / FCITX_SOCKET_NAME,
     )

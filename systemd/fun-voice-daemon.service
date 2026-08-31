@@ -1,0 +1,19 @@
+[Unit]
+Description=Fun Voice Ryan push-to-talk daemon (capture -> ASR -> commit)
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Deployed by install-user.sh (Task 8) as a console-script wrapper; the
+# absolute path keeps it resolvable regardless of the user manager's PATH.
+ExecStart=%h/.local/bin/fun-voice-daemon
+Restart=on-failure
+RestartSec=2
+# The daemon binds $XDG_RUNTIME_DIR/fun-voice-ryan/daemon.sock and refuses to
+# start if XDG_RUNTIME_DIR is unset or not owned by the current user. It needs
+# DISPLAY/XAUTHORITY for X11 focus and C-key queries; a graphical-session
+# importer (autostart .desktop, Task 8) supplies them.
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,431 @@
+"""State-machine and pipeline unit tests for the voice daemon.
+
+Every desktop/capture/fcitx/clipboard/injector/worker adapter is a fake, so no
+X server, PipeWire, Fcitx or GPU is required. The tests drive the daemon's
+public surface (``start_if_idle`` / ``stop`` / ``handle_auto_stop``) and assert
+state transitions, notification copy, and that the single cleanup function runs
+on every path.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from fun_voice.capture import CaptureError
+from fun_voice.contracts import (
+    CaptureArtifact,
+    CommitResult,
+    DaemonState,
+    ErrorCode,
+    FocusSnapshot,
+    Transcription,
+)
+from fun_voice.daemon import (
+    NOTIFY_EMPTY_SPEECH,
+    NOTIFY_LIMIT_REACHED,
+    NOTIFY_RECOGNITION_FAILED,
+    NOTIFY_RECORDING,
+    NOTIFY_TRANSCRIBING,
+    EmptySpeechError,
+    VoiceDaemon,
+    WorkerError,
+)
+from fun_voice.desktop import ClipboardError, X11Error, XTestError
+from fun_voice.fcitx import FcitxCommitError
+
+ARTIFACT = CaptureArtifact(
+    audio="/proc/self/fd/3", sample_rate=16000, channels=1, format="s16le",
+    duration_ms=1000,
+)
+
+SNAPSHOT = FocusSnapshot(
+    active_window=1, process_name="app", input_focus=2, monotonic_ns=0, window_pid=9
+)
+
+
+# --- Fakes -------------------------------------------------------------------
+
+
+class FakeGuard:
+    def __init__(
+        self,
+        snapshots: list[FocusSnapshot] | None = None,
+        *,
+        error: X11Error | None = None,
+    ) -> None:
+        self._snapshots = list(snapshots) if snapshots else [SNAPSHOT]
+        self._error = error
+        self.captures = 0
+
+    def capture(self) -> FocusSnapshot:
+        self.captures += 1
+        if self._error is not None:
+            raise self._error
+        if len(self._snapshots) > 1:
+            return self._snapshots.pop(0)
+        return self._snapshots[0]
+
+    def is_same(self, a: FocusSnapshot, b: FocusSnapshot) -> bool:
+        return (
+            a.active_window == b.active_window
+            and a.process_name == b.process_name
+            and a.input_focus == b.input_focus
+            and a.window_pid == b.window_pid
+        )
+
+
+class FakeRecorder:
+    def __init__(
+        self,
+        artifact: CaptureArtifact = ARTIFACT,
+        *,
+        start_error: CaptureError | None = None,
+        stop_error: CaptureError | None = None,
+    ) -> None:
+        self.artifact = artifact
+        self.start_error = start_error
+        self.stop_error = stop_error
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.cleanup_calls = 0
+        self.cancel_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+
+    def stop(self) -> CaptureArtifact:
+        self.stop_calls += 1
+        if self.stop_error is not None:
+            raise self.stop_error
+        return self.artifact
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+
+    def cleanup(self) -> None:
+        self.cleanup_calls += 1
+
+
+class FakeFcitx:
+    def __init__(
+        self,
+        *,
+        token: str | None = "tok-123",
+        start_error: FcitxCommitError | None = None,
+        commit_result: CommitResult | None = None,
+        commit_error: FcitxCommitError | None = None,
+    ) -> None:
+        self.token = token
+        self.start_error = start_error
+        self.commit_result = commit_result
+        self.commit_error = commit_error
+        self.commits: list[tuple[str, str]] = []
+        self.closed = False
+
+    def start_focus(self) -> str | None:
+        if self.start_error is not None:
+            raise self.start_error
+        return self.token
+
+    def commit(self, focus_token: str, text: str) -> CommitResult:
+        self.commits.append((focus_token, text))
+        if self.commit_error is not None:
+            raise self.commit_error
+        if self.commit_result is not None:
+            return self.commit_result
+        return CommitResult(committed=True, method="fcitx")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeClipboard:
+    def __init__(self, error: ClipboardError | None = None) -> None:
+        self.error = error
+        self.writes: list[str] = []
+
+    def write_utf8(self, text: str) -> None:
+        if self.error is not None:
+            raise self.error
+        self.writes.append(text)
+
+
+class FakeInjector:
+    def __init__(self, error: XTestError | None = None) -> None:
+        self.error = error
+        self.pastes = 0
+
+    def paste_ctrl_v(self) -> None:
+        self.pastes += 1
+        if self.error is not None:
+            raise self.error
+
+
+class FakeNotifier:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def notify(self, message: str) -> None:
+        self.messages.append(message)
+
+
+class FakeWorker:
+    def __init__(
+        self,
+        text: str = "你好",
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.text = text
+        self.error = error
+        self.transcriptions: list[CaptureArtifact] = []
+        self.closed = False
+
+    def transcribe(self, artifact: CaptureArtifact) -> Transcription:
+        self.transcriptions.append(artifact)
+        if self.error is not None:
+            raise self.error
+        return Transcription(text=self.text, segments=())
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class Harness:
+    def __init__(
+        self,
+        *,
+        guard: FakeGuard | None = None,
+        recorder: FakeRecorder | None = None,
+        fcitx: FakeFcitx | None = None,
+        clipboard: FakeClipboard | None = None,
+        injector: FakeInjector | None = None,
+        worker: FakeWorker | None = None,
+    ) -> None:
+        self.guard = guard if guard is not None else FakeGuard()
+        self.recorder = recorder if recorder is not None else FakeRecorder()
+        self.clipboard = clipboard if clipboard is not None else FakeClipboard()
+        self.injector = injector if injector is not None else FakeInjector()
+        self.notifier = FakeNotifier()
+        self.worker = worker if worker is not None else FakeWorker()
+        self.fcitx_instances: list[FakeFcitx] = []
+        self._fcitx_template = fcitx if fcitx is not None else FakeFcitx()
+
+        def factory() -> FakeFcitx:
+            instance = FakeFcitx(
+                token=self._fcitx_template.token,
+                start_error=self._fcitx_template.start_error,
+                commit_result=self._fcitx_template.commit_result,
+                commit_error=self._fcitx_template.commit_error,
+            )
+            self.fcitx_instances.append(instance)
+            return instance
+
+        self.daemon = VoiceDaemon(
+            guard=self.guard,
+            recorder=self.recorder,
+            fcitx_factory=factory,
+            clipboard=self.clipboard,
+            injector=self.injector,
+            notifier=self.notifier,
+            worker=self.worker,
+        )
+
+    @property
+    def fcitx(self) -> FakeFcitx:
+        assert self.fcitx_instances, "no Fcitx instance was created"
+        return self.fcitx_instances[-1]
+
+
+def _started(harness: Harness) -> None:
+    assert harness.daemon.start_if_idle() == "started"
+
+
+# --- State machine -----------------------------------------------------------
+
+
+def test_initial_state_is_idle() -> None:
+    assert Harness().daemon.state is DaemonState.IDLE
+
+
+def test_stop_in_idle_is_a_noop() -> None:
+    h = Harness()
+    h.daemon.stop()
+    assert h.daemon.state is DaemonState.IDLE
+    assert h.recorder.stop_calls == 0
+    assert h.worker.transcriptions == []
+
+
+def test_start_in_idle_transitions_to_recording() -> None:
+    h = Harness()
+    assert h.daemon.start_if_idle() == "started"
+    assert h.daemon.state is DaemonState.RECORDING
+    assert h.recorder.start_calls == 1
+
+
+def test_start_records_focus_snapshot_and_requests_token() -> None:
+    h = Harness()
+    h.daemon.start_if_idle()
+    assert h.guard.captures == 1
+    assert len(h.fcitx_instances) == 1
+
+
+def test_start_notifies_recording() -> None:
+    h = Harness()
+    h.daemon.start_if_idle()
+    assert NOTIFY_RECORDING in h.notifier.messages
+
+
+@pytest.mark.parametrize(
+    "bad_state",
+    [DaemonState.RECORDING, DaemonState.TRANSCRIBING, DaemonState.COMMITTING],
+)
+def test_start_if_idle_while_busy_is_rejected(bad_state: DaemonState) -> None:
+    h = Harness()
+    h.daemon._state = bad_state
+    assert h.daemon.start_if_idle() == "busy"
+    assert h.guard.captures == 0
+    assert h.recorder.start_calls == 0
+
+
+def test_repeated_start_while_recording_is_noop() -> None:
+    h = Harness()
+    _started(h)
+    assert h.daemon.start_if_idle() == "busy"
+    assert h.daemon.start_if_idle() == "busy"
+    assert h.guard.captures == 1
+    assert h.recorder.start_calls == 1
+
+
+def test_start_x11_error_returns_error_and_stays_idle() -> None:
+    h = Harness(guard=FakeGuard(error=X11Error("no X")))
+    assert h.daemon.start_if_idle() == "error"
+    assert h.daemon.state is DaemonState.IDLE
+    assert h.recorder.start_calls == 0
+
+
+def test_start_capture_error_cleans_up_and_returns_to_idle() -> None:
+    h = Harness(recorder=FakeRecorder(start_error=CaptureError("boom")))
+    assert h.daemon.start_if_idle() == "error"
+    assert h.daemon.state is DaemonState.IDLE
+    assert h.recorder.cleanup_calls == 1
+
+
+@pytest.mark.parametrize("token_or_error", ["none", "error"])
+def test_fcitx_token_unavailable_still_records(token_or_error: str) -> None:
+    fcitx = FakeFcitx(token=None) if token_or_error == "none" else FakeFcitx(
+        start_error=FcitxCommitError("down")
+    )
+    h = Harness(fcitx=fcitx)
+    assert h.daemon.start_if_idle() == "started"
+    assert h.daemon.state is DaemonState.RECORDING
+
+
+def test_stop_transitions_through_pipeline_to_idle() -> None:
+    h = Harness()
+    _started(h)
+    h.daemon.stop()
+    assert h.daemon.state is DaemonState.IDLE
+    assert h.recorder.stop_calls == 1
+    assert h.worker.transcriptions == [ARTIFACT]
+    assert NOTIFY_TRANSCRIBING in h.notifier.messages
+
+
+# --- Every path returns to IDLE and cleans up --------------------------------
+
+
+def _run_failing_stop(
+    recorder: FakeRecorder | None = None,
+    worker: FakeWorker | None = None,
+) -> Harness:
+    h = Harness(recorder=recorder, worker=worker)
+    _started(h)
+    h.daemon.stop()
+    return h
+
+
+def test_capture_error_returns_to_idle_and_notifies() -> None:
+    h = _run_failing_stop(recorder=FakeRecorder(stop_error=CaptureError("no audio")))
+    assert h.daemon.state is DaemonState.IDLE
+    assert h.worker.transcriptions == []
+    assert NOTIFY_RECOGNITION_FAILED.format(category="capture") in h.notifier.messages
+
+
+def test_empty_speech_returns_to_idle_and_notifies() -> None:
+    h = _run_failing_stop(worker=FakeWorker(error=EmptySpeechError()))
+    assert h.daemon.state is DaemonState.IDLE
+    assert NOTIFY_EMPTY_SPEECH in h.notifier.messages
+    assert h.clipboard.writes == []
+
+
+def test_worker_error_returns_to_idle_and_notifies_category() -> None:
+    h = _run_failing_stop(
+        worker=FakeWorker(
+            error=WorkerError(ErrorCode("worker", "oom"), "out of memory")
+        )
+    )
+    assert h.daemon.state is DaemonState.IDLE
+    assert (
+        NOTIFY_RECOGNITION_FAILED.format(category="worker.oom")
+        in h.notifier.messages
+    )
+    assert h.clipboard.writes == []
+
+
+def test_empty_text_treated_as_empty_speech() -> None:
+    h = _run_failing_stop(worker=FakeWorker(text=""))
+    assert h.daemon.state is DaemonState.IDLE
+    assert NOTIFY_EMPTY_SPEECH in h.notifier.messages
+
+
+@pytest.mark.parametrize(
+    ("recorder", "worker"),
+    [
+        (FakeRecorder(stop_error=CaptureError("no audio")), None),
+        (None, FakeWorker(error=EmptySpeechError())),
+        (None, FakeWorker(error=WorkerError(ErrorCode("worker", "oom")))),
+        (None, FakeWorker(text="")),
+    ],
+)
+def test_cleanup_runs_on_every_failure_path(
+    recorder: FakeRecorder | None, worker: FakeWorker | None
+) -> None:
+    h = _run_failing_stop(recorder=recorder, worker=worker)
+    assert h.recorder.cleanup_calls == 1
+    assert h.daemon.state is DaemonState.IDLE
+
+
+def test_cleanup_runs_on_success_path() -> None:
+    h = Harness()
+    _started(h)
+    h.daemon.stop()
+    assert h.recorder.cleanup_calls == 1
+    assert h.daemon.state is DaemonState.IDLE
+
+
+def test_cleanup_closes_session_fcitx_client() -> None:
+    h = Harness()
+    _started(h)
+    h.daemon.stop()
+    assert h.fcitx.closed is True
+
+
+# --- Auto-stop ---------------------------------------------------------------
+
+
+def test_auto_stop_notifies_limit_and_transcribes() -> None:
+    h = Harness()
+    _started(h)
+    h.daemon.handle_auto_stop()
+    assert h.daemon.state is DaemonState.IDLE
+    assert NOTIFY_LIMIT_REACHED in h.notifier.messages
+    assert h.worker.transcriptions == [ARTIFACT]
+
+
+def test_auto_stop_outside_recording_is_noop() -> None:
+    h = Harness()
+    h.daemon.handle_auto_stop()
+    assert h.recorder.stop_calls == 0
+    assert h.notifier.messages == []
