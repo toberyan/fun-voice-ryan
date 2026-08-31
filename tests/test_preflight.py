@@ -258,7 +258,9 @@ def test_load_nano_engine_passes_triton_attn_backend(
             return object()
 
     leaf = types.ModuleType("funasr.models.fun_asr_nano.inference_vllm")
-    setattr(leaf, "FunASRNanoVLLM", _FakeFunASRNanoVLLM)
+    # types.ModuleType has no declared attribute; setattr avoids a mypy
+    # attr-defined error on this dynamically-built fake module.
+    setattr(leaf, "FunASRNanoVLLM", _FakeFunASRNanoVLLM)  # noqa: B010
     for pkg_name in ("funasr", "funasr.models", "funasr.models.fun_asr_nano"):
         monkeypatch.setitem(sys.modules, pkg_name, types.ModuleType(pkg_name))
     monkeypatch.setitem(
