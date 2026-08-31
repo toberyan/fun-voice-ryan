@@ -20,6 +20,7 @@ from fun_voice.contracts import (
     CommitResult,
     ErrorCode,
     FcitxResponse,
+    ProtocolError,
     build_commit_frames,
     parse_fcitx_response,
 )
@@ -48,6 +49,9 @@ class FcitxClient:
     payload, and each reply uses the same framing. ``commit`` splits text on
     Unicode boundaries (via :func:`fun_voice.contracts.build_commit_frames`)
     and stops sending further chunks as soon as one is rejected.
+
+    Any failed request closes the underlying socket so the next request opens a
+    fresh connection; this lets the daemon survive an addon restart.
     """
 
     def __init__(
@@ -88,6 +92,9 @@ class FcitxClient:
             if length > MAX_MESSAGE_BYTES:
                 raise FcitxCommitError(f"addon reply too large: {length} bytes")
             return self._recv_exact(sock, length)
+        except FcitxCommitError:
+            self.close()
+            raise
         except (OSError, struct.error) as exc:
             self.close()
             raise FcitxCommitError(f"communication failed: {exc}") from exc
@@ -110,14 +117,17 @@ class FcitxClient:
     def start_focus(self) -> str | None:
         """Ask the addon for a focus token, or return ``None`` if no context
         has focus."""
-        reply = self._request(b"START_FOCUS").decode("utf-8").strip()
-        if reply.startswith("FOCUS "):
-            token = reply[len("FOCUS ") :]
+        reply = self._request(b"START_FOCUS").strip()
+        if reply.startswith(b"FOCUS "):
+            try:
+                token = reply[len(b"FOCUS ") :].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise FcitxCommitError("malformed FOCUS reply") from exc
             if token:
                 return token
-        if reply == "REJECT no-input-context":
+        if reply == b"REJECT no-input-context":
             return None
-        raise FcitxCommitError(f"unexpected START_FOCUS reply: {reply!r}")
+        raise FcitxCommitError("unexpected START_FOCUS reply")
 
     def commit(self, focus_token: str, text: str) -> CommitResult:
         """Commit ``text`` into the focused context using ``focus_token``.
@@ -128,7 +138,11 @@ class FcitxClient:
         """
         frames = build_commit_frames(focus_token, text)
         for frame in frames:
-            response = parse_fcitx_response(self._request(frame))
+            try:
+                response = parse_fcitx_response(self._request(frame))
+            except ProtocolError as exc:
+                self.close()
+                raise FcitxCommitError("malformed addon reply") from exc
             if response.status != "ok":
                 return CommitResult(
                     committed=False,

@@ -5,13 +5,18 @@ from __future__ import annotations
 import socket
 import struct
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from fun_voice.config import FCITX_SOCKET_NAME
-from fun_voice.contracts import FCITX_CHUNK_MAX_BYTES, parse_commit_frame
+from fun_voice.contracts import (
+    FCITX_CHUNK_MAX_BYTES,
+    MAX_MESSAGE_BYTES,
+    parse_commit_frame,
+)
 from fun_voice.fcitx import FcitxClient, FcitxCommitError, default_socket_path
 
 _LENGTH = struct.Struct(">I")
@@ -70,6 +75,30 @@ class FakeAddon:
 
     def close(self) -> None:
         self._stop.set()
+        self._server.close()
+        self._thread.join(timeout=2.0)
+
+
+class RawServer:
+    """Accept one connection and hand raw socket control to ``handler``."""
+
+    def __init__(
+        self, path: Path, handler: Callable[[socket.socket], None]
+    ) -> None:
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(str(path))
+        self._server.listen(1)
+        self._thread = threading.Thread(
+            target=self._serve, args=(handler,), daemon=True
+        )
+        self._thread.start()
+
+    def _serve(self, handler: Callable[[socket.socket], None]) -> None:
+        conn, _ = self._server.accept()
+        with conn:
+            handler(conn)
+
+    def close(self) -> None:
         self._server.close()
         self._thread.join(timeout=2.0)
 
@@ -217,3 +246,74 @@ def test_connect_failure_raises(tmp_path: Path) -> None:
     client = FcitxClient(tmp_path / "nonexistent.sock", timeout=0.1)
     with pytest.raises(FcitxCommitError):
         client.ping()
+
+
+def test_request_reconnects_after_disconnect(make_addon) -> None:
+    state = {"attempts": 0}
+
+    def responder(payload: bytes) -> bytes | None:
+        state["attempts"] += 1
+        if state["attempts"] == 1:
+            return None  # drop the connection without a reply
+        return b"PONG"
+
+    fake = make_addon(responder)
+    client = FcitxClient(fake.path)
+    try:
+        with pytest.raises(FcitxCommitError):
+            client.ping()  # first attempt: connection dropped mid-request
+        assert client.ping() is True  # next request opens a fresh connection
+    finally:
+        client.close()
+
+
+def test_oversized_reply_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "sock"
+
+    def handler(conn: socket.socket) -> None:
+        conn.recv(1024)  # consume the request
+        conn.sendall(_LENGTH.pack(MAX_MESSAGE_BYTES + 1))  # bogus length, no body
+
+    server = RawServer(path, handler)
+    client = FcitxClient(path, timeout=1.0)
+    try:
+        with pytest.raises(FcitxCommitError):
+            client.ping()
+    finally:
+        client.close()
+        server.close()
+
+
+def test_recv_timeout_raises(tmp_path: Path) -> None:
+    path = tmp_path / "sock"
+
+    def handler(conn: socket.socket) -> None:
+        conn.recv(1024)  # consume the request, then stay silent
+        time.sleep(0.5)
+
+    server = RawServer(path, handler)
+    client = FcitxClient(path, timeout=0.1)
+    try:
+        with pytest.raises(FcitxCommitError):
+            client.ping()
+    finally:
+        client.close()
+        server.close()
+
+
+def test_malformed_reply_raises(tmp_path: Path) -> None:
+    path = tmp_path / "sock"
+
+    def handler(conn: socket.socket) -> None:
+        conn.recv(1024)  # consume the request
+        reply = b"NOT-A-VALID-REPLY"
+        conn.sendall(_LENGTH.pack(len(reply)) + reply)
+
+    server = RawServer(path, handler)
+    client = FcitxClient(path, timeout=1.0)
+    try:
+        with pytest.raises(FcitxCommitError):
+            client.commit("tok", "你好")
+    finally:
+        client.close()
+        server.close()

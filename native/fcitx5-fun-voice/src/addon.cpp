@@ -290,8 +290,9 @@ bool Connection::drainFrames() {
             static_cast<std::uint32_t>(
                 static_cast<unsigned char>(readBuffer_[3]));
         if (length > kMaxFrameBytes) {
-            sendReply("ERROR too-large");
-            return false; // protocol violation: drop the connection
+            // The peer's declared frame size violates the protocol; drop the
+            // connection without a reply (its framing cannot be trusted).
+            return false;
         }
         if (readBuffer_.size() < 4 + length) {
             return true;
