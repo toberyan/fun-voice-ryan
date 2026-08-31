@@ -6,6 +6,10 @@ build/
 dist/
 *.egg-info/
 
+# XPU 环境构建中间产物
+.funasr-src/
+.funasr-src.tar.gz
+
 # 工具缓存
 .pytest_cache/
 .mypy_cache/
