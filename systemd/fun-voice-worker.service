@@ -1,0 +1,18 @@
+[Unit]
+Description=Fun Voice Ryan Nano ASR worker (warm XPU)
+After=default.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=%h/workspace/fun-voice-ryan/.venv/bin/fun-voice-worker
+Restart=on-failure
+RestartSec=2
+# The worker binds $XDG_RUNTIME_DIR/fun-voice-ryan/worker.sock and refuses to
+# start if XDG_RUNTIME_DIR is unset or not owned by the current user.
+Environment=MODELSCOPE_CACHE=%h/.local/share/fun-voice-ryan/models
+Environment=FUN_VOICE_MODELS_ROOT=%h/.local/share/fun-voice-ryan/models
+
+[Install]
+WantedBy=default.target
