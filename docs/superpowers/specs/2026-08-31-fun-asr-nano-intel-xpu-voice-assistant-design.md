@@ -9,7 +9,7 @@ scope: Deepin X11 上的按住说话、本地 Fun-ASR-Nano、Intel Arc XPU 输�
 
 ## 目标
 
-在当前 Deepin X11 桌面上提供一个本地语音输入助手：用户按住 `Super+C` 说普通话，松开后由 FunASR 的 Fun-ASR-Nano 转写，并把**未作术语纠正或格式化的模型原始文本**自动粘贴到录音开始时的焦点窗口。
+在当前 Deepin X11 桌面上提供一个本地语音输入助手：用户按住 `Super+C` 说普通话，松开后由 FunASR 的 Fun-ASR-Nano 转写，并把**未作术语纠正或格式化的模型原始文本**自动提交到录音开始时的焦点窗口。
 
 首版以识别准确性为先，不提供唤醒词、持续监听、语音命令、跨设备同步或历史记录。
 
@@ -52,15 +52,18 @@ flowchart LR
     VAD --> NANO[Fun-ASR-Nano\nPyTorch xpu:0 + vLLM XPU]
     NANO --> AW
     AW -->|原始文本 + 有序段| VD
-    VD --> X11[X11 剪贴板 + Ctrl+V]
+    VD --> FCITX[fcitx5 Addon\n本地 Commit]
+    VD --> CLIP[CLIPBOARD 镜像]
+    VD --> X11[X11 Ctrl+V 回退]
     VD --> NTF[DDE 通知]
 ```
 
 | 组件 | 责任 | 不负责 |
 | --- | --- | --- |
 | 快捷键 Bridge | 被 DDE 执行；向 daemon 发送一个本地 `start_if_idle` 消息后退出 | 录音、模型加载、按键轮询 |
-| Voice Daemon | 状态机、X11 按住/松开检测、PipeWire 捕获、焦点校验、通知、剪贴板与清理 | 模型推理 |
+| Voice Daemon | 状态机、X11 按住/松开检测、PipeWire 捕获、焦点校验、通知、fcitx/剪贴板上屏和清理 | 模型推理 |
 | ASR Worker | 保存已验证的模型、VAD、分段、XPU 推理、按时间组装结果 | 全局快捷键、桌面文本注入 |
+| fcitx5 Addon | 在当前输入法输入上下文提交 UTF-8 文本，暴露受限本地 IPC | 录音、模型推理、文本持久化 |
 | 模型缓存 | 持久化 Fun-ASR-Nano、VAD 和 Nano 提取出的 vLLM 权重 | 存储任何用户音频或文本 |
 
 Daemon 与 Worker 均运行在当前用户的会话范围内。Worker 仅监听 `${XDG_RUNTIME_DIR}/fun-voice-ryan/asr.sock`，不开放 TCP 端口。
@@ -140,6 +143,8 @@ Injecting
 
 本机的 `${XDG_RUNTIME_DIR}` 是用户专属 tmpfs，因此临时分片不会进入持久磁盘。文件以模式 `0600` 创建，任务完成、取消、失败和 daemon 启动恢复时都删除。临时目录不用于模型缓存。
 
+PipeWire 录音由 `pw-record` 执行。停止录音时 daemon 发送 `SIGINT` 并有界等待；`0`、`-SIGINT` 和 `130` 都是预期停止状态。录音是否有效只由最小录音时长和实际 PCM/WAV 大小判断，不能因为 `pw-record` 的预期非零退出码而错误丢弃一段可转写音频。
+
 25 分钟显示一次“即将达到录音上限”通知；30 分钟自动停止并转写已经收集的内容。没有以文本重叠去重的后处理：Worker 以连续的 VAD 状态读取分片，生成不重叠的语音段，再按开始时间拼接模型的原始输出。
 
 ## 推理后端
@@ -180,7 +185,7 @@ FunASR 当前 Nano vLLM 实现将音频编码器、适配器和嵌入层移动�
 6. 日志、vLLM 平台信息和 XPU 内存指标证明 LLM 解码和 Nano 音频模块均未回退至 CPU。
 7. OOM 时 Worker 报错并保持桌面 daemon 可用；禁止隐式 CPU fallback。
 
-若第 1--6 项有任一失败，工程停在兼容性修复阶段，不开始桌面功能验收。
+若第 1--6 项有任一失败，工程停在兼容性修复阶段，不开始桌面功能验收。可另开一个明确标记的研究 spike，验证 FunASR Nano 的 llama.cpp/Vulkan 路径是否能在 Intel Arc 上完整满足需求；它不是自动运行时回退，必须重新通过端到端 POC 并由用户明确选择。
 
 ## Worker 接口
 
@@ -195,12 +200,17 @@ Worker 通过 Unix Domain Socket 提供最小本地接口：
 
 ## 文本注入与桌面安全
 
-- 录音开始时记录 X11 focus window id；转写完成后再次查询。
-- 两次 id 相同：将完整原始文本写入 CLIPBOARD selection，再以 XTEST 发送 `Ctrl+V`；完成后保留该文本在剪贴板。
-- 两次 id 不同：不发送按键；仍把文本写入剪贴板，并通知“焦点已变化，结果已复制”。
-- 无焦点窗口、锁屏、会话退出、剪贴板设置失败或粘贴键失败均视作注入失败，不重试向未知窗口输入。
+当前机器已运行 fcitx5，且安装了 Fcitx5Core 开发库。因此上屏采用本地 fcitx5 addon 作为首选，X11 剪贴板粘贴只作为降级通道：
 
-使用剪贴板粘贴而不是逐字模拟键盘事件，是为了保留中文、英文、换行和代码符号。首版不尝试恢复原剪贴板，避免破坏其可能包含的图片、富文本或多个 MIME 类型。
+1. 录音开始时记录 X11 focus window id；如果 addon 健康检查通过，同时获取当前输入上下文的不可预测 focus token。
+2. 转写完成后再次查询 X11 focus window id；不一致时不发送上屏请求，只把完整原始文本写入剪贴板并通知“焦点已变化，结果已复制”。
+3. 一致时，通过 mode `0600` 的 `${XDG_RUNTIME_DIR}/fun-voice-ryan-fcitx.sock` 发送 `COMMIT <focus-token>\n<utf8-text>`。Addon 必须验证 token 仍属于当前聚焦输入上下文后才调用 fcitx5 的 `commitString`。
+4. 无论 fcitx5 上屏成功与否，都独立、带超时地将完整文本镜像到 CLIPBOARD selection；剪贴板超时不得撤销或阻塞已经成功的上屏。
+5. 仅当 fcitx addon 不可用或拒绝本次请求，且 X11 焦点仍一致时，才使用 CLIPBOARD + XTEST `Ctrl+V` 回退。两个通道均失败时保留可用的剪贴板结果并显示失败通知。
+
+单个 addon 消息最大 64 KiB；超出时 daemon 必须只在 UTF-8 字符边界拆成不超过 8 KiB 的有序 `COMMIT` 块，且每块使用同一 focus token。任何一块被拒绝即停止后续块，不向新的焦点窗口继续写入。
+
+该设计保留中文、英文、换行和代码符号，不依赖逐字模拟键盘事件。首版不尝试恢复原剪贴板，避免破坏其可能包含的图片、富文本或多个 MIME 类型。Addon 和 daemon 的诊断日志严禁记录 `COMMIT` payload 或模型文本。
 
 ## 通知、错误与可观测性
 
@@ -212,12 +222,15 @@ Worker 通过 Unix Domain Socket 提供最小本地接口：
 | 松键后 | `识别中` |
 | 无声 | `未检测到语音` |
 | 焦点变化 | `焦点已变化，结果已复制到剪贴板` |
+| 剪贴板镜像失败 | `文本已输入，但剪贴板备份失败` |
 | XPU/Worker 失败 | `本地识别失败：<安全的错误类别>` |
 | 达到限制 | `已达到 30 分钟录音上限，开始识别` |
 
 可记录的诊断仅包括时间、状态转移、耗时、音频时长、错误类别、依赖版本、设备信息与内存指标；严禁记录音频字节、文件路径中可识别内容或转写文本。
 
 Worker 用 systemd user service 的 `Restart=on-failure` 运行。Daemon 遇到 Worker 断开会显示失败，不自动把待转写音频重新提交到其他后端。
+
+所有外部边界使用可替换的适配器：`DdeKeybindingClient`、`X11FocusGuard`、`PipeWireRecorder`、`FcitxCommitClient`、`ClipboardMirror` 和 `AsrWorkerClient`。业务状态机只依赖这些小接口，测试使用 fake 实现，不需要真实桌面、声卡或 GPU。
 
 ## 进程启动与配置
 
@@ -227,6 +240,7 @@ Worker 用 systemd user service 的 `Restart=on-failure` 运行。Daemon 遇到 
 - `fun-voice-ryan-daemon.service`：会话级、单实例、随图形会话退出。
 - `fun-voice-ryan-asr.service`：由 daemon 首次请求时启动，模型加载成功后保留到注销。
 - `fun-voice-ryan-hotkey`：DDE action 调用的轻量 Bridge。
+- `fun-voice-ryan-fcitx` addon：用户级 fcitx5 插件，加载后拥有受限的本地 commit socket；addon 不可用不阻塞 daemon 启动。
 
 配置建议使用单一 TOML 文件：
 
@@ -238,6 +252,11 @@ hotkey = "<Super>C"
 source = "default"
 memory_threshold_minutes = 10
 max_recording_minutes = 30
+
+[input_method]
+primary = "fcitx5"
+commit_timeout_ms = 500
+allow_x11_paste_fallback = true
 
 [inference]
 model = "FunAudioLLM/Fun-ASR-Nano-2512"
@@ -253,6 +272,8 @@ retain_history = false
 
 配置中的模型缓存路径和 socket 路径由应用计算，不接受任意世界可写目录。系统级快捷键改动仅操作由本应用保存 id 的自定义快捷键。
 
+`fun-voice-ryan --self-test` 是安装与升级的放行检查，按只读或可清理的方式验证：DDE/X11 会话、`Super+C` 冲突、Bridge 到 daemon 的按住时机、PipeWire 默认输入和最短捕获、fcitx addon `PING`、剪贴板/XTEST 回退能力、Worker 健康检查，以及完整 XPU POC。未通过项必须给出可操作的错误类别，不能加载模型后才发现桌面集成无法工作。
+
 ## 验收测试
 
 ### 单元测试
@@ -261,12 +282,16 @@ retain_history = false
 - PCM 分片在 10 分钟阈值前后保持单调时间戳，无丢帧或重叠。
 - 清理函数在成功、VAD 空结果、XPU OOM、进程取消和异常退出恢复时均被调用。
 - 焦点守卫与剪贴板决策：相同窗口粘贴；变化窗口只复制。
+- fcitx focus token 一致时只提交一次；token 不一致、无输入上下文或 addon 超时均不提交，并可在焦点仍一致时走 X11 回退。
+- 剪贴板写入超时或失败不能阻塞 fcitx 提交；所有日志断言不得包含转写文本。
+- `pw-record` 收到 `SIGINT` 后的预期退出状态不会把有效音频误判为失败。
 - Worker 的段排序和原始文本拼接不做术语替换。
 
 ### 集成测试
 
 - DDE 中可看见、修改、删除本快捷键；`Super+C` 无系统冲突。
 - 在浏览器、终端和 IDE 按住/松开，验证不误输入字母 `c`。
+- fcitx addon `PING` 与 `COMMIT` 在中文、英文、换行及代码符号上正确工作；失去焦点后 token 被拒绝。
 - 合成短音频、普通话夹英文术语、中等时长和超过内存阈值的录音均生成正确顺序的结果。
 - 录音中切换焦点、锁屏、拔掉输入设备、杀死 Worker、制造 XPU OOM 时无错误注入和无残留文件。
 - 连续 30 次录音验证不产生重复文本、任务串台或守护进程泄漏。
@@ -280,7 +305,12 @@ retain_history = false
 - 不支持 Wayland、Windows、macOS 或多用户系统服务。
 - 不提供实时字幕、唤醒词、说话人分离、语音命令或历史检索。
 - 不保证能识别浏览器内部的密码输入框；焦点守卫只保证不会因窗口切换向另一窗口注入。使用敏感输入框前应避免触发快捷键。
+- 不读取 `/dev/input/event*`；这避免了 raw keyboard 监听所需的额外权限。DDE action 在按住阶段不可用时，才将纯 X11 抓键作为有单独审查的回退方案。
 - XPU 组合的最大技术风险是 FunASR 的 `enable_prompt_embeds` 与 vLLM XPU kernel 的端到端兼容性；POC 是该风险的唯一放行依据。
+
+## 参考实现中吸收与拒绝的设计
+
+`qwen-voice-input-deploy` 提供了有价值的同类桌面实践：`pw-record` 的结束语义、fcitx5 addon 的本地 IPC、上屏与剪贴板解耦、systemd user service、自检命令和可替换边界的单元测试。上述模式已吸收，但实现不得复制其会记录文本、持久化录音、直接读取 `/dev/input/event*`、自动 LLM 润色或实时增量上屏的行为；这些都与本方案的隐私、安全或“原始最终文本”约束冲突。
 
 ## 参考
 
