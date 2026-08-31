@@ -74,6 +74,8 @@ NOTIFY_RECORDING = "录音中"
 NOTIFY_TRANSCRIBING = "识别中"
 NOTIFY_EMPTY_SPEECH = "未检测到语音"
 NOTIFY_FOCUS_CHANGED = "焦点已变化，结果已复制到剪贴板"
+NOTIFY_COMMIT_CANCELLED = "输入已取消，结果已复制到剪贴板"
+NOTIFY_RESULT_LOST = "结果已丢失：焦点已变化且剪贴板不可用"
 NOTIFY_CLIPBOARD_FAILED = "文本已输入，但剪贴板备份失败"
 NOTIFY_RECOGNITION_FAILED = "本地识别失败：{category}"
 NOTIFY_LIMIT_REACHED = "已达到 30 分钟录音上限，开始识别"
@@ -82,6 +84,8 @@ NOTIFY_LIMIT_REACHED = "已达到 30 分钟录音上限，开始识别"
 WORKER_RESPONSE_TIMEOUT_SECONDS = 130.0
 FUN_VOICE_WORKER_SERVICE = "fun-voice-worker.service"
 SOCKET_BACKLOG = 4
+REQUEST_READ_TIMEOUT_SECONDS = 10.0
+STOP_LOCK_TIMEOUT_SECONDS = 2.0
 
 # Hold-to-talk confirmation: after the bridge reports C down, the daemon must
 # confirm C is still physically held within this window before recording.
@@ -112,14 +116,35 @@ class _WorkerConnectFailure(Exception):
     """Internal marker: the worker socket could not be reached/parsed."""
 
 
+_ALLOWED_WORKER_CODES = frozenset(
+    {
+        "empty_speech",
+        "oom",
+        "vllm",
+        "no_output",
+        "format",
+        "timeout",
+        "device",
+        "internal",
+        "protocol",
+        "unavailable",
+    }
+)
+
+
 def _parse_error_code(value: object) -> ErrorCode:
-    """Parse a worker ``error_code`` string back into an :class:`ErrorCode`."""
+    """Parse a worker ``error_code`` string into an :class:`ErrorCode`.
+
+    Only the known worker categories/codes are accepted; anything else falls
+    back to ``worker.internal`` so a malformed or hostile code never flows into
+    a notification or log line.
+    """
     if not isinstance(value, str) or not value:
         return ErrorCode("worker", "internal")
     category, sep, code = value.partition(".")
-    if sep and code:
+    if sep and category == "worker" and code in _ALLOWED_WORKER_CODES:
         return ErrorCode(category, code)
-    return ErrorCode("worker", value)
+    return ErrorCode("worker", "internal")
 
 
 # --- Adapter seams (the fakes implement these) -------------------------------
@@ -367,14 +392,20 @@ class VoiceDaemon:
     # --- Requests ------------------------------------------------------------
 
     def dispatch(self, message: Mapping[str, Any]) -> str:
-        op = message.get("op")
-        if op == "start_if_idle":
-            return self.start_if_idle()
-        if op == "stop":
-            self.stop()
-            return "ok"
-        logger.warning("ignoring unknown op: %r", op)
-        return "error"
+        try:
+            op = message.get("op")
+            if op == "start_if_idle":
+                return self.start_if_idle()
+            if op == "stop":
+                self.stop()
+                return "ok"
+            logger.warning("ignoring unknown op: %r", op)
+            return "error"
+        except Exception as exc:
+            # Never leak a message body or transcription text into logs.
+            logger.error("dispatch failed: %s", type(exc).__name__)
+            self._notify(NOTIFY_RECOGNITION_FAILED.format(category="internal"))
+            return "error"
 
     def start_if_idle(self) -> str:
         """Start recording if idle; ``"started"`` / ``"busy"`` / ``"error"`` /
@@ -397,7 +428,6 @@ class VoiceDaemon:
             # Hold-to-talk gate: confirm C is still held before recording.
             if not self._confirm_c_pressed():
                 logger.info("start_if_idle cancelled: C not held in window")
-                self._recorder.cancel()
                 self._cleanup()
                 return "cancelled"
 
@@ -421,6 +451,18 @@ class VoiceDaemon:
                 self._notify(NOTIFY_RECOGNITION_FAILED.format(category="capture"))
                 return "error"
 
+            # Re-check C after starting: a release during the start window must
+            # cancel instead of leaving an unintended recording running.
+            try:
+                if not self._guard.c_is_down():
+                    logger.info("start_if_idle cancelled: C released during start")
+                    self._cleanup()
+                    return "cancelled"
+            except X11Error:
+                logger.warning("start_if_idle cancelled: X11 unavailable after start")
+                self._cleanup()
+                return "cancelled"
+
             self._state = DaemonState.RECORDING
             logger.info("state -> recording")
             self._notify(NOTIFY_RECORDING)
@@ -442,8 +484,14 @@ class VoiceDaemon:
             self._sleep(C_CONFIRM_POLL_SECONDS)
 
     def stop(self) -> None:
-        """Handle a bridge ``stop`` (key released); only acts while RECORDING."""
-        if not self._lock.acquire(blocking=False):
+        """Handle a bridge ``stop`` (key released); only acts while RECORDING.
+
+        Uses a bounded blocking acquire so a ``stop`` arriving while ``start``
+        still holds the lock (e.g. during ``fcitx.start_focus``) waits for it
+        and then stops, instead of being silently dropped. The bound keeps it
+        from ever blocking on a long transcription.
+        """
+        if not self._lock.acquire(timeout=STOP_LOCK_TIMEOUT_SECONDS):
             return
         try:
             if self._state is not DaemonState.RECORDING:
@@ -542,12 +590,12 @@ class VoiceDaemon:
             return
         if not self._guard.is_same(snapshot, current):
             logger.info("focus changed; skipping injection")
-            self._notify_focus_or_clipboard(clipboard_ok)
+            self._notify_focus_or_clipboard(clipboard_ok, NOTIFY_FOCUS_CHANGED)
             return
 
         # 3. Prefer Fcitx commit (reusing the focus token), else XTEST fallback.
         if session.token is not None:
-            outcome = self._fcitx_commit(session, text)
+            outcome = self._fcitx_commit(session, text, clipboard_ok)
             if outcome is True:
                 if not clipboard_ok:
                     self._notify(NOTIFY_CLIPBOARD_FAILED)
@@ -558,7 +606,9 @@ class VoiceDaemon:
         # 4. XTEST fallback: only when focus is still unchanged and XTEST works.
         self._xtest_fallback(snapshot, clipboard_ok)
 
-    def _fcitx_commit(self, session: _Session, text: str) -> bool | None:
+    def _fcitx_commit(
+        self, session: _Session, text: str, clipboard_ok: bool
+    ) -> bool | None:
         """Return ``True`` (committed), ``False`` (explicit stale-focus reject),
         or ``None`` (channel failure → XTEST fallback allowed)."""
         assert session.token is not None
@@ -567,14 +617,16 @@ class VoiceDaemon:
         except FcitxCommitError:
             logger.info("fcitx channel failure; XTEST fallback allowed")
             return None
-        return self._interpret_commit(result)
+        return self._interpret_commit(result, clipboard_ok)
 
-    def _interpret_commit(self, result: CommitResult) -> bool | None:
+    def _interpret_commit(
+        self, result: CommitResult, clipboard_ok: bool
+    ) -> bool | None:
         if result.committed:
             return True
         if result.error is not None and result.error.code == "stale-focus":
             logger.info("fcitx rejected with stale focus; no fallback")
-            self._notify(NOTIFY_RECOGNITION_FAILED.format(category=str(result.error)))
+            self._notify_focus_or_clipboard(clipboard_ok, NOTIFY_COMMIT_CANCELLED)
             return False
         logger.info("fcitx returned error; XTEST fallback allowed")
         return None
@@ -587,7 +639,7 @@ class VoiceDaemon:
             return
         if not self._guard.is_same(snapshot, current):
             logger.info("focus changed before XTEST; skipping injection")
-            self._notify_focus_or_clipboard(clipboard_ok)
+            self._notify_focus_or_clipboard(clipboard_ok, NOTIFY_FOCUS_CHANGED)
             return
         try:
             self._injector.paste_ctrl_v()
@@ -598,11 +650,11 @@ class VoiceDaemon:
         if not clipboard_ok:
             self._notify(NOTIFY_CLIPBOARD_FAILED)
 
-    def _notify_focus_or_clipboard(self, clipboard_ok: bool) -> None:
+    def _notify_focus_or_clipboard(self, clipboard_ok: bool, message: str) -> None:
         if clipboard_ok:
-            self._notify(NOTIFY_FOCUS_CHANGED)
+            self._notify(message)
         else:
-            self._notify(NOTIFY_RECOGNITION_FAILED.format(category="clipboard"))
+            self._notify(NOTIFY_RESULT_LOST)
 
     # --- Cleanup -------------------------------------------------------------
 
@@ -667,6 +719,7 @@ class DaemonRequestHandler(socketserver.StreamRequestHandler):
         if not server.client_allowed(conn):
             logger.warning("rejecting connection from non-owner uid")
             return
+        conn.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
         try:
             line = _read_line(conn)
         except MessageTooLarge:

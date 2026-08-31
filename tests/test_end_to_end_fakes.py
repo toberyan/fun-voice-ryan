@@ -35,8 +35,10 @@ from fun_voice.contracts import (
 )
 from fun_voice.daemon import (
     NOTIFY_CLIPBOARD_FAILED,
+    NOTIFY_COMMIT_CANCELLED,
     NOTIFY_FOCUS_CHANGED,
     NOTIFY_RECOGNITION_FAILED,
+    NOTIFY_RESULT_LOST,
     DaemonServer,
     EmptySpeechError,
     SocketWorkerClient,
@@ -289,8 +291,18 @@ def test_focus_change_writes_only_clipboard() -> None:
     _record(h, "你好")
     assert h.clipboard.writes == ["你好"]
     assert h.fcitx.commits == []
-    assert h.injector.pastes == 0
     assert NOTIFY_FOCUS_CHANGED in h.notifier.messages
+
+
+def test_focus_change_and_clipboard_failure_reports_result_lost() -> None:
+    h = Harness(
+        guard=FakeGuard(snapshots=[SNAPSHOT, CHANGED]),
+        clipboard=FakeClipboard(error=ClipboardError("xclip missing")),
+    )
+    _record(h, "你好")
+    assert h.injector.pastes == 0
+    assert h.fcitx.commits == []
+    assert NOTIFY_RESULT_LOST in h.notifier.messages
 
 
 def test_fcitx_channel_failure_falls_back_to_xtest() -> None:
@@ -310,11 +322,7 @@ def test_fcitx_stale_focus_reject_does_not_fall_back() -> None:
     )
     _record(h, "你好")
     assert h.injector.pastes == 0
-    assert h.fcitx.commits == [("tok-123", "你好")]
-    assert (
-        NOTIFY_RECOGNITION_FAILED.format(category="fcitx.stale-focus")
-        in h.notifier.messages
-    )
+    assert NOTIFY_COMMIT_CANCELLED in h.notifier.messages
 
 
 def test_clipboard_failure_does_not_undo_fcitx_success() -> None:
@@ -411,11 +419,8 @@ def test_long_text_reject_sends_only_prefix_chunks() -> None:
     assert "".join(fcitx.sent_chunks) != long_text
     # The daemon never injects partial text via XTEST or a retry.
     assert injector.pastes == 0
-    assert fcitx.commits == [("tok-123", long_text)]
-    assert (
-        NOTIFY_RECOGNITION_FAILED.format(category="fcitx.stale-focus")
-        in notifier.messages
-    )
+    assert NOTIFY_COMMIT_CANCELLED in notifier.messages
+
 
 def test_no_token_records_and_uses_xtest_only() -> None:
     h = Harness(fcitx=FakeFcitx(token=None))
@@ -739,6 +744,20 @@ def test_worker_client_maps_oom_code(tmp_path: Path) -> None:
         with pytest.raises(WorkerError) as excinfo:
             client.transcribe(ARTIFACT)
         assert excinfo.value.code == ErrorCode("worker", "oom")
+    finally:
+        server.close()
+
+
+def test_worker_client_sanitizes_unknown_error_code(tmp_path: Path) -> None:
+    server = _WorkerSocket(
+        tmp_path / "worker.sock", _error_responder("worker.hacked<script>")
+    )
+    try:
+        client = SocketWorkerClient(tmp_path / "worker.sock", timeout=2.0)
+        with pytest.raises(WorkerError) as excinfo:
+            client.transcribe(ARTIFACT)
+        # Unknown/hostile codes fall back so they never reach notifications/logs.
+        assert excinfo.value.code == ErrorCode("worker", "internal")
     finally:
         server.close()
 

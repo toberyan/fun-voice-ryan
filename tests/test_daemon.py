@@ -9,6 +9,7 @@ on every path.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 
@@ -305,7 +306,7 @@ def test_start_cancels_when_c_not_pressed() -> None:
     )
     assert h.daemon.start_if_idle() == "cancelled"
     assert h.daemon.state is DaemonState.IDLE
-    assert h.recorder.cancel_calls == 1
+    assert h.recorder.cancel_calls == 0  # recorder never started; cleanup suffices
     assert h.recorder.start_calls == 0
     assert h.notifier.messages == []  # cancel is silent
 
@@ -319,6 +320,60 @@ def test_stop_while_transcribing_or_committing_is_noop(bad_state: DaemonState) -
     h.daemon.stop()
     assert h.recorder.stop_calls == 0
     assert h.worker.transcriptions == []
+
+
+class BlockingStartFcitx:
+    """Blocks inside ``start_focus`` so a test can hold the daemon lock."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def start_focus(self) -> str:
+        self.entered.set()
+        self.release.wait(timeout=5.0)
+        return "tok-123"
+
+    def commit(self, focus_token: str, text: str) -> CommitResult:
+        return CommitResult(committed=True, method="fcitx")
+
+    def close(self) -> None:
+        pass
+
+
+def test_stop_during_start_is_not_dropped() -> None:
+    fcitx = BlockingStartFcitx()
+    recorder = FakeRecorder()
+    daemon = VoiceDaemon(
+        guard=FakeGuard(),
+        recorder=recorder,
+        fcitx_factory=lambda: fcitx,
+        clipboard=FakeClipboard(),
+        injector=FakeInjector(),
+        notifier=FakeNotifier(),
+        worker=FakeWorker(text="你好"),
+    )
+    result: dict[str, str] = {}
+
+    def do_start() -> None:
+        result["status"] = daemon.start_if_idle()
+
+    start_thread = threading.Thread(target=do_start)
+    start_thread.start()
+    assert fcitx.entered.wait(timeout=2.0)  # start is now holding the lock
+
+    stop_thread = threading.Thread(target=daemon.stop)
+    stop_thread.start()
+    time.sleep(0.05)  # let stop block on the lock
+    fcitx.release.set()  # release start; stop must then proceed
+
+    start_thread.join(timeout=2.0)
+    stop_thread.join(timeout=2.0)
+
+    assert result["status"] == "started"
+    assert recorder.stop_calls == 1  # the queued stop was not dropped
+    assert daemon.state is DaemonState.IDLE
+
 
 @pytest.mark.parametrize(
     "bad_state",
