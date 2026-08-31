@@ -27,6 +27,7 @@ import contextlib
 import os
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -85,13 +86,24 @@ class Runner(Protocol):
     """Runs a command and returns ``(returncode, stdout, stderr)``."""
 
     def __call__(
-        self, argv: Sequence[str], input_text: str | None = None
+        self,
+        argv: Sequence[str],
+        input_text: str | None = None,
+        *,
+        timeout: float | None = None,
     ) -> RunResult: ...
 
 
-def default_runner(argv: Sequence[str], input_text: str | None = None) -> RunResult:
+def default_runner(
+    argv: Sequence[str],
+    input_text: str | None = None,
+    *,
+    timeout: float | None = None,
+) -> RunResult:
     """Run a command via subprocess, capturing UTF-8 text output."""
-    proc = subprocess.run(argv, input=input_text, capture_output=True, text=True)
+    proc = subprocess.run(
+        argv, input=input_text, capture_output=True, text=True, timeout=timeout
+    )
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
@@ -297,7 +309,7 @@ def _write_shortcut_id(path: Path, shortcut_id: str) -> None:
 def _read_shortcut_id(path: Path) -> str | None:
     try:
         text = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
+    except (OSError, UnicodeDecodeError):
         return None
     return text or None
 
@@ -360,9 +372,10 @@ def _first_int(value: object) -> int | None:
     if isinstance(value, int):
         return value
     if isinstance(value, (bytes, bytearray)):
+        if not value:
+            return None
         return int.from_bytes(value, "little")
     return None
-
 
 def _window_id(window: object) -> int | None:
     """Resolve an X11 window handle to its id, mapping None/PointerRoot to ``None``."""
@@ -408,8 +421,8 @@ class X11FocusGuard:
 
     def capture(self) -> FocusSnapshot:
         """Capture the current X11 focus state, raising X11Error on server error."""
-        display = self.display
         try:
+            display = self.display
             root = display.screen().root
             active_atom = display.intern_atom("_NET_ACTIVE_WINDOW")
             active = self._read_active_window(root, active_atom)
@@ -443,8 +456,13 @@ class X11FocusGuard:
 
     def c_is_down(self) -> bool:
         """Return whether the physical ``C`` key is currently held down."""
-        keycode = self.display.keysym_to_keycode(XK_C)
-        keymap = self.display.query_keymap()
+        try:
+            keycode = self.display.keysym_to_keycode(XK_C)
+            keymap = self.display.query_keymap()
+        except Exception as exc:
+            raise X11Error(f"X11 key state query failed: {exc}") from exc
+        if keycode == 0:
+            return False
         if not (0 <= keycode < len(keymap) * 8):
             return False
         return bool(keymap[keycode // 8] & (1 << (keycode % 8)))
@@ -453,7 +471,7 @@ class X11FocusGuard:
         prop = root.get_full_property(active_atom, X_ANY_PROPERTY_TYPE)
         if prop is None:
             return None
-        return _first_int(prop.value)
+        return _window_id(_first_int(prop.value))
 
     def _read_input_focus(self, display: XDisplay) -> int | None:
         focus, _revert = display.get_input_focus()
@@ -503,6 +521,8 @@ class HotkeyBridge:
 
 # --- Clipboard mirror --------------------------------------------------------
 
+CLIPBOARD_TIMEOUT_SECONDS = 5.0
+
 
 class ClipboardMirror:
     """Writes UTF-8 text to the CLIPBOARD selection via xclip or xsel."""
@@ -513,10 +533,12 @@ class ClipboardMirror:
         *,
         binary: str | None = None,
         which: Callable[[str], str | None] = shutil.which,
+        timeout: float | None = CLIPBOARD_TIMEOUT_SECONDS,
     ) -> None:
         self._runner: Runner = runner if runner is not None else default_runner
         self._binary = binary
         self._which = which
+        self._timeout = timeout
 
     def write_utf8(self, text: str) -> None:
         """Mirror ``text`` to the CLIPBOARD selection, raising on failure."""
@@ -527,7 +549,12 @@ class ClipboardMirror:
             argv = ["xsel", "--clipboard", "--input"]
         else:
             raise ClipboardError(f"unsupported clipboard tool: {binary!r}")
-        code, _stdout, stderr = self._runner(argv, text)
+        try:
+            code, _stdout, stderr = self._runner(argv, text, timeout=self._timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise ClipboardError(
+                f"clipboard write via {binary} timed out after {self._timeout}s"
+            ) from exc
         if code != 0:
             raise ClipboardError(
                 f"failed to write clipboard via {binary}: {stderr.strip()}"
@@ -568,13 +595,20 @@ class XTestInjector:
             from Xlib.ext import xtest
 
             fake_input = xtest.fake_input
-        ctrl = d.keysym_to_keycode(XK_CONTROL_L)
-        v = d.keysym_to_keycode(XK_V)
-        fake_input(d, X_KEY_PRESS, ctrl)
-        fake_input(d, X_KEY_PRESS, v)
-        fake_input(d, X_KEY_RELEASE, v)
-        fake_input(d, X_KEY_RELEASE, ctrl)
-        d.sync()
+        try:
+            ctrl = d.keysym_to_keycode(XK_CONTROL_L)
+            v = d.keysym_to_keycode(XK_V)
+            if ctrl == 0 or v == 0:
+                raise XTestError("Ctrl or V keycode unavailable on this display")
+            fake_input(d, X_KEY_PRESS, ctrl)
+            fake_input(d, X_KEY_PRESS, v)
+            fake_input(d, X_KEY_RELEASE, v)
+            fake_input(d, X_KEY_RELEASE, ctrl)
+            d.sync()
+        except XTestError:
+            raise
+        except Exception as exc:
+            raise XTestError(f"XTEST injection failed: {exc}") from exc
 
 
 # --- CLI (used by the register/unregister scripts) ----------------------------
@@ -603,20 +637,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ns = parser.parse_args(argv)
     client = DdeKeybindingClient()
-    if ns.command == "register":
+    try:
+        if ns.command == "register":
+            state_file = _state_file_or_default(ns.state_file)
+            shortcut_id = register_shortcut(
+                client,
+                name=ns.name,
+                action=ns.action,
+                hotkey=ns.hotkey,
+                state_file=state_file,
+            )
+            print(shortcut_id)
+            return 0
         state_file = _state_file_or_default(ns.state_file)
-        shortcut_id = register_shortcut(
-            client,
-            name=ns.name,
-            action=ns.action,
-            hotkey=ns.hotkey,
-            state_file=state_file,
-        )
-        print(shortcut_id)
+        unregister_shortcut(client, state_file=state_file)
         return 0
-    state_file = _state_file_or_default(ns.state_file)
-    unregister_shortcut(client, state_file=state_file)
-    return 0
+    except DesktopError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
 
 
 if __name__ == "__main__":

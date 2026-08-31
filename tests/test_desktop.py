@@ -7,6 +7,7 @@ server or DDE session is required.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,11 @@ class FakeRunner:
         self._results = list(results)
 
     def __call__(
-        self, argv: list[str] | tuple[str, ...], input_text: str | None = None
+        self,
+        argv: list[str] | tuple[str, ...],
+        input_text: str | None = None,
+        *,
+        timeout: float | None = None,
     ) -> tuple[int, str, str]:
         self.calls.append((tuple(argv), input_text))
         if self._results:
@@ -315,6 +320,15 @@ def test_unregister_shortcut_without_state_is_noop(tmp_path: Path) -> None:
     assert runner.calls == []
 
 
+def test_unregister_corrupted_state_file_is_noop(tmp_path: Path) -> None:
+    state_file = tmp_path / "shortcut-id"
+    state_file.write_bytes(b"\xff\xfe\x00garbage")
+    runner = FakeRunner()
+    client = DdeKeybindingClient(runner)
+    assert unregister_shortcut(client, state_file=state_file) is None
+    assert runner.calls == []
+
+
 # --- Hotkey bridge -----------------------------------------------------------
 
 
@@ -412,6 +426,15 @@ def test_focus_guard_x_server_error_raises() -> None:
         guard.capture()
 
 
+def test_focus_guard_display_open_failure_raises_x11_error() -> None:
+    def boom() -> FakeDisplay:
+        raise RuntimeError("cannot open display")
+
+    guard = X11FocusGuard(display=None, make_display=boom, monotonic=lambda: 0)
+    with pytest.raises(X11Error):
+        guard.capture()
+
+
 def test_focus_guard_is_same_compares_focus_identity_only() -> None:
     guard = X11FocusGuard(display=FakeDisplay(), monotonic=lambda: 0)
     a = FocusSnapshot(
@@ -458,6 +481,12 @@ def test_focus_guard_c_is_down() -> None:
     assert guard.c_is_down() is False
 
 
+def test_c_is_down_invalid_keycode_returns_false() -> None:
+    display = FakeDisplay(c_keycode=0)
+    guard = X11FocusGuard(display=display, monotonic=lambda: 0)
+    assert guard.c_is_down() is False
+
+
 # --- Clipboard mirror --------------------------------------------------------
 
 
@@ -483,6 +512,20 @@ def test_clipboard_failure_raises() -> None:
     runner = FakeRunner((1, "", "xclip: error"))
     mirror = ClipboardMirror(runner, binary="xclip")
     with pytest.raises(ClipboardError, match="xclip"):
+        mirror.write_utf8("text")
+
+
+def test_clipboard_timeout_raises() -> None:
+    def timeout_runner(
+        argv: list[str] | tuple[str, ...],
+        input_text: str | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[int, str, str]:
+        raise subprocess.TimeoutExpired(argv, timeout or 5)
+
+    mirror = ClipboardMirror(timeout_runner, binary="xclip")
+    with pytest.raises(ClipboardError, match="timed out"):
         mirror.write_utf8("text")
 
 
