@@ -89,7 +89,8 @@ worker 首次启动需要几分钟加载模型（状态会先处于 `activating`
 - 不要把 `Super+C` 分配给其他 DDE 快捷键或第三方工具。
 - 卸载前先运行 `scripts/uninstall-user.sh`，它会注销快捷键并删除 id 文件。
 - 若手动在 DDE「快捷键」里删除了本助手，残留的
-  `~/.config/fun-voice-ryan/dde-shortcut-id` 会造成重复注册；删除该文件即可复位。
+  `~/.config/fun-voice-ryan/dde-shortcut-id` 会让安装脚本误以为已注册而**跳过**注册，
+  导致 `Super+C` 未注册；删除该文件后重跑 `scripts/install-user.sh` 即可复位。
 
 ## 9. 卸载
 

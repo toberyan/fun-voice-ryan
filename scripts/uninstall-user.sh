@@ -27,12 +27,21 @@ MODELS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/models"
 CONSOLE_SCRIPTS=(fun-voice-daemon fun-voice-worker fun-voice-bridge fun-voice-preflight fun-voice-selftest)
 SYSTEMD_SERVICES=(fun-voice-worker.service fun-voice-daemon.service)
 
-SHORTCUT_ID_FILE="${CONFIG_DIR}/dde-shortcut-id"
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-}/fun-voice-ryan"
-FCITX_SOCKET="${XDG_RUNTIME_DIR:-}/fun-voice-ryan-fcitx.sock"
-
 log() { printf '[uninstall-user] %s\n' "$*"; }
 die() { printf '[uninstall-user] ERROR(%s): %s\n' "$1" "$2" >&2; exit 1; }
+
+SHORTCUT_ID_FILE="${CONFIG_DIR}/dde-shortcut-id"
+# Guard the runtime paths: with XDG_RUNTIME_DIR unset, ${VAR:-}/fun-voice-ryan
+# would collapse to the root-level "/fun-voice-ryan". Never touch those paths
+# unless the runtime dir is valid (mirrors the install script's precondition).
+if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR}" ]]; then
+    log "XDG_RUNTIME_DIR is not set or does not exist; skipping runtime cleanup"
+    RUNTIME_DIR=""
+    FCITX_SOCKET=""
+else
+    RUNTIME_DIR="${XDG_RUNTIME_DIR}/fun-voice-ryan"
+    FCITX_SOCKET="${XDG_RUNTIME_DIR}/fun-voice-ryan-fcitx.sock"
+fi
 
 PURGE=0
 if [[ "${1:-}" == "--purge" ]]; then
@@ -81,12 +90,14 @@ for script in "${CONSOLE_SCRIPTS[@]}"; do
 done
 
 # --- 5. Remove runtime sockets and capture shards ----------------------------
-for socket in "${RUNTIME_DIR}/daemon.sock" "${RUNTIME_DIR}/worker.sock"; do
-    remove_file "${socket}"
-done
-remove_file "${FCITX_SOCKET}"
-if [[ -d "${RUNTIME_DIR}/capture" ]]; then
-    rm -rf "${RUNTIME_DIR}/capture" && log "removed capture shards under ${RUNTIME_DIR}/capture"
+if [[ -n "${RUNTIME_DIR}" ]]; then
+    for socket in "${RUNTIME_DIR}/daemon.sock" "${RUNTIME_DIR}/worker.sock"; do
+        remove_file "${socket}"
+    done
+    remove_file "${FCITX_SOCKET}"
+    if [[ -d "${RUNTIME_DIR}/capture" ]]; then
+        rm -rf "${RUNTIME_DIR}/capture" && log "removed capture shards under ${RUNTIME_DIR}/capture"
+    fi
 fi
 
 # --- 6. Optional purge (model cache + user config) --------------------------
@@ -95,7 +106,10 @@ if [[ "${PURGE}" -eq 1 ]]; then
     printf '  model cache: %s\n' "${MODELS_DIR}"
     printf '  user config: %s\n' "${CONFIG_DIR}"
     printf 'Type "DELETE" (without quotes) to confirm: '
-    read -r answer
+    if ! read -r answer; then
+        printf '\n[uninstall-user] ERROR(abort): purge not confirmed (stdin closed); model cache and config preserved\n' >&2
+        exit 1
+    fi
     if [[ "${answer}" != "DELETE" ]]; then
         die "abort" "purge not confirmed; model cache and config preserved"
     fi
