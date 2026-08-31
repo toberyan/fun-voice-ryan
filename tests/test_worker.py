@@ -6,6 +6,7 @@ import torch / vllm / funasr, so they run in milliseconds.
 
 from __future__ import annotations
 
+import time
 import wave
 from types import SimpleNamespace
 from typing import Any
@@ -16,9 +17,15 @@ import pytest
 from fun_voice.contracts import ErrorCode, Segment, Transcription, WorkerHealth
 from fun_voice.nano_runtime import (
     VAD_OVERLAP_MS,
+    AudioFormatError,
     DeviceMismatchError,
     EmptySpeechError,
+    FsmnVadSegmenter,
+    InferenceTimeoutError,
+    ModelOutputError,
     NanoRuntime,
+    NanoRuntimeError,
+    OomError,
     VllmError,
     _slice_windows,
     check_engine_devices,
@@ -64,6 +71,52 @@ class FakeEngine:
             for i, text in enumerate(self.texts)
         ]
 
+
+class FakeFsmnVadModel:
+    """Fake raw FunASR FSMN-VAD returning ``[{"key", "value": [[s, e], ...]}]``."""
+
+    def __init__(self, result: list[dict[str, Any]]) -> None:
+        self.result = result
+
+    def generate(self, input: Any, cache: Any, is_final: Any) -> list[dict[str, Any]]:
+        return self.result
+
+
+class SlowEngine:
+    """Fake ASR engine that blocks long enough to trip a small timeout."""
+
+    def __init__(self, delay: float = 0.3, text: str = "late") -> None:
+        self.delay = delay
+        self.text = text
+
+    def generate(
+        self, inputs: list[np.ndarray], max_new_tokens: int = 512
+    ) -> list[dict[str, Any]]:
+        time.sleep(self.delay)
+        return [{"key": "sample_0", "text": self.text}]
+
+
+class FlakyRuntime:
+    """Raises once, then succeeds — for the "keeps serving after error" path."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def transcribe(
+        self, audio: str, *, sample_rate: int = 16000, timeout: float | None = None
+    ) -> Transcription:
+        self.calls += 1
+        if self.calls == 1:
+            raise OomError("out of memory")
+        return Transcription(text="ok", segments=(Segment(0, 100, "ok"),))
+
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test", xpu_ready=True, model_ready=True, device="xpu:0"
+        )
+
+    def close(self) -> None:
+        pass
 
 def _runtime(engine: FakeEngine, vad: FakeVad) -> NanoRuntime:
     return NanoRuntime(engine=engine, vad=vad)  # type: ignore[arg-type]
@@ -138,6 +191,65 @@ def test_segment_text_is_empty_string_when_model_outputs_empty() -> None:
     result = runtime.transcribe_samples(_silence())
     assert result.text == "ok"
     assert [seg.text for seg in result.segments] == ["", "ok"]
+
+
+# --- FSMN-VAD adapter (real parse path) -------------------------------------
+
+
+def test_fsmn_vad_detect_parses_segments() -> None:
+    model = FakeFsmnVadModel([{"key": "k", "value": [[100, 200], [300, 400]]}])
+    assert FsmnVadSegmenter(model).detect(_silence(), 16000) == [(100, 200), (300, 400)]
+
+
+def test_fsmn_vad_detect_empty_value_returns_empty() -> None:
+    model = FakeFsmnVadModel([{"key": "k", "value": []}])
+    assert FsmnVadSegmenter(model).detect(_silence(), 16000) == []
+
+
+def test_fsmn_vad_detect_missing_value_key_raises() -> None:
+    model = FakeFsmnVadModel([{"key": "k"}])
+    with pytest.raises(ModelOutputError):
+        FsmnVadSegmenter(model).detect(_silence(), 16000)
+
+
+def test_fsmn_vad_detect_empty_result_list_raises() -> None:
+    with pytest.raises(ModelOutputError):
+        FsmnVadSegmenter(FakeFsmnVadModel([])).detect(_silence(), 16000)
+
+
+def test_fsmn_vad_detect_malformed_segment_raises() -> None:
+    model = FakeFsmnVadModel([{"key": "k", "value": [[100]]}])  # 1-element segment
+    with pytest.raises(ModelOutputError):
+        FsmnVadSegmenter(model).detect(_silence(), 16000)
+
+
+# --- ASR error taxonomy -----------------------------------------------------
+
+
+def test_runtime_oom_maps_to_oom_error() -> None:
+    runtime = _runtime(
+        FakeEngine(error=RuntimeError("XPU out of memory")), FakeVad([(0, 100)])
+    )
+    with pytest.raises(OomError):
+        runtime.transcribe_samples(_silence())
+
+
+def test_runtime_model_no_output_raises() -> None:
+    runtime = _runtime(FakeEngine(texts=[]), FakeVad([(0, 100)]))
+    with pytest.raises(ModelOutputError):
+        runtime.transcribe_samples(_silence())
+
+
+def test_runtime_timeout_raises_then_next_request_succeeds() -> None:
+    # A timed-out generate keeps holding the generate lock until it finishes;
+    # the next request must wait for the lock and then succeed (Minor 4).
+    runtime = NanoRuntime(
+        engine=SlowEngine(), vad=FakeVad([(0, 100)]), default_timeout=0.05
+    )
+    with pytest.raises(InferenceTimeoutError):
+        runtime.transcribe_samples(_silence(), timeout=0.05)
+    result = runtime.transcribe_samples(_silence(), timeout=2.0)
+    assert result.text == "late"
 
 
 # --- Device guard -----------------------------------------------------------
@@ -236,15 +348,43 @@ def test_worker_transcribe_success_shape() -> None:
     assert response["error_code"] is None
 
 
-def test_worker_transcribe_error_maps_stable_code() -> None:
-    runtime = FakeRuntime(error=EmptySpeechError("VAD detected no speech"))
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (EmptySpeechError("no speech"), "worker.empty_speech"),
+        (OomError("out of memory"), "worker.oom"),
+        (VllmError("ValueError"), "worker.vllm"),
+        (ModelOutputError("no output"), "worker.no_output"),
+        (AudioFormatError("bad audio"), "worker.format"),
+        (InferenceTimeoutError("slow"), "worker.timeout"),
+        (DeviceMismatchError("not xpu"), "worker.device"),
+    ],
+)
+def test_worker_maps_runtime_errors_to_codes(
+    error: NanoRuntimeError, expected_code: str
+) -> None:
+    runtime = FakeRuntime(error=error)
     response = _worker(runtime).handle(
         {"id": "u1", "op": "transcribe", "audio": "/tmp/a.wav", "sample_rate": 16000}
     )
     assert response["status"] == "error"
-    assert response["error_code"] == "worker.empty_speech"
+    assert response["error_code"] == expected_code
     assert response["text"] == ""
     assert response["segments"] == []
+
+
+def test_worker_keeps_serving_after_error() -> None:
+    worker = _worker(FlakyRuntime())  # type: ignore[arg-type]
+    first = worker.handle(
+        {"id": "u1", "op": "transcribe", "audio": "/tmp/a.wav", "sample_rate": 16000}
+    )
+    assert first["status"] == "error"
+    assert first["error_code"] == "worker.oom"
+    second = worker.handle(
+        {"id": "u2", "op": "transcribe", "audio": "/tmp/a.wav", "sample_rate": 16000}
+    )
+    assert second["status"] == "ok"
+    assert second["text"] == "ok"
 
 
 def test_worker_passes_timeout_ms_to_runtime() -> None:

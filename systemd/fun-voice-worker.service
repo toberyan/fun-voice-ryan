@@ -1,12 +1,13 @@
 [Unit]
 Description=Fun Voice Ryan Nano ASR worker (warm XPU)
-After=default.target
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStart=%h/workspace/fun-voice-ryan/.venv/bin/fun-voice-worker
+# Deployed by install-user.sh (Task 8) as a console-script wrapper; the
+# absolute path keeps it resolvable regardless of the user manager's PATH.
+ExecStart=%h/.local/bin/fun-voice-worker
 Restart=on-failure
 RestartSec=2
 # The worker binds $XDG_RUNTIME_DIR/fun-voice-ryan/worker.sock and refuses to

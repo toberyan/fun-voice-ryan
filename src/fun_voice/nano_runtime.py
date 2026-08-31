@@ -196,8 +196,23 @@ class FsmnVadSegmenter:
         self, samples: np.ndarray, sample_rate: int
     ) -> list[tuple[int, int]]:
         result = self._model.generate(input=samples, cache={}, is_final=True)
-        value = result[0]["value"]
-        return [(int(start_ms), int(end_ms)) for start_ms, end_ms in value]
+        if not result:
+            raise ModelOutputError("VAD returned no result")
+        first = result[0]
+        if not isinstance(first, dict) or "value" not in first:
+            raise ModelOutputError("malformed VAD result")
+        value = first["value"]
+        if not isinstance(value, list):
+            raise ModelOutputError("malformed VAD value")
+        regions: list[tuple[int, int]] = []
+        for item in value:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ModelOutputError("malformed VAD segment")
+            try:
+                regions.append((int(item[0]), int(item[1])))
+            except (TypeError, ValueError):
+                raise ModelOutputError("malformed VAD segment") from None
+        return regions
 
 
 # --- Slicing ----------------------------------------------------------------
@@ -339,6 +354,15 @@ class NanoRuntime:
     # -- ASR with timeout + error taxonomy -----------------------------------
 
     def _run_asr(self, slices: list[np.ndarray], timeout: float | None) -> list[str]:
+        """Run one batch through the engine, mapping failures to typed errors.
+
+        Timeout is a design trade-off: vLLM's offline ``generate`` cannot be
+        safely interrupted mid-decode, so a timed-out call keeps running on a
+        daemon thread. ``_generate_lock`` serializes engine access, which both
+        prevents concurrent ``generate`` calls from corrupting the engine and
+        guarantees the lock is released once the straggler finishes — a
+        subsequent (short) request then proceeds normally.
+        """
         effective = self.default_timeout if timeout is None else timeout
         if effective <= 0:
             effective = self.default_timeout

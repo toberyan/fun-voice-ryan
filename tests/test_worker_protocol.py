@@ -49,6 +49,22 @@ class FakeRuntime:
         self.closed = True
 
 
+class FlakyRuntime(FakeRuntime):
+    """Raises on the first transcribe, then succeeds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def transcribe(
+        self, audio: str, *, sample_rate: int = 16000, timeout: float | None = None
+    ) -> Transcription:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("out of memory")
+        return self.transcription
+
+
 @pytest.fixture
 def server(tmp_path) -> Iterator[tuple[WorkerServer, FakeRuntime, str]]:
     runtime = FakeRuntime()
@@ -160,6 +176,31 @@ def test_transcribe_round_trip(server) -> None:
     assert response["text"] == "你好"
     assert response["segments"] == [{"start_ms": 0, "end_ms": 100, "text": "你好"}]
     assert response["error_code"] is None
+
+
+def test_server_keeps_listening_after_error(tmp_path) -> None:
+    socket_path = tmp_path / "flaky.sock"
+    server = WorkerServer(socket_path, Worker(FlakyRuntime()), uid=os.getuid())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        first = _request(
+            str(socket_path),
+            {
+                "id": "u1",
+                "op": "transcribe",
+                "audio": "/tmp/a.wav",
+                "sample_rate": 16000,
+            },
+        )
+        assert first["status"] == "error"
+        # The same server must still answer after a failed request.
+        health = _request(str(socket_path), {"op": "health"})
+        assert health["status"] == "ok"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 # --- Framing / protocol errors ----------------------------------------------
