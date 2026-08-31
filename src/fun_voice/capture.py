@@ -41,6 +41,7 @@ from typing import BinaryIO, Protocol, cast
 from fun_voice.config import (
     DIRECTORY_MODE,
     FILE_MODE,
+    RUNTIME_DIR_NAME,
     ConfigError,
     resolve_runtime_dir,
 )
@@ -143,6 +144,7 @@ class PipeWireRecorder:
         *,
         pw_record: str = "pw-record",
         notifier: Callable[[str], None] | None = None,
+        on_auto_stop: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         spawn: Callable[[Sequence[str]], CaptureProcess] | None = None,
         runtime_dir: Path | None = None,
@@ -150,6 +152,7 @@ class PipeWireRecorder:
     ) -> None:
         self._pw_record = pw_record
         self._notifier = notifier
+        self._on_auto_stop = on_auto_stop
         self._clock = clock
         self._spawn = spawn if spawn is not None else _default_spawn
         self._runtime_dir = runtime_dir
@@ -195,7 +198,12 @@ class PipeWireRecorder:
         self._watchdog.start()
 
     def stop(self) -> CaptureArtifact:
-        """Stop recording and return the collected audio artifact."""
+        """Stop recording and return the collected audio artifact.
+
+        The returned :attr:`CaptureArtifact.audio` handle stays readable only
+        until the recorder is reused (``start()``) or cleaned up (``cleanup()``);
+        the caller must consume it before either event.
+        """
         if self._proc is None:
             raise CaptureError("capture not started")
         proc = self._proc
@@ -329,6 +337,10 @@ class PipeWireRecorder:
         shard_dir = self._shard_dir_path()
         shard_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(shard_dir, DIRECTORY_MODE)
+        # Harden the fun-voice-ryan parent dir (may have been created with umask).
+        parent = shard_dir.parent
+        if parent.name == RUNTIME_DIR_NAME and parent.is_dir():
+            os.chmod(parent, DIRECTORY_MODE)
         self._shard_dir = shard_dir
 
     # --- Watchdog thread ------------------------------------------------------
@@ -358,6 +370,9 @@ class PipeWireRecorder:
         if proc is not None and proc.poll() is None:
             with contextlib.suppress(OSError):
                 proc.send_signal(signal.SIGINT)
+        if self._on_auto_stop is not None:
+            with contextlib.suppress(Exception):
+                self._on_auto_stop()
 
     # --- Stop / finalize ------------------------------------------------------
 
@@ -419,6 +434,9 @@ class PipeWireRecorder:
                     shutil.copyfileobj(shard, out)
             out.flush()
             fd = out.fileno()
+        except OSError as exc:
+            out.close()
+            raise CaptureError(f"failed to materialize captured audio: {exc}") from exc
         except BaseException:
             out.close()
             raise

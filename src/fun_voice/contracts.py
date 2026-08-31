@@ -100,7 +100,16 @@ class FocusSnapshot:
 
 @dataclass(frozen=True)
 class CaptureArtifact:
-    """Handle to captured audio: a path or memfd plus its format."""
+    """Handle to captured audio: a path or memfd plus its format.
+
+    When ``audio`` is a ``/proc/<pid>/fd/<n>`` path it references an anonymous,
+    unlinked tmpfs-backed file whose validity is bound to the recorder that
+    produced it: the underlying descriptor stays open only until the recorder is
+    reused (``start()``) or torn down (``cleanup()``).  Consumers must finish
+    reading the handle before either of those events; there is no stable on-disk
+    path.  When ``audio`` is a real path, the file exists until the producer
+    deletes it.
+    """
 
     audio: str
     sample_rate: int = 16000

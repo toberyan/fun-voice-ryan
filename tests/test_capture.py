@@ -6,8 +6,11 @@ PipeWire server, or wall-clock waiting is required.
 
 from __future__ import annotations
 
+import errno
 import io
 import signal
+import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -84,6 +87,7 @@ def make_recorder(
     exited: bool = False,
     clock: Callable[[], float] | None = None,
     notifier: Callable[[str], None] | None = None,
+    on_auto_stop: Callable[[], None] | None = None,
     memory_threshold_bytes: int = MEMORY_THRESHOLD_BYTES,
 ) -> tuple[PipeWireRecorder, list[list[str]], dict[str, FakeProcess]]:
     argv_log: list[list[str]] = []
@@ -97,6 +101,7 @@ def make_recorder(
     recorder = PipeWireRecorder(
         clock=clock if clock is not None else FakeClock(),
         notifier=notifier,
+        on_auto_stop=on_auto_stop,
         spawn=spawn,
         runtime_dir=tmp_path,
         memory_threshold_bytes=memory_threshold_bytes,
@@ -332,3 +337,98 @@ def test_startup_leftover_directory_is_cleaned(tmp_path: Path) -> None:
     recorder.start()
     assert not shard_dir.exists()
     recorder.cancel()
+def test_artifact_handle_readable_across_process(tmp_path: Path) -> None:
+    data = pcm_bytes(1000)
+    recorder, _, _ = make_recorder(tmp_path, data=data)
+    recorder.start()
+    artifact = recorder.stop()
+    # A separate process opens the /proc/<pid>/fd/<n> handle and reads it back.
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys; print(len(open(sys.argv[1], 'rb').read()))",
+         artifact.audio],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert int(result.stdout.strip()) == len(data)
+
+
+def test_await_exit_escalates_terminate_then_kill(tmp_path: Path) -> None:
+    data = pcm_bytes(1000)
+
+    class StallingProcess(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__(data, exit_code=0)
+            self._wait_calls = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self._wait_calls += 1
+            if self._wait_calls < 3:
+                raise subprocess.TimeoutExpired(cmd="pw-record", timeout=timeout or 0)
+            return 0
+
+    holder: dict[str, StallingProcess] = {}
+
+    def spawn(argv: list[str]) -> StallingProcess:
+        holder["proc"] = StallingProcess()
+        return holder["proc"]
+
+    recorder = PipeWireRecorder(spawn=spawn, runtime_dir=tmp_path)
+    recorder.start()
+    artifact = recorder.stop()
+    assert holder["proc"].terminated
+    assert holder["proc"].killed
+    assert read_artifact(artifact) == data
+
+
+def test_auto_stop_fires_on_auto_stop_callback(tmp_path: Path) -> None:
+    clock = FakeClock()
+    data = pcm_bytes(1000)
+    auto_stops: list[None] = []
+    recorder, _, _ = make_recorder(
+        tmp_path, data=data, clock=clock, on_auto_stop=lambda: auto_stops.append(None)
+    )
+    recorder.start()
+    clock.now = MAX_RECORDING_MINUTES * 60 + 1
+    wait_for(lambda: bool(auto_stops))
+    assert len(auto_stops) == 1
+    artifact = recorder.stop()
+    assert read_artifact(artifact) == data
+
+
+def test_shard_parent_dir_is_private(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "fun-voice-ryan"
+    data = bytes(i % 256 for i in range(1024 + SHARD_BYTES + 5))
+    recorder = PipeWireRecorder(
+        spawn=lambda argv: FakeProcess(data, 0),
+        runtime_dir=runtime_dir,
+        memory_threshold_bytes=1024,
+    )
+    recorder.start()
+    wait_for(lambda: recorder._bytes == len(data))
+    assert (runtime_dir.stat().st_mode & 0o777) == 0o700
+    assert (runtime_dir / "capture").is_dir()
+    recorder.cancel()
+
+
+def test_materialize_write_error_raises_capture_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _NoSpaceFile:
+        def write(self, data: bytes) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        def flush(self) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        def close(self) -> None:
+            pass
+
+    recorder, _, _ = make_recorder(tmp_path, data=pcm_bytes(1000))
+    recorder.start()
+    monkeypatch.setattr(
+        "fun_voice.capture._create_memory_backed_file", lambda: _NoSpaceFile()
+    )
+    with pytest.raises(CaptureError, match="materialize"):
+        recorder.stop()
