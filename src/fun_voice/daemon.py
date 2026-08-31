@@ -467,11 +467,22 @@ class VoiceDaemon:
             self._lock.release()
 
     def shutdown(self) -> None:
-        """Final teardown: cleanup any session and close long-lived resources."""
-        with self._lock:
+        """Final teardown; never blocks on an in-flight transcription.
+
+        An in-flight session already finalized its capture shards via
+        ``recorder.stop()`` and only holds a memfd that the OS reclaims on
+        process exit, so skipping cleanup here is safe and keeps shutdown
+        within systemd's ``TimeoutStopSec``.
+        """
+        if not self._lock.acquire(blocking=False):
+            logger.info("shutdown: in-flight session; skipping cleanup")
+            return
+        try:
             self._cleanup()
             with contextlib.suppress(Exception):
                 self._worker.close()
+        finally:
+            self._lock.release()
 
     # --- Pipeline ------------------------------------------------------------
 
@@ -680,10 +691,13 @@ class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     transcription never blocks ``accept``: a ``start_if_idle`` arriving while a
     session is in flight is rejected immediately (the state machine lock is
     non-blocking) instead of queueing in the backlog.
+
+    ``daemon_threads`` keeps request threads daemonic so ``server_close`` never
+    waits on an in-flight transcription; shutdown must not exceed systemd's
+    default ``TimeoutStopSec``.
     """
 
-    daemon_threads = False
-    block_on_close = True
+    daemon_threads = True
 
     def __init__(
         self,

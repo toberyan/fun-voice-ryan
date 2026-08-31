@@ -365,6 +365,29 @@ def test_fcitx_token_unavailable_still_records(token_or_error: str) -> None:
     assert h.daemon.state is DaemonState.RECORDING
 
 
+def test_fcitx_factory_failure_still_records_and_uses_xtest() -> None:
+    def boom() -> FakeFcitx:
+        raise FcitxCommitError("cannot construct client")
+
+    injector = FakeInjector()
+    notifier = FakeNotifier()
+    daemon = VoiceDaemon(
+        guard=FakeGuard(),
+        recorder=FakeRecorder(),
+        fcitx_factory=boom,
+        clipboard=FakeClipboard(),
+        injector=injector,
+        notifier=notifier,
+        worker=FakeWorker(text="你好"),
+    )
+    assert daemon.start_if_idle() == "started"
+    assert daemon.state is DaemonState.RECORDING
+    daemon.stop()
+    assert daemon.state is DaemonState.IDLE
+    assert injector.pastes == 1  # no Fcitx → XTEST fallback
+    assert notifier.messages
+
+
 def test_stop_transitions_through_pipeline_to_idle() -> None:
     h = Harness()
     _started(h)
