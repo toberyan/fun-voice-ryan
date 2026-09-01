@@ -63,8 +63,8 @@ makes framing unambiguous). A `COMMIT` is at most 64 KiB; longer text is split
 by the daemon into ordered chunks of at most 8 KiB on Unicode boundaries, each
 carrying its `sequence`/`total` and the same focus token. Multi-chunk commits
 are **atomic**: the addon buffers the ordered chunks in memory (bounded by the
-64 KiB protocol limit) and calls `commitString` exactly once, on the final
-chunk of a complete in-order sequence. A single-chunk commit (`total=1`) is
+4 MiB buffer limit) and calls `commitString` exactly once, on the final chunk
+of a complete in-order sequence. A single-chunk commit (`total=1`) is
 committed immediately. Any out-of-order, duplicated, oversized, or malformed
 frame is rejected without committing, and any reject stops the daemon from
 sending the remaining chunks. If the focused context changes, is destroyed, or

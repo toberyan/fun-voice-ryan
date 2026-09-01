@@ -22,6 +22,11 @@ namespace fun_voice {
 /// ``fun_voice.contracts.MAX_MESSAGE_BYTES``.
 constexpr std::size_t kMaxFrameBytes = 64 * 1024;
 
+/// Maximum total buffered text (bytes) of a multi-chunk COMMIT, matching
+/// ``fun_voice.contracts.WORKER_RESPONSE_MAX_BYTES``. A single session holds
+/// at most one buffer, so this bound keeps memory use predictable.
+constexpr std::size_t kMaxBufferedBytes = 4 * 1024 * 1024;
+
 /// Abstraction over the live fcitx input-context state so the protocol engine
 /// can be tested with a mock instead of a real fcitx instance.
 class FocusBridge {
@@ -163,8 +168,8 @@ private:
         // final chunk arrives. A mid-stream failure (focus change, disconnect,
         // malformed frame) drops the buffer without committing, so a partial
         // transcription is never injected. The accumulated buffer is bounded
-        // by the 64 KiB protocol limit to keep memory use predictable.
-        if (session.buffer.size() + text.size() > kMaxFrameBytes) {
+        // by the 4 MiB buffer limit to keep memory use predictable.
+        if (session.buffer.size() + text.size() > kMaxBufferedBytes) {
             tokens_.erase(it);
             return "ERROR too-large";
         }

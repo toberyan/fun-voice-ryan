@@ -229,18 +229,24 @@ int main() {
               "incomplete sequence commits nothing before final");
     }
 
-    // A multi-chunk sequence exceeding the 64 KiB buffer bound is rejected.
+    // A multi-chunk sequence exceeding the 4 MiB buffer bound is rejected.
     {
         MockBridge bridge;
         fun_voice::ProtocolEngine engine(&bridge);
         const std::string token = engine.handle("START_FOCUS").substr(6);
         const std::string big(8 * 1024, 'a'); // 8 KiB per chunk
-        for (int seq = 1; seq <= 8; ++seq) {
-            checkEqual(engine.handle(commitFrame(token, seq, 9, big)), "OK",
-                       "buffered chunk accepted");
+        const int full = static_cast<int>(fun_voice::kMaxBufferedBytes) /
+                         static_cast<int>(big.size()); // 512 chunks == 4 MiB
+        const int total = full + 1;
+        bool allBuffered = true;
+        for (int seq = 1; seq <= full; ++seq) {
+            if (engine.handle(commitFrame(token, seq, total, big)) != "OK") {
+                allBuffered = false;
+            }
         }
+        check(allBuffered, "4 MiB of chunks buffered successfully");
         check(bridge.commits.empty(), "buffered chunks not committed");
-        checkEqual(engine.handle(commitFrame(token, 9, 9, big)),
+        checkEqual(engine.handle(commitFrame(token, total, total, big)),
                    "ERROR too-large", "overflowing buffer rejected");
         check(bridge.commits.empty(), "overflow commits nothing");
     }
