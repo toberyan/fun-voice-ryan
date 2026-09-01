@@ -245,6 +245,33 @@ def test_shard_layout_before_finalize(tmp_path: Path) -> None:
     recorder.cancel()
 
 
+def test_live_snapshot_uses_exact_pcm_bounds_and_survives_a_new_recording(
+    tmp_path: Path,
+) -> None:
+    data = bytes(index % 256 for index in range(1000 * 32))
+    recorder, _, _ = make_recorder(tmp_path, data=data)
+    recorder.start()
+    wait_for(lambda: recorder._bytes == len(data))  # noqa: SLF001 - live boundary
+
+    first = recorder.snapshot(100, 400)
+    overlap = recorder.snapshot(250, 500)
+    retained = first.retain()
+    first.release()
+
+    assert read_artifact(retained.artifact) == data[3200:12800]
+    assert read_artifact(overlap.artifact) == data[8000:16000]
+    assert retained.artifact.duration_ms == 300
+    assert overlap.artifact.duration_ms == 250
+
+    recorder.stop()
+    recorder.start()
+    assert read_artifact(retained.artifact) == data[3200:12800]
+    retained.release()
+    retained.release()
+    overlap.release()
+    recorder.cancel()
+
+
 # --- Watchdog: notify and auto-stop ------------------------------------------
 
 

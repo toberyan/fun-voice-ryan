@@ -103,6 +103,50 @@ class CaptureConfig:
     source: str = "default"
 
 
+class LiveCaptureView(Protocol):
+    """Read-only, in-memory view used for bounded live-ASR windows."""
+
+    def snapshot(self, start_ms: int, end_ms: int) -> AudioLease: ...
+
+
+class AudioLease:
+    """Reference-counted anonymous PCM window with an idempotent release."""
+
+    def __init__(self, artifact: CaptureArtifact, backing: BinaryIO) -> None:
+        self.artifact = artifact
+        self._backing = backing
+        self._refs = 1
+        self._closed = False
+        self._lock = threading.Lock()
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def retain(self) -> AudioLease:
+        """Retain the anonymous window for another in-process consumer."""
+        with self._lock:
+            if self._closed:
+                raise CaptureError("audio lease is already released")
+            self._refs += 1
+        return self
+
+    def release(self) -> None:
+        """Release one reference and close the anonymous descriptor at zero."""
+        backing: BinaryIO | None = None
+        with self._lock:
+            if self._closed:
+                return
+            self._refs -= 1
+            if self._refs > 0:
+                return
+            self._closed = True
+            backing = self._backing
+        with contextlib.suppress(OSError):
+            backing.close()
+
+
 class CaptureProcess(Protocol):
     """Minimal subprocess surface the recorder needs (testable via fakes)."""
 
@@ -171,6 +215,7 @@ class PipeWireRecorder:
         self._bytes = 0
         self._started_mono = 0.0
         self._notified = False
+        self._audio_lock = threading.RLock()
 
         self._backing_files: list[BinaryIO] = []
 
@@ -218,6 +263,46 @@ class PipeWireRecorder:
         if self._proc is None:
             return
         self.cleanup()
+
+    def snapshot(self, start_ms: int, end_ms: int) -> AudioLease:
+        """Copy one bounded live PCM interval to a fresh anonymous lease.
+
+        The new backing descriptor is independent from the recorder and may
+        outlive a later ``start()`` call.  Audio is copied under the capture
+        lock, so callers never observe a partially written shard boundary.
+        """
+        if isinstance(start_ms, bool) or isinstance(end_ms, bool):
+            raise CaptureError("live snapshot bounds must be integer milliseconds")
+        if start_ms < 0 or end_ms <= start_ms:
+            raise CaptureError("live snapshot bounds are invalid")
+        with self._audio_lock:
+            if self._proc is None:
+                raise CaptureError("capture not started")
+            start_byte = self._ms_to_frame_byte(start_ms)
+            end_byte = min(self._ms_to_frame_byte(end_ms), self._bytes)
+            start_byte = min(start_byte, end_byte)
+            if end_byte <= start_byte:
+                raise CaptureError("live snapshot contains no audio")
+            out = _create_memory_backed_file()
+            try:
+                self._copy_range(out, start_byte, end_byte)
+                out.flush()
+                fd = out.fileno()
+            except OSError as exc:
+                out.close()
+                raise CaptureError("failed to materialize live audio window") from exc
+            except BaseException:
+                out.close()
+                raise
+        duration_ms = int((end_byte - start_byte) * 1000 / BYTES_PER_SECOND)
+        artifact = CaptureArtifact(
+            audio=f"/proc/{os.getpid()}/fd/{fd}",
+            sample_rate=SAMPLE_RATE,
+            channels=CHANNELS,
+            format=SAMPLE_FORMAT,
+            duration_ms=duration_ms,
+        )
+        return AudioLease(artifact, out)
 
     def cleanup(self) -> None:
         """Terminate capture and remove exactly this task's files.  Idempotent."""
@@ -275,18 +360,22 @@ class PipeWireRecorder:
             pass
 
     def _write_audio(self, chunk: bytes) -> None:
-        while chunk:
-            if self._shard_dir is None and self._bytes < self._memory_threshold_bytes:
-                room = self._memory_threshold_bytes - self._bytes
-                take = min(room, len(chunk))
-                self._memory.extend(chunk[:take])
-                self._bytes += take
-                chunk = chunk[take:]
-            else:
-                if self._shard_dir is None:
-                    self._ensure_shard_dir()
-                self._append_to_shard(chunk)
-                return
+        with self._audio_lock:
+            while chunk:
+                if (
+                    self._shard_dir is None
+                    and self._bytes < self._memory_threshold_bytes
+                ):
+                    room = self._memory_threshold_bytes - self._bytes
+                    take = min(room, len(chunk))
+                    self._memory.extend(chunk[:take])
+                    self._bytes += take
+                    chunk = chunk[take:]
+                else:
+                    if self._shard_dir is None:
+                        self._ensure_shard_dir()
+                    self._append_to_shard(chunk)
+                    return
 
     def _append_to_shard(self, chunk: bytes) -> None:
         while chunk:
@@ -448,6 +537,40 @@ class PipeWireRecorder:
             format=SAMPLE_FORMAT,
             duration_ms=duration_ms,
         )
+
+    @staticmethod
+    def _ms_to_frame_byte(milliseconds: int) -> int:
+        """Convert a non-negative millisecond offset to a s16le frame boundary."""
+        raw_byte = int(milliseconds * BYTES_PER_SECOND / 1000)
+        return raw_byte // BYTES_PER_FRAME * BYTES_PER_FRAME
+
+    def _copy_range(self, out: BinaryIO, start_byte: int, end_byte: int) -> None:
+        """Copy a byte range from memory and current private shards in order."""
+        memory_end = len(self._memory)
+        if start_byte < memory_end:
+            upper = min(end_byte, memory_end)
+            out.write(self._memory[start_byte:upper])
+        if end_byte <= memory_end:
+            return
+        offset = memory_end
+        for path in self._shards:
+            shard_size = path.stat().st_size
+            shard_end = offset + shard_size
+            if end_byte <= offset:
+                break
+            if start_byte < shard_end:
+                lower = max(0, start_byte - offset)
+                upper = min(shard_size, end_byte - offset)
+                with path.open("rb") as shard:
+                    shard.seek(lower)
+                    remaining = upper - lower
+                    while remaining:
+                        chunk = shard.read(min(remaining, 8192))
+                        if not chunk:
+                            raise CaptureError("live snapshot shard ended unexpectedly")
+                        out.write(chunk)
+                        remaining -= len(chunk)
+            offset = shard_end
 
     # --- Cleanup --------------------------------------------------------------
 
