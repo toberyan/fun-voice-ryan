@@ -16,12 +16,15 @@ from fun_voice.config import (
     RUNTIME_DIR_NAME,
     SOCKET_MODE,
     WORKER_SOCKET_NAME,
+    ActiveSessionConfig,
     Config,
     ConfigError,
     InferenceConfig,
+    ResourcePolicy,
     build_runtime_paths,
     load_config,
     resolve_runtime_dir,
+    validate_active_session_config,
 )
 
 
@@ -83,8 +86,9 @@ def test_config_defaults() -> None:
     assert cfg.inference == InferenceConfig()
     assert cfg.inference.gpu_memory_utilization == 0.15
     assert cfg.inference.max_model_len == 1536
-    assert cfg.inference.idle_unload_seconds == 120
+    assert cfg.inference.worker_failsafe_idle_seconds == 1800
     assert cfg.inference.allow_sensevoice_fallback is True
+    assert cfg.active_session == ActiveSessionConfig()
 
 
 def test_load_config_defaults_when_missing(tmp_path: Path) -> None:
@@ -112,6 +116,10 @@ def test_load_config_parses_toml_overrides(tmp_path: Path) -> None:
                 "idle_unload_seconds = 90",
                 "allow_sensevoice_fallback = false",
                 "enforce_eager = false",
+                "",
+                "[active_session]",
+                'policy = "memory_saver"',
+                "provisional_enabled = true",
             ]
         ),
         encoding="utf-8",
@@ -125,9 +133,15 @@ def test_load_config_parses_toml_overrides(tmp_path: Path) -> None:
         dtype="bf16",
         gpu_memory_utilization=0.2,
         max_model_len=1024,
-        idle_unload_seconds=90,
+        worker_failsafe_idle_seconds=1800,
         allow_sensevoice_fallback=False,
         enforce_eager=False,
+    )
+    assert cfg.active_session == ActiveSessionConfig(
+        policy=ResourcePolicy.MEMORY_SAVER,
+        active_idle_seconds=120,
+        worker_failsafe_idle_seconds=1800,
+        provisional_enabled=True,
     )
 
 
@@ -145,8 +159,8 @@ def test_load_config_rejects_non_xpu_inference_device(tmp_path: Path) -> None:
         ("gpu_memory_utilization", "0.21", "0.20"),
         ("max_model_len", "1023", "1024"),
         ("max_model_len", "1537", "1536"),
-        ("idle_unload_seconds", "29", "30"),
-        ("idle_unload_seconds", "301", "300"),
+        ("worker_failsafe_idle_seconds", "1799", "1800"),
+        ("worker_failsafe_idle_seconds", "1801", "1800"),
     ],
 )
 def test_load_config_rejects_unsafe_model_lifecycle_bounds(
@@ -156,6 +170,37 @@ def test_load_config_rejects_unsafe_model_lifecycle_bounds(
     path.write_text(f"[inference]\n{key} = {value}\n", encoding="utf-8")
     with pytest.raises(ConfigError, match=message):
         load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("policy", "active_idle_seconds"),
+    [
+        (ResourcePolicy.MEMORY_SAVER, 480),
+        (ResourcePolicy.BALANCED, 120),
+        (ResourcePolicy.SUSTAINED, 480),
+    ],
+)
+def test_active_session_rejects_window_not_fixed_for_policy(
+    policy: ResourcePolicy, active_idle_seconds: int
+) -> None:
+    with pytest.raises(ConfigError, match="active_session.active_idle_seconds"):
+        validate_active_session_config(
+            ActiveSessionConfig(
+                policy=policy,
+                active_idle_seconds=active_idle_seconds,
+            )
+        )
+
+
+def test_active_session_rejects_non_xpu_and_nonfixed_failsafe() -> None:
+    with pytest.raises(ConfigError, match="active_session.device"):
+        validate_active_session_config(
+            ActiveSessionConfig(device="cpu")
+        )
+    with pytest.raises(ConfigError, match="worker_failsafe_idle_seconds"):
+        validate_active_session_config(
+            ActiveSessionConfig(worker_failsafe_idle_seconds=1799)
+        )
 
 
 def test_enhanced_inference_rejects_non_xpu_corrector() -> None:

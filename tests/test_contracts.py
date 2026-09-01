@@ -19,8 +19,10 @@ from fun_voice.contracts import (
     FcitxResponse,
     FocusSnapshot,
     MessageTooLarge,
+    ModelTaskKind,
     ProtocolError,
     Segment,
+    SessionKey,
     StartRequest,
     StopRequest,
     Transcription,
@@ -45,9 +47,15 @@ def test_protocol_size_constants() -> None:
 def test_daemon_state_members() -> None:
     assert {state.name for state in DaemonState} == {
         "IDLE",
+        "PREPARING",
         "RECORDING",
         "TRANSCRIBING",
+        "FINALIZING",
+        "CORRECTING",
         "COMMITTING",
+        "REHYDRATING",
+        "ENRICHING",
+        "ACTIVE_IDLE",
         "ERROR",
     }
 
@@ -80,6 +88,24 @@ def test_error_code_is_structured() -> None:
     assert err.category == "worker"
     assert err.code == "oom"
     assert str(err) == "worker.oom"
+
+
+def test_session_key_is_frozen_and_hides_its_opaque_identifier() -> None:
+    key = SessionKey(session_id="opaque-session-value", generation=1)
+
+    assert "opaque-session-value" not in repr(key)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        key.generation = 2
+
+
+def test_model_task_kinds_have_the_approved_scheduler_names() -> None:
+    assert {kind.value for kind in ModelTaskKind} == {
+        "final_tail",
+        "stable_segment",
+        "provisional_tail",
+        "correction",
+        "enrichment",
+    }
 
 
 def test_requests_have_expected_ops() -> None:

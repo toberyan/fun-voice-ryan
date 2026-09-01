@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any, Final, Literal, cast
 
 # --- Size limits ------------------------------------------------------------
@@ -51,9 +51,15 @@ class DaemonState(Enum):
     """Top-level states of the voice daemon."""
 
     IDLE = "idle"
+    PREPARING = "preparing"
     RECORDING = "recording"
     TRANSCRIBING = "transcribing"
+    FINALIZING = "finalizing"
+    CORRECTING = "correcting"
     COMMITTING = "committing"
+    REHYDRATING = "rehydrating"
+    ENRICHING = "enriching"
+    ACTIVE_IDLE = "active_idle"
     ERROR = "error"
 
 
@@ -68,6 +74,35 @@ class ErrorCode:
 
     def __str__(self) -> str:
         return f"{self.category}.{self.code}"
+
+
+class ModelTaskKind(StrEnum):
+    """The approved XPU scheduler task classes, in priority order elsewhere."""
+
+    FINAL_TAIL = "final_tail"
+    STABLE_SEGMENT = "stable_segment"
+    PROVISIONAL_TAIL = "provisional_tail"
+    CORRECTION = "correction"
+    ENRICHMENT = "enrichment"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionKey:
+    """Opaque, process-local identity for work belonging to one recording.
+
+    The identifier is deliberately omitted from ``repr`` so an accidental debug
+    log cannot correlate otherwise private session work.  It is never a wire
+    protocol identifier.
+    """
+
+    session_id: str = field(repr=False)
+    generation: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            raise ValueError("session_id must not be empty")
+        if self.generation < 1:
+            raise ValueError("generation must be positive")
 
 
 # --- Data types -------------------------------------------------------------

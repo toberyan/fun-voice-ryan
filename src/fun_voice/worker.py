@@ -554,7 +554,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default=None)
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
     parser.add_argument("--max-model-len", type=int, default=None)
-    parser.add_argument("--idle-unload-seconds", type=int, default=None)
+    parser.add_argument(
+        "--worker-failsafe-idle-seconds",
+        "--idle-unload-seconds",
+        dest="worker_failsafe_idle_seconds",
+        type=int,
+        default=None,
+    )
     parser.add_argument("--timeout-ms", type=int, default=DEFAULT_TIMEOUT_MS)
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -583,10 +589,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if args.max_model_len is not None
                     else cfg.inference.max_model_len
                 ),
-                idle_unload_seconds=(
-                    args.idle_unload_seconds
-                    if args.idle_unload_seconds is not None
-                    else cfg.inference.idle_unload_seconds
+                worker_failsafe_idle_seconds=(
+                    args.worker_failsafe_idle_seconds
+                    if args.worker_failsafe_idle_seconds is not None
+                    else cfg.inference.worker_failsafe_idle_seconds
                 ),
                 allow_sensevoice_fallback=cfg.inference.allow_sensevoice_fallback,
                 enforce_eager=cfg.inference.enforce_eager,
@@ -623,7 +629,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return serve(
         socket_path,
         worker,
-        idle_unload_seconds=inference.idle_unload_seconds,
+        idle_unload_seconds=inference.worker_failsafe_idle_seconds,
     )
 
 

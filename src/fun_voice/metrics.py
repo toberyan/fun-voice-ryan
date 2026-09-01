@@ -21,6 +21,7 @@ _TIMING_FIELDS: Final = frozenset(
         "preload_worker_ms",
         "preload_runtime_load_ms",
         "preload_warmup_ms",
+        "active_idle_ms",
         "asr_ms",
         "asr_worker_ms",
         "asr_queue_transport_ms",
@@ -45,6 +46,11 @@ _ENUM_FIELDS: Final = frozenset(
         "correction_rejection",
         "error_code",
         "nano_was_stopped_for_qwen",
+        "session_policy",
+        "session_transition",
+        "risk_gate",
+        "nano_rehydration",
+        "background_enrichment",
     }
 )
 _ALLOWED_ASR_PROFILES: Final = frozenset({"nano", "sensevoice"})
@@ -54,6 +60,31 @@ _ALLOWED_NANO_PRELOAD: Final = frozenset(
 _ALLOWED_NANO_WARMUP: Final = frozenset({"not_requested", "ready", "failed"})
 _ALLOWED_CORRECTION: Final = frozenset(
     {"disabled", "corrected", "raw_fallback", "skipped_lease", "failed"}
+)
+_ALLOWED_SESSION_POLICIES: Final = frozenset(
+    {"memory_saver", "balanced", "sustained"}
+)
+_ALLOWED_SESSION_TRANSITIONS: Final = frozenset(
+    {
+        "preparing",
+        "recording",
+        "finalizing",
+        "correcting",
+        "committing",
+        "rehydrating",
+        "enriching",
+        "active_idle",
+        "idle",
+    }
+)
+_ALLOWED_RISK_GATE: Final = frozenset(
+    {"none", "punctuation", "term", "mixed_technical", "explicit_polish"}
+)
+_ALLOWED_NANO_REHYDRATION: Final = frozenset(
+    {"not_requested", "scheduled", "ready", "failed", "skipped"}
+)
+_ALLOWED_BACKGROUND_ENRICHMENT: Final = frozenset(
+    {"not_requested", "scheduled", "completed", "cancelled", "failed"}
 )
 _ALLOWED_ERROR_CODES: Final = frozenset(
     {
@@ -86,6 +117,7 @@ class SessionMetric:
     preload_worker_ms: int | None = None
     preload_runtime_load_ms: int | None = None
     preload_warmup_ms: int | None = None
+    active_idle_ms: int | None = None
     asr_ms: int | None = None
     asr_worker_ms: int | None = None
     asr_queue_transport_ms: int | None = None
@@ -106,6 +138,11 @@ class SessionMetric:
     correction_rejection: str | None = None
     error_code: str | None = None
     nano_was_stopped_for_qwen: bool = False
+    session_policy: str | None = None
+    session_transition: str | None = None
+    risk_gate: str | None = None
+    nano_rehydration: str | None = None
+    background_enrichment: str | None = None
 
 
 class MetricsLedger:
@@ -165,6 +202,11 @@ class MetricsLedger:
             "correction",
             "correction_rejection",
             "error_code",
+            "session_policy",
+            "session_transition",
+            "risk_gate",
+            "nano_rehydration",
+            "background_enrichment",
         ):
             values = [getattr(row, field) for row in rows]
             counts = Counter(value for value in values if value is not None)
@@ -216,6 +258,29 @@ class MetricsLedger:
             and updates["error_code"] not in _ALLOWED_ERROR_CODES
         ):
             raise ValueError("invalid error_code")
+        if (
+            "session_policy" in updates
+            and updates["session_policy"] not in _ALLOWED_SESSION_POLICIES
+        ):
+            raise ValueError("invalid session_policy")
+        if (
+            "session_transition" in updates
+            and updates["session_transition"] not in _ALLOWED_SESSION_TRANSITIONS
+        ):
+            raise ValueError("invalid session_transition")
+        if "risk_gate" in updates and updates["risk_gate"] not in _ALLOWED_RISK_GATE:
+            raise ValueError("invalid risk_gate")
+        if (
+            "nano_rehydration" in updates
+            and updates["nano_rehydration"] not in _ALLOWED_NANO_REHYDRATION
+        ):
+            raise ValueError("invalid nano_rehydration")
+        if (
+            "background_enrichment" in updates
+            and updates["background_enrichment"]
+            not in _ALLOWED_BACKGROUND_ENRICHMENT
+        ):
+            raise ValueError("invalid background_enrichment")
         if "nano_was_stopped_for_qwen" in updates and not isinstance(
             updates["nano_was_stopped_for_qwen"], bool
         ):

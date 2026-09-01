@@ -25,11 +25,17 @@ dtype = "bf16"
 gpu_memory_utilization = 0.15
 # Nano 单次解码的最大上下文；范围固定为 1024..1536。
 max_model_len = 1536
-# 模型 worker 在最后一次请求完成后空闲多久退出并释放 XPU 内存；30..300 秒。
-idle_unload_seconds = 120
+# 模型 worker 的最终防泄漏兜底；活跃会话由 daemon 显式控制停止，固定 1800 秒。
+worker_failsafe_idle_seconds = 1800
 # 仅 Nano 无法加载或 XPU OOM 时才改用 SenseVoiceSmall；普通结果不降级。
 allow_sensevoice_fallback = true
 enforce_eager = true
+
+[active_session]
+# Nano 成功识别后的热驻留策略；窗口固定为 120 / 480 / 1800 秒。
+policy = "balanced" # memory_saver | balanced | sustained
+# 仅本机 incremental Nano XPU POC 通过后才能实际启用。
+provisional_enabled = false
 
 [enhanced]
 # 启用后，ASR 完成才会启动一次 Qwen3.5-0.8B 修正子进程；进程返回即退出。

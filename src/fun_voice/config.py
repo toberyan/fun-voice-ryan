@@ -12,6 +12,7 @@ import os
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 
 # --- Permission policy ------------------------------------------------------
@@ -39,6 +40,23 @@ XPU_DEVICE = "xpu:0"
 class ConfigError(RuntimeError):
     """Raised when the configuration or runtime environment cannot be used safely."""
 
+
+class ResourcePolicy(StrEnum):
+    """The three product-owned Nano active-session resource profiles."""
+
+    MEMORY_SAVER = "memory_saver"
+    BALANCED = "balanced"
+    SUSTAINED = "sustained"
+
+
+_ACTIVE_IDLE_SECONDS = {
+    ResourcePolicy.MEMORY_SAVER: 120,
+    ResourcePolicy.BALANCED: 480,
+    ResourcePolicy.SUSTAINED: 1800,
+}
+WORKER_FAILSAFE_IDLE_SECONDS = 1800
+
+
 @dataclass(frozen=True)
 class InferenceConfig:
     """Bounded XPU ASR settings for a transient worker process.
@@ -52,9 +70,40 @@ class InferenceConfig:
     dtype: str = "bf16"
     gpu_memory_utilization: float = 0.15
     max_model_len: int = 1536
-    idle_unload_seconds: int = 120
+    worker_failsafe_idle_seconds: int = WORKER_FAILSAFE_IDLE_SECONDS
     allow_sensevoice_fallback: bool = True
     enforce_eager: bool = True
+
+    @property
+    def idle_unload_seconds(self) -> int:
+        """Compatibility read alias retained for existing worker integrations."""
+        return self.worker_failsafe_idle_seconds
+
+
+@dataclass(frozen=True)
+class ActiveSessionConfig:
+    """Fixed active-session policy independent of model runtime imports."""
+
+    policy: ResourcePolicy = ResourcePolicy.BALANCED
+    active_idle_seconds: int = _ACTIVE_IDLE_SECONDS[ResourcePolicy.BALANCED]
+    worker_failsafe_idle_seconds: int = WORKER_FAILSAFE_IDLE_SECONDS
+    provisional_enabled: bool = False
+    device: str = XPU_DEVICE
+
+    @classmethod
+    def for_policy(
+        cls,
+        policy: ResourcePolicy,
+        *,
+        provisional_enabled: bool = False,
+        worker_failsafe_idle_seconds: int = WORKER_FAILSAFE_IDLE_SECONDS,
+    ) -> ActiveSessionConfig:
+        return cls(
+            policy=policy,
+            active_idle_seconds=_ACTIVE_IDLE_SECONDS[policy],
+            worker_failsafe_idle_seconds=worker_failsafe_idle_seconds,
+            provisional_enabled=provisional_enabled,
+        )
 
 
 @dataclass(frozen=True)
@@ -96,6 +145,7 @@ class Config:
     fcitx_commit_timeout_ms: int = 500
     allow_x11_paste_fallback: bool = True
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+    active_session: ActiveSessionConfig = field(default_factory=ActiveSessionConfig)
     enhanced: EnhancedInferenceConfig = field(default_factory=EnhancedInferenceConfig)
 
 
@@ -187,6 +237,17 @@ def _bool(value: object, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
 
+def _resource_policy(value: object, default: ResourcePolicy) -> ResourcePolicy:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ConfigError("active_session.policy must be a supported policy")
+    try:
+        return ResourcePolicy(value)
+    except ValueError as exc:
+        raise ConfigError("active_session.policy must be a supported policy") from exc
+
+
 def _float(value: object, default: float) -> float:
     if isinstance(value, bool):
         return default
@@ -237,9 +298,27 @@ def validate_inference_config(inference: InferenceConfig) -> InferenceConfig:
         )
     if not 1024 <= inference.max_model_len <= 1536:
         raise ConfigError("inference.max_model_len must be in [1024, 1536]")
-    if not 30 <= inference.idle_unload_seconds <= 300:
-        raise ConfigError("inference.idle_unload_seconds must be in [30, 300]")
+    if inference.worker_failsafe_idle_seconds != WORKER_FAILSAFE_IDLE_SECONDS:
+        raise ConfigError(
+            "inference.worker_failsafe_idle_seconds must be 1800"
+        )
     return inference
+
+
+def validate_active_session_config(value: ActiveSessionConfig) -> ActiveSessionConfig:
+    """Validate the bounded, XPU-only active-session product policy."""
+    if value.device != XPU_DEVICE:
+        raise ConfigError("active_session.device must be 'xpu:0'")
+    expected_idle = _ACTIVE_IDLE_SECONDS.get(value.policy)
+    if expected_idle is None or value.active_idle_seconds != expected_idle:
+        raise ConfigError(
+            "active_session.active_idle_seconds must match the fixed policy window"
+        )
+    if value.worker_failsafe_idle_seconds != WORKER_FAILSAFE_IDLE_SECONDS:
+        raise ConfigError(
+            "active_session.worker_failsafe_idle_seconds must be 1800"
+        )
+    return value
 
 
 def validate_enhanced_inference_config(
@@ -299,9 +378,21 @@ def load_config(path: str | Path | None = None) -> Config:
     audio = _table(raw.get("audio"))
     input_method = _table(raw.get("input_method"))
     inference = _table(raw.get("inference"))
+    active_session = _table(raw.get("active_session"))
     enhanced = _table(raw.get("enhanced"))
     correction = _table(raw.get("correction"))
     speaker_identity = _table(raw.get("speaker_identity"))
+
+    configured_failsafe = inference.get("worker_failsafe_idle_seconds")
+    if configured_failsafe is None and "idle_unload_seconds" in inference:
+        # Keep one release of TOML compatibility while never allowing the old
+        # short worker timeout to defeat an active Nano session.
+        legacy_value = _positive_int(
+            inference.get("idle_unload_seconds"),
+            key="inference.idle_unload_seconds",
+            default=WORKER_FAILSAFE_IDLE_SECONDS,
+        )
+        configured_failsafe = max(legacy_value, WORKER_FAILSAFE_IDLE_SECONDS)
 
     inference_config = validate_inference_config(
         InferenceConfig(
@@ -315,15 +406,33 @@ def load_config(path: str | Path | None = None) -> Config:
                 key="inference.max_model_len",
                 default=1536,
             ),
-            idle_unload_seconds=_positive_int(
-                inference.get("idle_unload_seconds"),
-                key="inference.idle_unload_seconds",
-                default=120,
+            worker_failsafe_idle_seconds=_positive_int(
+                configured_failsafe,
+                key="inference.worker_failsafe_idle_seconds",
+                default=WORKER_FAILSAFE_IDLE_SECONDS,
             ),
             allow_sensevoice_fallback=_bool(
                 inference.get("allow_sensevoice_fallback"), True
             ),
             enforce_eager=_bool(inference.get("enforce_eager"), True),
+        )
+    )
+    active_policy = _resource_policy(
+        active_session.get("policy"), ResourcePolicy.BALANCED
+    )
+    active_config = validate_active_session_config(
+        ActiveSessionConfig(
+            policy=active_policy,
+            active_idle_seconds=_positive_int(
+                active_session.get("active_idle_seconds"),
+                key="active_session.active_idle_seconds",
+                default=_ACTIVE_IDLE_SECONDS[active_policy],
+            ),
+            worker_failsafe_idle_seconds=inference_config.worker_failsafe_idle_seconds,
+            provisional_enabled=_bool(
+                active_session.get("provisional_enabled"), False
+            ),
+            device=_str(active_session.get("device"), XPU_DEVICE),
         )
     )
     enhanced_config = validate_enhanced_inference_config(
@@ -380,5 +489,6 @@ def load_config(path: str | Path | None = None) -> Config:
             input_method.get("allow_x11_paste_fallback"), True
         ),
         inference=inference_config,
+        active_session=active_config,
         enhanced=enhanced_config,
     )

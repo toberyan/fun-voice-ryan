@@ -60,3 +60,26 @@ def test_metrics_aggregate_private_stage_durations_and_warmup_state() -> None:
     assert summary["asr_release_ms"] == {"p50": 3, "p95": 3}
     assert summary["nano_warmup"] == {"ready": 1}
     assert "worker_response" not in repr(summary)
+
+
+def test_metrics_aggregate_only_fixed_active_session_categories() -> None:
+    ledger = MetricsLedger()
+    row = ledger.begin()
+    ledger.record(
+        row,
+        active_idle_ms=480_000,
+        session_policy="balanced",
+        session_transition="active_idle",
+        risk_gate="mixed_technical",
+        nano_rehydration="ready",
+        background_enrichment="cancelled",
+    )
+
+    summary = ledger.summary()
+
+    assert summary["active_idle_ms"] == {"p50": 480_000, "p95": 480_000}
+    assert summary["session_policy"] == {"balanced": 1}
+    assert summary["session_transition"] == {"active_idle": 1}
+    assert summary["risk_gate"] == {"mixed_technical": 1}
+    assert summary["nano_rehydration"] == {"ready": 1}
+    assert summary["background_enrichment"] == {"cancelled": 1}
