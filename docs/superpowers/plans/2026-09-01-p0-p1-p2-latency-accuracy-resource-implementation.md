@@ -169,7 +169,7 @@ class VoiceDaemon:
     def __init__(..., nano_preloader: Callable[[], None] | None = None, ...): ...
 ```
 
-- [ ] **Step 1: Write failing behavior tests**
+- [x] **Step 1: Write failing behavior tests**
 
 ```python
 def test_preload_constructs_lazy_runtime_once_then_transcribe_reuses_it() -> None:
@@ -186,17 +186,17 @@ def test_daemon_requests_nano_preload_only_after_recording_starts() -> None:
     wait_until(lambda: calls == ["preload"])
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_worker_protocol.py tests/test_daemon.py tests/test_end_to_end_fakes.py -q`
 
 Expected: FAIL because `preload` does not exist.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Worker `preload` calls only `LazyTranscriber._get_runtime()` and returns XPU/model readiness without audio. `SocketWorkerClient.preload` starts its assigned template if needed and sends that operation. Once daemon state is `RECORDING`, create one daemon preload thread. Its exception is captured as a metric enum; it never blocks hotkey handling or release. Wire only `nano_worker.preload` in `main`; never preload `FallbackWorkerClient` or SenseVoice. Preserve the single-threaded worker server so preload and transcribe serialize model access.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_worker_protocol.py tests/test_daemon.py tests/test_end_to_end_fakes.py -q && .venv/bin/ruff check src/fun_voice/worker.py src/fun_voice/daemon.py && .venv/bin/mypy src`
 

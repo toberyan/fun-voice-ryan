@@ -348,6 +348,15 @@ class SocketWorkerClient:
             self._start_service()
             return self._wait_for_worker(request, first_failure)
 
+    def preload(self) -> None:
+        """Request model materialization without sending any audio."""
+        request = {"id": uuid.uuid4().hex, "op": "preload"}
+        try:
+            self._parse_preload_response(self._round_trip(request))
+        except _WorkerConnectFailure as first_failure:
+            self._start_service()
+            self._wait_for_preload(request, first_failure)
+
     def _wait_for_worker(
         self, request: Mapping[str, Any], first_failure: _WorkerConnectFailure
     ) -> Transcription:
@@ -356,6 +365,20 @@ class SocketWorkerClient:
         while self._monotonic() < deadline:
             try:
                 return self._parse_response(self._round_trip(request))
+            except _WorkerConnectFailure as exc:
+                last = exc
+                self._sleep(WORKER_STARTUP_POLL_SECONDS)
+        raise WorkerError(ErrorCode("worker", "unavailable"), str(last))
+
+    def _wait_for_preload(
+        self, request: Mapping[str, Any], first_failure: _WorkerConnectFailure
+    ) -> None:
+        deadline = self._monotonic() + self._startup_timeout
+        last = first_failure
+        while self._monotonic() < deadline:
+            try:
+                self._parse_preload_response(self._round_trip(request))
+                return
             except _WorkerConnectFailure as exc:
                 last = exc
                 self._sleep(WORKER_STARTUP_POLL_SECONDS)
@@ -405,6 +428,14 @@ class SocketWorkerClient:
         detail = str(response.get("error_message") or "")
         if code.code == "empty_speech":
             raise EmptySpeechError()
+        raise WorkerError(code, detail)
+
+    @staticmethod
+    def _parse_preload_response(response: Mapping[str, Any]) -> None:
+        if response.get("status") == "ok" and response.get("model_ready") is True:
+            return
+        code = _parse_error_code(response.get("error_code"))
+        detail = str(response.get("error_message") or "")
         raise WorkerError(code, detail)
 
 
@@ -466,6 +497,7 @@ class VoiceDaemon:
         worker: WorkerClient,
         corrector: TextCorrector | None = None,
         metrics: MetricsLedger | None = None,
+        nano_preloader: Callable[[], None] | None = None,
         auto_stop_event: threading.Event | None = None,
         capture_config: CaptureConfig | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -481,6 +513,7 @@ class VoiceDaemon:
         self._corrector = corrector
         self._metrics = metrics if metrics is not None else MetricsLedger()
         self._metric_sequence: int | None = None
+        self._nano_preloader = nano_preloader
         self._auto_stop_event = auto_stop_event
         self._capture_config = (
             capture_config if capture_config is not None else CaptureConfig()
@@ -599,6 +632,7 @@ class VoiceDaemon:
 
             self._state = DaemonState.RECORDING
             self._metric_sequence = self._metrics.begin()
+            self._schedule_nano_preload(self._metric_sequence)
             logger.info("state -> recording")
             self._notify(NOTIFY_RECORDING)
             return "started"
@@ -617,6 +651,37 @@ class VoiceDaemon:
             if self._monotonic() >= deadline:
                 return False
             self._sleep(C_CONFIRM_POLL_SECONDS)
+
+    def _schedule_nano_preload(self, sequence: int) -> None:
+        """Start one non-blocking Nano preload after capture has begun."""
+        preloader = self._nano_preloader
+        if preloader is None:
+            return
+        self._metrics.record(sequence, nano_preload="scheduled")
+        threading.Thread(
+            target=self._preload_nano,
+            args=(sequence, preloader),
+            daemon=True,
+            name="nano-preload",
+        ).start()
+
+    def _preload_nano(self, sequence: int, preloader: Callable[[], None]) -> None:
+        started = self._monotonic()
+        try:
+            preloader()
+        except Exception as exc:  # noqa: BLE001 - recording stays unaffected
+            logger.info("nano preload unavailable: %s", type(exc).__name__)
+            self._metrics.record(
+                sequence,
+                preload_ms=_elapsed_ms(started, self._monotonic()),
+                nano_preload="failed",
+            )
+            return
+        self._metrics.record(
+            sequence,
+            preload_ms=_elapsed_ms(started, self._monotonic()),
+            nano_preload="ready",
+        )
 
     def stop(self) -> None:
         """Handle a hotkey release; only acts while ``RECORDING``.
@@ -1159,6 +1224,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         notifier=notifier,
         worker=worker,
         corrector=corrector,
+        nano_preloader=nano_worker.preload,
         auto_stop_event=auto_stop_event,
         capture_config=CaptureConfig(source=cfg.audio_source),
     )

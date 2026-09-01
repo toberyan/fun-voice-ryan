@@ -619,6 +619,14 @@ class _WorkerSocket:
 
 
 def _ok_responder(request: dict) -> dict:
+    if request["op"] == "preload":
+        return {
+            "id": request["id"],
+            "status": "ok",
+            "model_ready": True,
+            "xpu_ready": True,
+            "device": "xpu:0",
+        }
     return {
         "id": request["id"],
         "status": "ok",
@@ -652,6 +660,17 @@ def test_worker_client_round_trip(tmp_path: Path) -> None:
         assert result.text == "你好"
         assert server.requests[0]["op"] == "transcribe"
         assert server.requests[0]["audio"] == ARTIFACT.audio
+    finally:
+        server.close()
+
+
+def test_worker_client_preload_sends_no_audio(tmp_path: Path) -> None:
+    server = _WorkerSocket(tmp_path / "worker.sock", _ok_responder)
+    try:
+        client = SocketWorkerClient(tmp_path / "worker.sock", timeout=2.0)
+        client.preload()
+        assert server.requests[0]["op"] == "preload"
+        assert "audio" not in server.requests[0]
     finally:
         server.close()
 

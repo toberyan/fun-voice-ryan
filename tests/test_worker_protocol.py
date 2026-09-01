@@ -184,6 +184,27 @@ def test_lazy_transcriber_loads_only_for_first_transcription() -> None:
     assert len(loaded) == 1
 
 
+def test_preload_constructs_lazy_runtime_once_then_transcribe_reuses_it() -> None:
+    loaded: list[FakeRuntime] = []
+
+    def load() -> FakeRuntime:
+        runtime = FakeRuntime()
+        loaded.append(runtime)
+        return runtime
+
+    worker = Worker(LazyTranscriber(load, device="xpu:0"))
+
+    preload = worker.handle({"id": "p", "op": "preload"})
+    transcribe = worker.handle(
+        {"id": "t", "op": "transcribe", "audio": "/tmp/a", "sample_rate": 16000}
+    )
+
+    assert preload["status"] == "ok"
+    assert preload["model_ready"] is True
+    assert transcribe["status"] == "ok"
+    assert len(loaded) == 1
+
+
 def test_lazy_transcriber_maps_load_failure_to_stable_worker_error() -> None:
     def load() -> FakeRuntime:
         raise RuntimeError("broken checkpoint")

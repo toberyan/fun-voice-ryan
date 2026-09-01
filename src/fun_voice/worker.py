@@ -76,7 +76,7 @@ class Transcriber(Protocol):
 
 
 class LazyTranscriber:
-    """Build one profile-owned runtime on its first transcription only."""
+    """Build one profile-owned runtime on its first request or preload."""
 
     def __init__(self, loader: Callable[[], Transcriber], *, device: str) -> None:
         self._loader = loader
@@ -105,6 +105,10 @@ class LazyTranscriber:
         return self._get_runtime().transcribe(
             audio, sample_rate=sample_rate, timeout=timeout
         )
+
+    def preload(self) -> WorkerHealth:
+        """Materialize the profile runtime without accepting audio input."""
+        return self._get_runtime().health()
 
     def health(self) -> WorkerHealth:
         runtime = self._runtime
@@ -180,6 +184,8 @@ class Worker:
         op = message.get("op")
         if op == "transcribe":
             return self._transcribe(message)
+        if op == "preload":
+            return self._preload(message)
         if op == "health":
             return self._health(message)
         return _error_response(message.get("id"), ERR_PROTOCOL, f"unknown op: {op!r}")
@@ -226,6 +232,33 @@ class Worker:
             return _error_response(request_id, code, detail, elapsed)
         elapsed = int((time.perf_counter() - started) * 1000)
         return _ok_response(request_id, transcription, elapsed)
+
+    def _preload(self, message: Mapping[str, Any]) -> dict[str, Any]:
+        """Load the lazy runtime and return health, without audio or text."""
+        request_id = message.get("id")
+        if not isinstance(request_id, str) or not request_id:
+            return _error_response(None, ERR_PROTOCOL, "missing or invalid id")
+        started = time.perf_counter()
+        try:
+            preload = getattr(self.runtime, "preload", None)
+            health = preload() if callable(preload) else self.runtime.health()
+        except Exception as exc:
+            elapsed = int((time.perf_counter() - started) * 1000)
+            code = _error_code_of(exc)
+            detail = (
+                str(exc) if isinstance(exc, NanoRuntimeError) else type(exc).__name__
+            )
+            logger.warning("preload failed: %s (%s)", code, type(exc).__name__)
+            return _error_response(request_id, code, detail, elapsed)
+        return {
+            "id": request_id,
+            "status": "ok",
+            "version": self.version,
+            "model_ready": health.model_ready,
+            "xpu_ready": health.xpu_ready,
+            "device": health.device,
+            "last_error": str(health.last_error) if health.last_error else None,
+        }
 
     def _health(self, message: Mapping[str, Any]) -> dict[str, Any]:
         health = self.runtime.health()

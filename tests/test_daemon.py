@@ -255,6 +255,7 @@ class Harness:
         injector: FakeInjector | None = None,
         worker: FakeWorker | None = None,
         corrector: FakeCorrector | None = None,
+        nano_preloader: Callable[[], None] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         capture_config: CaptureConfig | None = None,
@@ -288,6 +289,7 @@ class Harness:
             notifier=self.notifier,
             worker=self.worker,
             corrector=self.corrector,
+            nano_preloader=nano_preloader,
             monotonic=monotonic if monotonic is not None else time.monotonic,
             sleep=sleep if sleep is not None else time.sleep,
             capture_config=(
@@ -387,6 +389,23 @@ def test_completed_session_metrics_contain_only_aggregate_stage_data() -> None:
     assert "commit_ms" in report
     assert "你好" not in repr(report)
     assert ARTIFACT.audio not in repr(report)
+
+
+def test_daemon_requests_nano_preload_only_after_recording_starts() -> None:
+    called = threading.Event()
+    states: list[DaemonState] = []
+    holder: dict[str, VoiceDaemon] = {}
+
+    def preload() -> None:
+        states.append(holder["daemon"].state)
+        called.set()
+
+    h = Harness(nano_preloader=preload)
+    holder["daemon"] = h.daemon
+
+    assert h.daemon.start_if_idle() == "started"
+    assert called.wait(timeout=2.0)
+    assert states == [DaemonState.RECORDING]
 
 
 def test_start_cancels_when_c_not_pressed() -> None:
