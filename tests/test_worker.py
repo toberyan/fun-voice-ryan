@@ -6,6 +6,8 @@ import torch / vllm / funasr, so they run in milliseconds.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 import wave
 from types import SimpleNamespace
@@ -219,6 +221,25 @@ def test_nano_warmup_generates_synthetic_audio_without_vad() -> None:
     assert inputs[0].dtype == np.float32
     assert max_new_tokens == 512
     assert vad.detect_calls == []
+
+
+def test_runtime_live_fd_vad_and_window_preserve_source_offsets() -> None:
+    runtime = _runtime(FakeEngine(texts=["window"]), FakeVad([(0, 100)]))
+    with tempfile.TemporaryFile() as audio:
+        fd = audio.fileno()
+        audio.write(b"\x00\x00" * (16_000 * 300 // 1000))
+        audio.flush()
+
+        assert runtime.detect_vad_fd(fd, sample_rate=16000) == ((0, 100),)
+        transcription = runtime.transcribe_window_fd(
+            fd,
+            sample_rate=16000,
+            source_start_ms=1200,
+            source_end_ms=1500,
+        )
+
+    assert transcription.text == "window"
+    assert transcription.segments == (Segment(1200, 1300, "window"),)
 
 
 # --- FSMN-VAD adapter (real parse path) -------------------------------------
@@ -474,6 +495,69 @@ def test_worker_health_never_carries_audio_or_text() -> None:
     assert "text" not in response
     assert "path" not in response
     assert "segments" not in response
+
+
+def test_worker_live_requests_require_one_fd_and_preserve_source_offsets() -> None:
+    class LiveRuntime(FakeRuntime):
+        def detect_vad_fd(
+            self, fd: int, *, sample_rate: int
+        ) -> tuple[tuple[int, int], ...]:
+            assert fd >= 0
+            assert sample_rate == 16000
+            return ((0, 100), (120, 220))
+
+        def transcribe_window_fd(
+            self,
+            fd: int,
+            *,
+            sample_rate: int,
+            source_start_ms: int,
+            source_end_ms: int,
+        ) -> Transcription:
+            assert fd >= 0
+            assert sample_rate == 16000
+            assert (source_start_ms, source_end_ms) == (1200, 1500)
+            return Transcription(
+                text="window",
+                segments=(Segment(1200, 1500, "window"),),
+            )
+
+    worker = _worker(LiveRuntime())
+    fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        missing = worker.handle({"id": "missing", "op": "detect_vad"})
+        detected = worker.handle(
+            {"id": "vad", "op": "detect_vad", "sample_rate": 16000},
+            audio_fd=fd,
+        )
+        transcribed = worker.handle(
+            {
+                "id": "window",
+                "op": "transcribe_window",
+                "sample_rate": 16000,
+                "source_start_ms": 1200,
+                "source_end_ms": 1500,
+            },
+            audio_fd=fd,
+        )
+    finally:
+        os.close(fd)
+
+    assert missing["status"] == "error"
+    assert missing["error_code"] == "worker.protocol"
+    assert detected == {
+        "id": "vad",
+        "status": "ok",
+        "ranges": [
+            {"start_ms": 0, "end_ms": 100},
+            {"start_ms": 120, "end_ms": 220},
+        ],
+        "error_code": None,
+    }
+    assert transcribed["status"] == "ok"
+    assert transcribed["segments"] == [
+        {"start_ms": 1200, "end_ms": 1500, "text": "window"}
+    ]
 
 
 def test_worker_unknown_op_returns_protocol_error() -> None:

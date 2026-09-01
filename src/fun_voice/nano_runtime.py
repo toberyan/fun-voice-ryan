@@ -209,6 +209,19 @@ def _load_audio_samples(path: str, sample_rate: int) -> np.ndarray:
     return pcm.astype(np.float32) / 32768.0
 
 
+def _load_pcm_fd(fd: int) -> np.ndarray:
+    """Read raw s16le PCM from one received descriptor without a pathname."""
+    try:
+        with os.fdopen(os.dup(fd), "rb", closefd=True) as audio:
+            audio.seek(0)
+            data = audio.read()
+    except OSError as exc:
+        raise AudioFormatError("unable to read live audio descriptor") from exc
+    if not data or len(data) % 2:
+        raise AudioFormatError("live audio descriptor is not s16le PCM")
+    return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 # --- VAD segmenter ----------------------------------------------------------
 
 
@@ -380,6 +393,52 @@ class NanoRuntime:
         except NanoRuntimeError as exc:
             self.last_error = exc.error_code
             raise
+
+    def detect_vad_fd(
+        self, fd: int, *, sample_rate: int = 16000
+    ) -> tuple[tuple[int, int], ...]:
+        """Run the already-loaded VAD over a received anonymous PCM window."""
+        try:
+            regions = self.vad.detect(_load_pcm_fd(fd), sample_rate)
+            return tuple(sorted(regions, key=lambda region: region[0]))
+        except NanoRuntimeError as exc:
+            self.last_error = exc.error_code
+            raise
+
+    def transcribe_window_fd(
+        self,
+        fd: int,
+        *,
+        sample_rate: int = 16000,
+        source_start_ms: int,
+        source_end_ms: int,
+        timeout: float | None = None,
+    ) -> Transcription:
+        """Decode one live window and express its segments in source time."""
+        if source_start_ms < 0 or source_end_ms <= source_start_ms:
+            raise AudioFormatError("invalid live source range")
+        try:
+            result = self.transcribe_samples(
+                _load_pcm_fd(fd), sample_rate=sample_rate, timeout=timeout
+            )
+        except NanoRuntimeError as exc:
+            self.last_error = exc.error_code
+            raise
+        return Transcription(
+            text=result.text,
+            segments=tuple(
+                Segment(
+                    start_ms=source_start_ms + segment.start_ms,
+                    end_ms=source_start_ms + segment.end_ms,
+                    text=segment.text,
+                )
+                for segment in result.segments
+            ),
+            request_id=result.request_id,
+            engine=result.engine,
+            timing=result.timing,
+            worker_elapsed_ms=result.worker_elapsed_ms,
+        )
 
     def _transcribe_impl(
         self,

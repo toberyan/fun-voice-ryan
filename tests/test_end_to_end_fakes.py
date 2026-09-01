@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -20,7 +21,7 @@ from typing import Any
 import pytest
 
 from fun_voice import daemon as daemon_mod
-from fun_voice.capture import CaptureError
+from fun_voice.capture import AudioLease, CaptureError
 from fun_voice.contracts import (
     FCITX_CHUNK_MAX_BYTES,
     CaptureArtifact,
@@ -699,6 +700,40 @@ def test_worker_client_preload_sends_no_audio(tmp_path: Path) -> None:
         assert "audio" not in server.requests[0]
     finally:
         server.close()
+
+
+def test_worker_client_live_vad_uses_an_anonymous_audio_lease(tmp_path: Path) -> None:
+    server = _WorkerSocket(
+        tmp_path / "worker.sock",
+        lambda request: {
+            "id": request["id"],
+            "status": "ok",
+            "ranges": [{"start_ms": 0, "end_ms": 100}],
+            "error_code": None,
+        },
+    )
+    try:
+        with tempfile.TemporaryFile() as backing:
+            backing.write(b"\x00\x00" * 1600)
+            backing.flush()
+            lease = AudioLease(
+                CaptureArtifact(
+                    audio=f"/proc/self/fd/{backing.fileno()}", duration_ms=100
+                ),
+                backing,
+            )
+            try:
+                ranges = SocketWorkerClient(
+                    tmp_path / "worker.sock", timeout=1.0
+                ).detect_vad(lease)
+            finally:
+                lease.release()
+    finally:
+        server.close()
+
+    assert ranges == ((0, 100),)
+    assert server.requests[0]["op"] == "detect_vad"
+    assert "audio" not in server.requests[0]
 
 
 def test_worker_client_maps_empty_speech(tmp_path: Path) -> None:

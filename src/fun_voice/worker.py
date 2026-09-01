@@ -20,6 +20,7 @@ Privacy: responses and logs never carry audio paths or transcription text.
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import logging
 import os
@@ -230,6 +231,26 @@ def _error_code_of(exc: BaseException) -> ErrorCode:
     return code if isinstance(code, ErrorCode) else ERR_INTERNAL
 
 
+def _ordered_ranges(ranges: tuple[object, ...]) -> bool:
+    """Validate VAD ranges without preserving any audio or text payload."""
+    previous_end = -1
+    for item in ranges:
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
+        start, end = item
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < previous_end
+            or end <= start
+        ):
+            return False
+        previous_end = end
+    return True
+
+
 # --- Dispatch ---------------------------------------------------------------
 
 
@@ -240,10 +261,16 @@ class Worker:
         self.runtime = runtime
         self.version = version
 
-    def handle(self, message: Mapping[str, Any]) -> dict[str, Any]:
+    def handle(
+        self, message: Mapping[str, Any], *, audio_fd: int | None = None
+    ) -> dict[str, Any]:
         op = message.get("op")
         if op == "transcribe":
             return self._transcribe(message)
+        if op == "detect_vad":
+            return self._detect_vad(message, audio_fd)
+        if op == "transcribe_window":
+            return self._transcribe_window(message, audio_fd)
         if op == "preload":
             return self._preload(message)
         if op == "health":
@@ -292,6 +319,93 @@ class Worker:
             return _error_response(request_id, code, detail, elapsed)
         elapsed = int((time.perf_counter() - started) * 1000)
         return _ok_response(request_id, transcription, elapsed)
+
+    def _detect_vad(
+        self, message: Mapping[str, Any], audio_fd: int | None
+    ) -> dict[str, Any]:
+        request_id, sample_rate = self._live_request_fields(message, audio_fd)
+        if request_id is None or sample_rate is None:
+            return _error_response(
+                message.get("id"), ERR_PROTOCOL, "invalid live request"
+            )
+        detect = getattr(self.runtime, "detect_vad_fd", None)
+        if not callable(detect):
+            return _error_response(request_id, ERR_INTERNAL, "live VAD unavailable")
+        try:
+            ranges = tuple(detect(audio_fd, sample_rate=sample_rate))
+        except Exception as exc:
+            code = _error_code_of(exc)
+            return _error_response(request_id, code, type(exc).__name__)
+        if not _ordered_ranges(ranges):
+            return _error_response(request_id, ERR_INTERNAL, "invalid VAD ranges")
+        return {
+            "id": request_id,
+            "status": "ok",
+            "ranges": [
+                {"start_ms": start_ms, "end_ms": end_ms}
+                for start_ms, end_ms in ranges
+            ],
+            "error_code": None,
+        }
+
+    def _transcribe_window(
+        self, message: Mapping[str, Any], audio_fd: int | None
+    ) -> dict[str, Any]:
+        request_id, sample_rate = self._live_request_fields(message, audio_fd)
+        if request_id is None or sample_rate is None:
+            return _error_response(
+                message.get("id"), ERR_PROTOCOL, "invalid live request"
+            )
+        start = message.get("source_start_ms")
+        end = message.get("source_end_ms")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < 0
+            or end <= start
+        ):
+            return _error_response(request_id, ERR_PROTOCOL, "invalid source range")
+        transcribe = getattr(self.runtime, "transcribe_window_fd", None)
+        if not callable(transcribe):
+            return _error_response(request_id, ERR_INTERNAL, "live ASR unavailable")
+        started = time.perf_counter()
+        try:
+            transcription = transcribe(
+                audio_fd,
+                sample_rate=sample_rate,
+                source_start_ms=start,
+                source_end_ms=end,
+            )
+        except Exception as exc:
+            return _error_response(
+                request_id,
+                _error_code_of(exc),
+                type(exc).__name__,
+                int((time.perf_counter() - started) * 1000),
+            )
+        return _ok_response(
+            request_id, transcription, int((time.perf_counter() - started) * 1000)
+        )
+
+    @staticmethod
+    def _live_request_fields(
+        message: Mapping[str, Any], audio_fd: int | None
+    ) -> tuple[str | None, int | None]:
+        request_id = message.get("id")
+        sample_rate = message.get("sample_rate")
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or audio_fd is None
+            or audio_fd < 0
+            or isinstance(sample_rate, bool)
+            or not isinstance(sample_rate, int)
+            or sample_rate <= 0
+        ):
+            return None, None
+        return request_id, sample_rate
 
     def _preload(self, message: Mapping[str, Any]) -> dict[str, Any]:
         """Load the lazy runtime and return health, without audio or text."""
@@ -436,10 +550,11 @@ class WorkerRequestHandler(socketserver.StreamRequestHandler):
             logger.warning("rejecting connection from non-owner uid")
             return
         server.request_started()
+        received_fds: tuple[int, ...] = ()
         try:
             line: bytes | None
             try:
-                line = _read_line(conn)
+                line, received_fds = _read_line_with_fds(conn)
             except MessageTooLarge as exc:
                 _send(conn, _error_response(None, ERR_PROTOCOL, str(exc)))
                 return
@@ -452,9 +567,31 @@ class WorkerRequestHandler(socketserver.StreamRequestHandler):
             except ProtocolError as exc:
                 _send(conn, _error_response(None, ERR_PROTOCOL, str(exc)))
                 return
-            response = server.worker.handle(message)
+            is_live = message.get("op") in {"detect_vad", "transcribe_window"}
+            if is_live and len(received_fds) != 1:
+                _send(
+                    conn,
+                    _error_response(
+                        message.get("id"),
+                        ERR_PROTOCOL,
+                        "live request requires exactly one fd",
+                    ),
+                )
+                return
+            if not is_live and received_fds:
+                _send(
+                    conn,
+                    _error_response(message.get("id"), ERR_PROTOCOL, "unexpected fd"),
+                )
+                return
+            response = server.worker.handle(
+                message, audio_fd=received_fds[0] if received_fds else None
+            )
             _send(conn, response)
         finally:
+            for fd in received_fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
             server.request_finished()
 
 
@@ -472,6 +609,55 @@ def _read_line(conn: socket.socket, max_bytes: int = MAX_MESSAGE_BYTES) -> bytes
             break
     line, _sep, _rest = buf.partition(b"\n")
     return bytes(line)
+
+
+def _read_line_with_fds(
+    conn: socket.socket, max_bytes: int = MAX_MESSAGE_BYTES
+) -> tuple[bytes | None, tuple[int, ...]]:
+    """Read one bounded line and its SCM_RIGHTS descriptors from the first byte.
+
+    The protocol deliberately accepts descriptors only on the initial recvmsg
+    packet.  This keeps the one-request-per-connection framing unambiguous and
+    rejects truncated or malformed ancillary layouts before a model sees audio.
+    """
+    max_fds = 4
+    ancbuf = socket.CMSG_SPACE(max_fds * array.array("i").itemsize)
+    buf = bytearray()
+    fds: list[int] = []
+    first = True
+    while True:
+        if first:
+            chunk, ancdata, flags, _addr = conn.recvmsg(4096, ancbuf)
+            first = False
+            if flags & socket.MSG_CTRUNC:
+                _close_fds(fds)
+                raise ProtocolError("truncated ancillary data")
+            for level, kind, data in ancdata:
+                if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                    _close_fds(fds)
+                    raise ProtocolError("unexpected ancillary data")
+                ints = array.array("i")
+                usable = len(data) - (len(data) % ints.itemsize)
+                ints.frombytes(data[:usable])
+                fds.extend(ints)
+        else:
+            chunk = conn.recv(4096)
+        if not chunk:
+            return (bytes(buf) if buf else None), tuple(fds)
+        buf.extend(chunk)
+        if len(buf) > max_bytes + 1:
+            _close_fds(fds)
+            raise MessageTooLarge(f"message exceeds {max_bytes} bytes")
+        if b"\n" in buf:
+            break
+    line, _sep, _rest = buf.partition(b"\n")
+    return bytes(line), tuple(fds)
+
+
+def _close_fds(fds: Sequence[int]) -> None:
+    for fd in fds:
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def _send(conn: socket.socket, response: dict[str, Any]) -> None:

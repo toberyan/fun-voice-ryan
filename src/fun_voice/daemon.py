@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from fun_voice import config
-from fun_voice.capture import CaptureConfig, CaptureError, PipeWireRecorder
+from fun_voice.capture import AudioLease, CaptureConfig, CaptureError, PipeWireRecorder
 from fun_voice.contracts import (
     MAX_MESSAGE_BYTES,
     WORKER_RESPONSE_MAX_BYTES,
@@ -554,6 +554,38 @@ class SocketWorkerClient:
             lifecycle=lifecycle,
         )
 
+    def detect_vad(self, lease: AudioLease) -> tuple[tuple[int, int], ...]:
+        """Ask the Nano worker for ranges using exactly one lease descriptor."""
+        request = {"id": uuid.uuid4().hex, "op": "detect_vad", "sample_rate": 16000}
+        try:
+            response = self._round_trip_fd(request, lease)
+        except _WorkerConnectFailure as exc:
+            raise WorkerError(ErrorCode("worker", "unavailable")) from exc
+        if response.get("status") != "ok":
+            raise WorkerError(_parse_error_code(response.get("error_code")))
+        raw_ranges = response.get("ranges")
+        if not isinstance(raw_ranges, list):
+            raise WorkerError(ErrorCode("worker", "protocol"))
+        parsed: list[tuple[int, int]] = []
+        previous_end = -1
+        for item in raw_ranges:
+            if not isinstance(item, Mapping):
+                raise WorkerError(ErrorCode("worker", "protocol"))
+            start = item.get("start_ms")
+            end = item.get("end_ms")
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+                or start < previous_end
+                or end <= start
+            ):
+                raise WorkerError(ErrorCode("worker", "protocol"))
+            parsed.append((start, end))
+            previous_end = end
+        return tuple(parsed)
+
     def _wait_for_worker(
         self, request: Mapping[str, Any], first_failure: _WorkerConnectFailure
     ) -> Transcription:
@@ -592,6 +624,36 @@ class SocketWorkerClient:
                 sock.sendall(encode_message(request) + b"\n")
                 line = _read_line(sock, WORKER_RESPONSE_MAX_BYTES)
         except (OSError, ProtocolError) as exc:
+            raise _WorkerConnectFailure(str(exc)) from exc
+        if line is None:
+            raise _WorkerConnectFailure("worker closed the connection without a reply")
+        try:
+            return decode_message(line, WORKER_RESPONSE_MAX_BYTES)
+        except ProtocolError as exc:
+            raise _WorkerConnectFailure(f"invalid worker reply: {exc}") from exc
+
+    def _round_trip_fd(
+        self, request: Mapping[str, Any], lease: AudioLease
+    ) -> dict[str, Any]:
+        try:
+            payload = encode_message(request) + b"\n"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self._timeout)
+                sock.connect(str(self._socket_path))
+                sent = sock.sendmsg(
+                    [payload],
+                    [
+                        (
+                            socket.SOL_SOCKET,
+                            socket.SCM_RIGHTS,
+                            struct.pack("i", lease.fileno()),
+                        )
+                    ],
+                )
+                if sent != len(payload):
+                    raise _WorkerConnectFailure("worker request was truncated")
+                line = _read_line(sock, WORKER_RESPONSE_MAX_BYTES)
+        except (OSError, ProtocolError, CaptureError) as exc:
             raise _WorkerConnectFailure(str(exc)) from exc
         if line is None:
             raise _WorkerConnectFailure("worker closed the connection without a reply")

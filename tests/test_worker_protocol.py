@@ -7,6 +7,7 @@ single-line JSON framing.
 
 from __future__ import annotations
 
+import array
 import contextlib
 import os
 import socket
@@ -49,6 +50,13 @@ class FakeRuntime:
 
     def close(self) -> None:
         self.closed = True
+
+    def detect_vad_fd(
+        self, fd: int, *, sample_rate: int
+    ) -> tuple[tuple[int, int], ...]:
+        assert fd >= 0
+        assert sample_rate == 16000
+        return ((0, 100),)
 
 
 class FlakyRuntime(FakeRuntime):
@@ -173,6 +181,38 @@ def test_health_over_socket(server) -> None:
     assert response["lifecycle"] == "ready"
     assert "audio" not in response
     assert "text" not in response
+
+
+def test_live_vad_socket_request_transfers_exactly_one_fd(server) -> None:
+    _worker_server, _runtime, socket_path = server
+    request = encode_message(
+        {"id": "live", "op": "detect_vad", "sample_rate": 16000}
+    ) + b"\n"
+    fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.connect(socket_path)
+            sent = conn.sendmsg(
+                [request],
+                [
+                    (
+                        socket.SOL_SOCKET,
+                        socket.SCM_RIGHTS,
+                        array.array("i", [fd]),
+                    )
+                ],
+            )
+            assert sent == len(request)
+            response = decode_message(conn.recv(4096).rstrip(b"\n"))
+    finally:
+        os.close(fd)
+
+    assert response == {
+        "id": "live",
+        "status": "ok",
+        "ranges": [{"start_ms": 0, "end_ms": 100}],
+        "error_code": None,
+    }
 
 
 def test_lazy_transcriber_loads_only_for_first_transcription() -> None:

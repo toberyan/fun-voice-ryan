@@ -132,6 +132,13 @@ class AudioLease:
             self._refs += 1
         return self
 
+    def fileno(self) -> int:
+        """Return the live descriptor while the caller still owns a reference."""
+        with self._lock:
+            if self._closed:
+                raise CaptureError("audio lease is already released")
+            return self._backing.fileno()
+
     def release(self) -> None:
         """Release one reference and close the anonymous descriptor at zero."""
         backing: BinaryIO | None = None
