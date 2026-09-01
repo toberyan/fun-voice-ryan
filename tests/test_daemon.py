@@ -58,6 +58,7 @@ from fun_voice.desktop import (
     XTestInjector,
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
+from fun_voice.overlay import OverlayModel
 from fun_voice.scheduler import ModelLifecycle, XpuScheduler
 
 ARTIFACT = CaptureArtifact(
@@ -209,6 +210,22 @@ class FakeNotifier:
         self.messages.append(message)
 
 
+class FakeOverlay:
+    def __init__(self) -> None:
+        self.models: list[OverlayModel] = []
+        self.clear_calls = 0
+        self.close_calls = 0
+
+    def show(self, model: OverlayModel) -> None:
+        self.models.append(model)
+
+    def clear(self) -> None:
+        self.clear_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 class FakeWorker:
     def __init__(
         self,
@@ -274,6 +291,7 @@ class Harness:
         worker: FakeWorker | None = None,
         fallback_worker: FakeWorker | None = None,
         corrector: FakeCorrector | None = None,
+        overlay: FakeOverlay | None = None,
         xpu_lease: AllowingLease | RejectingLease | None = None,
         nano_preloader: Callable[[], PreloadTiming | None] | None = None,
         monotonic: Callable[[], float] | None = None,
@@ -286,6 +304,7 @@ class Harness:
         self.clipboard = clipboard if clipboard is not None else FakeClipboard()
         self.injector = injector if injector is not None else FakeInjector()
         self.notifier = FakeNotifier()
+        self.overlay = overlay if overlay is not None else FakeOverlay()
         self.worker = worker if worker is not None else FakeWorker()
         self.corrector = corrector
         self.fcitx_instances: list[FakeFcitx] = []
@@ -311,6 +330,7 @@ class Harness:
             worker=self.worker,
             fallback_worker=fallback_worker,
             corrector=self.corrector,
+            overlay=self.overlay,
             xpu_lease=(
                 xpu_lease if xpu_lease is not None else AllowingLease()
                 if corrector is not None
@@ -368,6 +388,77 @@ def test_start_notifies_recording() -> None:
     h = Harness()
     h.daemon.start_if_idle()
     assert NOTIFY_RECORDING in h.notifier.messages
+
+
+def test_cold_start_shows_preparing_until_nano_preload_finishes() -> None:
+    preload_started = threading.Event()
+    release_preload = threading.Event()
+    scheduler = XpuScheduler(
+        start_profile=lambda _profile: True,
+        stop_profile=lambda _profile: True,
+        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+    )
+
+    def preload() -> None:
+        preload_started.set()
+        assert release_preload.wait(timeout=1.0)
+
+    h = Harness(nano_preloader=preload, scheduler=scheduler)
+    try:
+        assert h.daemon.start_if_idle() == "started"
+        assert preload_started.wait(timeout=1.0)
+        assert h.daemon.state is DaemonState.PREPARING
+        assert h.overlay.models[-1].phase is DaemonState.PREPARING
+
+        release_preload.set()
+        deadline = time.monotonic() + 1.0
+        while h.daemon.state is DaemonState.PREPARING and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert h.daemon.state is DaemonState.RECORDING
+        assert h.overlay.models[-1].phase is DaemonState.RECORDING
+    finally:
+        release_preload.set()
+        scheduler.close()
+
+
+def test_hot_start_immediately_shows_recording() -> None:
+    h = Harness()
+    h.daemon._state = DaemonState.ACTIVE_IDLE  # noqa: SLF001 - hot-state seam
+
+    assert h.daemon.start_if_idle() == "started"
+
+    assert h.daemon.state is DaemonState.RECORDING
+    assert h.overlay.models[-1].phase is DaemonState.RECORDING
+
+
+def test_finalizing_and_correcting_statuses_clear_after_commit() -> None:
+    h = Harness(corrector=FakeCorrector(text="git commit"))
+
+    _started(h)
+    h.daemon.stop()
+
+    phases = [model.phase for model in h.overlay.models]
+    assert DaemonState.FINALIZING in phases
+    assert DaemonState.CORRECTING in phases
+    assert DaemonState.COMMITTING in phases
+    assert h.overlay.clear_calls >= 1
+    assert all(
+        not model.stable_text and not model.provisional_text
+        for model in h.overlay.models
+    )
+
+
+def test_error_path_clears_overlay_without_publishing_temporary_text() -> None:
+    h = Harness(worker=FakeWorker(error=WorkerError(ErrorCode("worker", "oom"))))
+
+    _started(h)
+    h.daemon.stop()
+
+    assert h.overlay.clear_calls >= 1
+    assert all(
+        not model.stable_text and not model.provisional_text
+        for model in h.overlay.models
+    )
 
 
 def test_start_confirms_c_is_still_pressed() -> None:
@@ -514,7 +605,7 @@ def test_daemon_aggregates_worker_and_preload_stage_durations() -> None:
     assert "你好" not in repr(report)
 
 
-def test_daemon_requests_nano_preload_only_after_recording_starts(
+def test_daemon_requests_nano_preload_only_after_capture_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     called = threading.Event()
@@ -537,7 +628,12 @@ def test_daemon_requests_nano_preload_only_after_recording_starts(
 
     assert h.daemon.start_if_idle() == "started"
     assert called.wait(timeout=2.0)
-    assert states == [DaemonState.RECORDING]
+    assert states == [DaemonState.PREPARING]
+    deadline = time.monotonic() + 1.0
+    while h.daemon.state is DaemonState.PREPARING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert h.daemon.state is DaemonState.RECORDING
+    assert h.recorder.start_calls == 1
     assert starts == []
 
 
@@ -725,6 +821,30 @@ def test_stop_transitions_through_pipeline_to_idle() -> None:
     assert h.recorder.stop_calls == 1
     assert h.worker.transcriptions == [ARTIFACT]
     assert NOTIFY_TRANSCRIBING in h.notifier.messages
+
+
+def test_finalization_does_not_hold_the_state_lock_while_asr_runs() -> None:
+    asr_started = threading.Event()
+    release_asr = threading.Event()
+
+    class BlockingWorker(FakeWorker):
+        def transcribe(self, artifact: CaptureArtifact) -> Transcription:
+            asr_started.set()
+            assert release_asr.wait(timeout=1.0)
+            return super().transcribe(artifact)
+
+    h = Harness(worker=BlockingWorker())
+    _started(h)
+    stop_thread = threading.Thread(target=h.daemon.stop)
+    stop_thread.start()
+    try:
+        assert asr_started.wait(timeout=1.0)
+        assert h.daemon.state is DaemonState.FINALIZING
+        assert h.daemon._lock.acquire(blocking=False)  # noqa: SLF001 - lock contract
+        h.daemon._lock.release()  # noqa: SLF001 - paired private-lock probe
+    finally:
+        release_asr.set()
+        stop_thread.join(timeout=1.0)
 
 
 def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> None:

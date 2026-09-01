@@ -76,6 +76,12 @@ from fun_voice.desktop import (
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
 from fun_voice.metrics import MetricsLedger
+from fun_voice.overlay import (
+    NullOverlay,
+    OverlayController,
+    OverlayModel,
+    X11TransientOverlay,
+)
 from fun_voice.scheduler import (
     CorrectionOutcome,
     ModelLifecycle,
@@ -710,6 +716,7 @@ class VoiceDaemon:
         clipboard: ClipboardLike,
         injector: InjectorLike,
         notifier: Notifier,
+        overlay: OverlayController | None = None,
         worker: WorkerClient,
         fallback_worker: WorkerClient | None = None,
         corrector: TextCorrector | None = None,
@@ -728,6 +735,7 @@ class VoiceDaemon:
         self._clipboard = clipboard
         self._injector = injector
         self._notifier = notifier
+        self._overlay = overlay if overlay is not None else NullOverlay()
         self._worker = worker
         self._fallback_worker = fallback_worker
         self._corrector = corrector
@@ -811,9 +819,10 @@ class VoiceDaemon:
             logger.info("start_if_idle rejected: session already in progress")
             return "busy"
         try:
-            if self._state is not DaemonState.IDLE:
+            if self._state not in {DaemonState.IDLE, DaemonState.ACTIVE_IDLE}:
                 logger.info("start_if_idle ignored: state=%s", self._state.value)
                 return "busy"
+            hot = self._state is DaemonState.ACTIVE_IDLE
 
             try:
                 snapshot = self._guard.capture()
@@ -847,6 +856,9 @@ class VoiceDaemon:
                 key=key, snapshot=snapshot, token=token, fcitx=fcitx
             )
             self._scheduler.activate(key)
+            if not hot:
+                self._state = DaemonState.PREPARING
+                self._show_overlay(DaemonState.PREPARING)
             try:
                 self._recorder.start(self._capture_config)
             except CaptureError:
@@ -867,10 +879,15 @@ class VoiceDaemon:
                 self._cleanup()
                 return "cancelled"
 
-            self._state = DaemonState.RECORDING
             self._metric_sequence = self._metrics.begin()
-            self._schedule_nano_preload(self._metric_sequence)
-            logger.info("state -> recording")
+            if hot:
+                self._state = DaemonState.RECORDING
+                self._show_overlay(DaemonState.RECORDING)
+            elif self._nano_preloader is None:
+                self._mark_recording_ready(key)
+            else:
+                self._schedule_nano_preload(self._metric_sequence)
+            logger.info("state -> %s", self._state.value)
             self._notify(NOTIFY_RECORDING)
             return "started"
         finally:
@@ -901,13 +918,14 @@ class VoiceDaemon:
         self._preload_handle = self._scheduler.run_asr(
             session.key,
             "nano",
-            lambda: self._preload_nano(sequence, preloader, cancelled),
+            lambda: self._preload_nano(sequence, session.key, preloader, cancelled),
             kind=ModelTaskKind.STABLE_SEGMENT,
         )
 
     def _preload_nano(
         self,
         sequence: int,
+        key: SessionKey,
         preloader: Callable[[], PreloadTiming | None],
         cancelled: threading.Event,
     ) -> None:
@@ -924,6 +942,7 @@ class VoiceDaemon:
                     preload_ms=_elapsed_ms(started, self._monotonic()),
                     nano_preload="failed",
                 )
+                self._mark_recording_ready(key)
                 return
             updates: dict[str, object] = {
                 "preload_ms": _elapsed_ms(started, self._monotonic()),
@@ -938,41 +957,65 @@ class VoiceDaemon:
                     updates["preload_warmup_ms"] = timing.warmup_ms
                 updates["nano_warmup"] = timing.warmup_status
             self._metrics.record(sequence, **updates)
+            self._mark_recording_ready(key)
+
+    def _mark_recording_ready(self, key: SessionKey) -> None:
+        """Publish Nano readiness only for the still-current preparation."""
+        session = self._session
+        if session is None or session.key != key:
+            return
+        if self._state is not DaemonState.PREPARING:
+            return
+        self._state = DaemonState.RECORDING
+        self._show_overlay(DaemonState.RECORDING)
 
     def stop(self) -> None:
-        """Handle a hotkey release; only acts while ``RECORDING``.
+        """Finalize a held recording without retaining the state lock for ASR.
 
         Uses a bounded blocking acquire so a ``stop`` arriving while ``start``
         still holds the lock (e.g. during ``fcitx.start_focus``) waits for it
         and then stops, instead of being silently dropped. The bound keeps it
-        from ever blocking on a long transcription.
+        from ever blocking on a long transcription; the capture→ASR pipeline
+        starts only after that lock has been released.
         """
         if not self._lock.acquire(timeout=STOP_LOCK_TIMEOUT_SECONDS):
             return
+        should_finalize = False
         try:
-            if self._state is not DaemonState.RECORDING:
+            if self._state not in {DaemonState.PREPARING, DaemonState.RECORDING}:
                 logger.info("stop ignored: state=%s", self._state.value)
                 return
             self._stop_locked()
+            should_finalize = True
         finally:
             self._lock.release()
+        if should_finalize:
+            self._transcribe_and_commit()
 
     def _stop_locked(self) -> None:
-        """Notify and transcribe; caller holds the lock and observed RECORDING."""
+        """Seal one recording; caller starts the model pipeline after unlock."""
         self._notify(NOTIFY_TRANSCRIBING)
-        self._transcribe_and_commit()
+        self._state = DaemonState.FINALIZING
+        self._show_overlay(DaemonState.FINALIZING)
+        logger.info("state -> finalizing")
 
     def handle_auto_stop(self) -> None:
         """Handle the recorder's 30-minute auto-stop (limit reached)."""
         if not self._lock.acquire(blocking=False):
             return
+        should_finalize = False
         try:
-            if self._state is not DaemonState.RECORDING:
+            if self._state not in {DaemonState.PREPARING, DaemonState.RECORDING}:
                 return
             self._notify(NOTIFY_LIMIT_REACHED)
-            self._transcribe_and_commit()
+            self._state = DaemonState.FINALIZING
+            self._show_overlay(DaemonState.FINALIZING)
+            logger.info("state -> finalizing")
+            should_finalize = True
         finally:
             self._lock.release()
+        if should_finalize:
+            self._transcribe_and_commit()
 
     def shutdown(self) -> None:
         """Final teardown; never blocks on an in-flight transcription.
@@ -986,6 +1029,9 @@ class VoiceDaemon:
             logger.info("shutdown: in-flight session; skipping cleanup")
             return
         try:
+            if self._state not in {DaemonState.IDLE, DaemonState.ACTIVE_IDLE}:
+                logger.info("shutdown: in-flight session; skipping cleanup")
+                return
             self._cleanup()
             with contextlib.suppress(Exception):
                 self._worker.close()
@@ -996,14 +1042,14 @@ class VoiceDaemon:
                 with contextlib.suppress(Exception):
                     self._corrector.close()
             self._scheduler.close()
+            with contextlib.suppress(Exception):
+                self._overlay.close()
         finally:
             self._lock.release()
 
     # --- Pipeline ------------------------------------------------------------
 
     def _transcribe_and_commit(self) -> None:
-        self._state = DaemonState.TRANSCRIBING
-        logger.info("state -> transcribing")
         if self._preload_cancel is not None:
             self._preload_cancel.set()
         if self._preload_handle is not None:
@@ -1067,9 +1113,12 @@ class VoiceDaemon:
 
             corrector = self._corrector
             if corrector is not None:
+                self._state = DaemonState.CORRECTING
+                self._show_overlay(DaemonState.CORRECTING)
                 text = self._correct_after_asr(corrector, text, transcription.engine)
 
             self._state = DaemonState.COMMITTING
+            self._show_overlay(DaemonState.COMMITTING)
             logger.info("state -> committing")
             commit_started = self._monotonic()
             self._commit(text)
@@ -1314,6 +1363,7 @@ class VoiceDaemon:
     def _cleanup(self) -> None:
         """Idempotent teardown; every path leaving a non-IDLE state calls it."""
         self._recorder.cleanup()
+        self._clear_overlay()
         session = self._session
         self._session = None
         self._metric_sequence = None
@@ -1321,6 +1371,15 @@ class VoiceDaemon:
             with contextlib.suppress(Exception):
                 session.fcitx.close()
         self._state = DaemonState.IDLE
+
+    def _show_overlay(self, phase: DaemonState) -> None:
+        """Best-effort status only; text/audio never enter this UI path here."""
+        with contextlib.suppress(Exception):
+            self._overlay.show(OverlayModel(phase=phase))
+
+    def _clear_overlay(self) -> None:
+        with contextlib.suppress(Exception):
+            self._overlay.clear()
 
     def _notify(self, message: str) -> None:
         try:
@@ -1586,6 +1645,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_dir=paths.runtime_dir,
     )
     guard = X11FocusGuard()
+    overlay: OverlayController = X11TransientOverlay()
     nano_worker = SocketWorkerClient(
         paths.worker_socket,
         start_service=functools.partial(default_start_worker_service, "nano"),
@@ -1619,6 +1679,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         clipboard=ClipboardMirror(),
         injector=build_injector(cfg, guard),
         notifier=notifier,
+        overlay=overlay,
         worker=nano_worker,
         fallback_worker=fallback_worker,
         corrector=corrector,
