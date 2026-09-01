@@ -90,6 +90,26 @@ fun-voice-selftest --format json
 `activating`。daemon 依赖
 图形会话环境（DISPLAY/XAUTHORITY），由登录时的 autostart 入口导入（见第 8 节）。
 
+### 6.1 内存时延诊断
+
+daemon 的 owner-only control socket 支持 `{"op":"metrics"}`。它只返回当前进程最近
+128 次会话的聚合计数、P50/P95 与固定枚举直方图；不会返回会话明细，也不会包含音频、文本、
+路径、窗口信息或模型异常原文。重启 daemon 会清空这些内存指标。
+
+- `preload_runtime_load_ms` 是 worker 内 Nano/VAD/runtime 构造耗时；
+  `preload_warmup_ms` 是构造完成后对固定一秒静音 PCM 的一次生成预热，二者均在录音期发生。
+  `nano_warmup=failed` 只表示这次预热不可用，真实 ASR 仍会继续使用已加载的 Nano。
+- `asr_queue_transport_ms` 是 daemon 端 ASR 总耗时扣除 worker 执行耗时后的外部等待；
+  `asr_audio_load_ms`、`asr_vad_ms`、`asr_generate_ms` 分别定位音频读取、VAD 和 Nano 生成。
+  `asr_release_ms` 是启动 Qwen 前确认对应 ASR worker 已停止的耗时。
+- `correction_model_load_ms`、`correction_generate_ms`、`correction_validate_ms` 分别表示
+  一次 Qwen3.5-0.8B 子进程的加载、生成和确定性校验耗时。`correction_rejection` 仅为固定原因，
+  例如 `envelope_missing`、`similarity`、`protected_token`、`oom` 或 `timeout`；它不携带候选
+  文本或被保护的技术词。任何此类拒绝仍提交原始 ASR 文本。
+
+使用这些字段先判断瓶颈是否在 runtime 加载、首次预热、ASR 推理、worker 交换，还是 Qwen
+加载；不要为了追求单次时延在登录时常驻 Nano/Qwen，或让两个模型同时占用 XPU。
+
 ## 7. 本地准确率与时延基准
 
 仅在你明确执行时运行基准。清单为本机自有的 JSONL 文件，每行包含安全类别名
