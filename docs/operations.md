@@ -83,9 +83,24 @@ fun-voice-selftest --format json
 音频或转写文本。该项通过后仍须完成 `docs/acceptance-checklist.md` 的目标应用人工验收。
 
 worker 首次启动需要几分钟加载模型（状态会先处于 `activating`）；daemon 依赖
-图形会话环境（DISPLAY/XAUTHORITY），由登录时的 autostart 入口导入（见第 7 节）。
+图形会话环境（DISPLAY/XAUTHORITY），由登录时的 autostart 入口导入（见第 8 节）。
 
-## 7. X11 热键 / Fcitx 故障处理
+## 7. 本地准确率与时延基准
+
+仅在你明确执行时运行基准。清单为本机自有的 JSONL 文件，每行包含安全类别名
+（如 `mixed`）、16 kHz 单声道 WAV/PCM 的绝对路径、参考文本，以及可选的技术词
+`terms`。它不应加入仓库。示例命令：
+
+```bash
+fun-voice-benchmark --manifest /path/to/private-manifest.jsonl \
+  --output /path/to/private-benchmark-report.json
+```
+
+命令会依次测量首个请求的冷启动和后续请求的热态时延，计算字级 CER、技术词精确率
+与标点 P/R/F1。清单、音频、参考文本和识别结果只保留在该进程内用于评分；终端输出和
+可选报告都只包含类别级计数、P50/P95 聚合值。显式指定的报告权限固定为 `0600`。
+
+## 8. X11 热键 / Fcitx 故障处理
 
 - **Fcitx addon 未加载**：确认 fcitx5 正在运行，且
   `~/.local/lib/fcitx5/fcitx5-fun-voice.so` 与
@@ -103,7 +118,7 @@ worker 首次启动需要几分钟加载模型（状态会先处于 `activating`
 - **daemon 反复失败**：`journalctl --user -u fun-voice-daemon` 查看退出原因；
   常见为缺少 `DISPLAY`（需重启会话让 autostart 入口导入环境）。
 
-## 8. 如何保持 Super+C 可用
+## 9. 如何保持 Super+C 可用
 
 - 不要让其他 X11 全局热键工具抢占 `Super+C`。
 - daemon 在启动时会原子抓取含 Caps Lock、Num Lock、Scroll Lock 变体的 `Super+C`；任何
@@ -111,7 +126,7 @@ worker 首次启动需要几分钟加载模型（状态会先处于 `activating`
 - 重启 daemon 后应重新执行一次按住/松开，再以 `fun-voice-selftest --format json` 确认
   `x11_hotkey` 为 `pass`。
 
-## 9. 卸载
+## 10. 卸载
 
 ```bash
 scripts/uninstall-user.sh            # 保留模型缓存与用户配置
@@ -123,7 +138,7 @@ scripts/uninstall-user.sh --purge    # 二次确认后连模型缓存与配置�
 `$XDG_RUNTIME_DIR/fun-voice-ryan/` 下的 daemon/worker socket、fcitx socket 与
 capture 分片。
 
-## 10. Wayland 非支持声明
+## 11. Wayland 非支持声明
 
 首版**不支持 Wayland**。本项目依赖 X11 焦点查询（`_NET_ACTIVE_WINDOW`）、
 C 键物理状态查询与 XTEST 注入，这些能力在 Wayland 会话下不可用。请在

@@ -111,7 +111,7 @@ def score_text(reference: str, candidate: str, terms: Sequence[str]) -> dict[str
 def aggregate_scores(rows: Sequence[tuple[str, Mapping[str, float | int]]]) -> dict[str, object]: ...
 ```
 
-- [ ] **Step 1: Write failing score and privacy tests**
+- [x] **Step 1: Write failing score and privacy tests**
 
 ```python
 def test_score_text_calculates_cer_terms_and_punctuation_without_text() -> None:
@@ -127,17 +127,17 @@ def test_aggregate_groups_category_without_audio_or_reference() -> None:
     assert "audio" not in repr(report)
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_benchmark.py -q`
 
 Expected: FAIL because the benchmark module is absent.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add `fun-voice-benchmark --manifest PATH [--output PATH]`. Manifest JSONL is user-owned and untracked; each line contains `category`, `audio`, `reference`, optional `terms`. Use character Levenshtein CER, configured term exactness, punctuation precision/recall/F1 and wall-clock cold/warm request durations. Recognized/reference text lives only during scoring. The report has category aggregates, counts and percentiles only; write it only at explicit `--output` with mode `0600`.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_benchmark.py -q && .venv/bin/ruff check src/fun_voice/benchmark.py tests/test_benchmark.py && .venv/bin/mypy src`
 

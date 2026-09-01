@@ -16,6 +16,7 @@ fun-voice-worker = "fun_voice.worker:main"
 fun-voice-preflight = "fun_voice.preflight:main"
 fun-voice-selftest = "fun_voice.selftest:main"
 fun-voice-corrector = "fun_voice.corrector:main"
+fun-voice-benchmark = "fun_voice.benchmark:main"
 
 [build-system]
 requires = ["hatchling"]
