@@ -31,7 +31,7 @@ AUTOSTART_DIR="${HOME}/.config/autostart"
 LEGACY_SHORTCUT_ID_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/fun-voice-ryan/dde-shortcut-id"
 CONSOLE_SCRIPTS=(
     fun-voice-daemon fun-voice-worker fun-voice-preflight fun-voice-selftest
-    fun-voice-corrector
+    fun-voice-corrector fun-voice-benchmark
 )
 SYSTEMD_UNITS=(fun-voice-worker@.service fun-voice-daemon.service)
 

@@ -35,9 +35,11 @@ Fun Voice Ryan 的安装、运行与故障排查。安装脚本为 `scripts/inst
 
 配置文件为 `${XDG_CONFIG_HOME:-~/.config}/fun-voice-ryan/config.toml`；不存在时使用
 安全默认值。可从 `scripts/config.example.toml` 复制后修改，daemon 与 worker 都在启动时
-读取它。当前生效的键为 PipeWire `audio.source`、Fcitx
-`input_method.commit_timeout_ms`（毫秒）及 `input_method.allow_x11_paste_fallback`，以及
-`inference.device`、`dtype`、`gpu_memory_utilization`、`enforce_eager`。
+读取它。当前生效的键包括 PipeWire `audio.source`、Fcitx
+`input_method.commit_timeout_ms`（毫秒）及 `input_method.allow_x11_paste_fallback`、Nano
+的 `inference.*`，以及 `enhanced.enabled` 和 Qwen 的
+`correction.max_source_characters`、`max_new_tokens`、`timeout_seconds`、`protected_terms`。
+Qwen 的模型、设备和精度固定，不能改为其他模型或 CPU。
 
 `inference.device` 只能是 `xpu:0`，任何 CPU/CUDA 设置都会拒绝启动，绝不静默回退。
 热键固定为 `<Super>C`，模型固定为 `FunAudioLLM/Fun-ASR-Nano-2512`，Fcitx 主通道固定为
@@ -53,7 +55,9 @@ fcitx5；录音上限、内存阈值和不保留历史均为不可配置的安�
 - **不持久化录音或转写文本**：短音频只驻留内存；超过阈值才在
   `$XDG_RUNTIME_DIR`（用户专属 tmpfs）下以 `0700`/`0600` 权限暂存，任务结束即删除。
 - **日志与通知不含音频内容或转写正文**，只记录长度、状态、错误类别和请求 id。
-- **模型输出原样保留**，不做任何词典、正则或 LLM 改写。
+- **原始转写始终可用**：仅 Qwen3.5-0.8B 可做一次本地校对；URL、路径、反引号代码、
+  命令选项、版本、`snake_case`、`CamelCase` 和配置技术词必须保留。校对超时、失败或
+  校验不通过时提交原始转写。
 
 ## 5. 日志脱敏
 
@@ -62,10 +66,10 @@ fcitx5；录音上限、内存阈值和不保留历史均为不可配置的安�
 
 ## 6. 服务诊断（journalctl --user）
 
-安装后有两个 systemd user 服务：
+安装后有 daemon 与按需 worker template：
 
 ```bash
-systemctl --user status fun-voice-worker
+systemctl --user status fun-voice-worker@nano.service
 systemctl --user status fun-voice-daemon
 journalctl --user -u fun-voice-worker -f
 journalctl --user -u fun-voice-daemon -f
@@ -82,7 +86,8 @@ fun-voice-selftest --format json
 自检；它只读取 daemon 内存中的 `registered`、`press_seen` 两个布尔值，不保存按键时间、
 音频或转写文本。该项通过后仍须完成 `docs/acceptance-checklist.md` 的目标应用人工验收。
 
-worker 首次启动需要几分钟加载模型（状态会先处于 `activating`）；daemon 依赖
+首次有效录音会在录音期间预加载 Nano；若此前没有模型驻留，worker 状态会短暂为
+`activating`。daemon 依赖
 图形会话环境（DISPLAY/XAUTHORITY），由登录时的 autostart 入口导入（见第 8 节）。
 
 ## 7. 本地准确率与时延基准
@@ -99,6 +104,12 @@ fun-voice-benchmark --manifest /path/to/private-manifest.jsonl \
 命令会依次测量首个请求的冷启动和后续请求的热态时延，计算字级 CER、技术词精确率
 与标点 P/R/F1。清单、音频、参考文本和识别结果只保留在该进程内用于评分；终端输出和
 可选报告都只包含类别级计数、P50/P95 聚合值。显式指定的报告权限固定为 `0600`。
+
+基准先采集不含 Qwen 的 Nano ASR 基线；日常输入链路则在 PipeWire 录音成功后异步**预加载**
+Nano。松键后 worker 对预加载与转写串行执行。若启用校对，daemon 必须先**停止 Nano**（若
+本次使用备用模型则停止 SenseVoice）并确认对应 user service 已是 `inactive` 或 `failed`，
+才启动一次 Qwen3.5-0.8B 子进程。任何停止确认失败都会跳过 Qwen、直接提交原始转写；Qwen
+退出后，下一次有效录音才会重新预加载 Nano。此顺序不依赖不可靠的跨进程显存读数。
 
 ## 8. X11 热键 / Fcitx 故障处理
 
@@ -134,7 +145,7 @@ scripts/uninstall-user.sh --purge    # 二次确认后连模型缓存与配置�
 ```
 
 卸载会停止并 disable 两个 systemd 服务、移除 unit/desktop/addon 文件、
-`~/.local/bin` 下的 4 个 console script，以及
+`~/.local/bin` 下的 6 个 console script，以及
 `$XDG_RUNTIME_DIR/fun-voice-ryan/` 下的 daemon/worker socket、fcitx socket 与
 capture 分片。
 

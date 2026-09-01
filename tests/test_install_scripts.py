@@ -83,6 +83,21 @@ def test_current_user_docs_describe_x11_not_dde_bridge() -> None:
         assert "X11" in text
 
 
+def test_operations_document_benchmark_preload_and_serial_qwen() -> None:
+    text = (ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    assert "fun-voice-benchmark" in text
+    assert "预加载" in text
+    assert "停止 Nano" in text
+
+
+def test_install_and_uninstall_include_all_public_console_scripts() -> None:
+    install = (ROOT / "scripts/install-user.sh").read_text(encoding="utf-8")
+    uninstall = (ROOT / "scripts/uninstall-user.sh").read_text(encoding="utf-8")
+    for script in ("fun-voice-corrector", "fun-voice-benchmark"):
+        assert script in install
+        assert script in uninstall
+
+
 def test_historical_design_links_to_the_x11_replacement() -> None:
     design = (
         ROOT

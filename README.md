@@ -1,6 +1,10 @@
 # Fun Voice Ryan
 
-Fun Voice Ryan 是一个运行在 Deepin DDE X11 上的本地语音输入助手：按住 `Super+C` 说普通话（可夹杂英文、代码与计算机术语），松开后由本机 Fun-ASR-Nano 转写，并把**未经改写的模型原始文本**提交到录音开始时的焦点窗口（首选 Fcitx 上屏，剪贴板作备份）。
+Fun Voice Ryan 是一个运行在 Deepin DDE X11 上的本地语音输入助手：按住 `Super+C`
+说普通话（可夹杂英文、代码与计算机术语），松开后由本机 Fun-ASR-Nano 转写。它会在
+确认 ASR worker 已停止后，按需启动一次本地 Qwen3.5-0.8B 校对；校对失败、超时或未能
+取得 XPU 租约时，原始转写直接提交到录音开始时的焦点窗口（首选 Fcitx，上屏文本也写入
+剪贴板）。
 
 > [!WARNING]
 > **未通过 Intel XPU POC 之前，禁止安装或启动桌面服务。**
@@ -26,7 +30,8 @@ uv sync --inexact
 
 - **不持久化录音或转写文本。** 短音频只驻留内存；超过阈值才在 `$XDG_RUNTIME_DIR`（用户专属 tmpfs）下以 `0700`/`0600` 权限暂存，任务结束即删除。
 - **日志与通知不含音频内容或转写正文**，只记录长度、状态、错误类别和请求 id。
-- **模型输出原样保留**，不做任何词典、正则或 LLM 改写。
+- **原始转写始终可用**：仅 Qwen3.5-0.8B 可做一次受保护的本地校对；URL、路径、代码、
+  选项、版本和配置的技术词改动会被拒绝，任意失败都回退原始转写。
 
 ## 安装
 
@@ -44,7 +49,7 @@ uv sync --inexact
 scripts/install-user.sh
 ```
 
-安装内容：4 个 console script 拷贝到 `~/.local/bin/`；两个 systemd user unit
+安装内容：6 个 console script 拷贝到 `~/.local/bin/`；两个 systemd user unit
 （worker、daemon）写入 `~/.config/systemd/user/`；fcitx addon 的 `.so` 与
 `.conf` 写入 `~/.local/lib/fcitx5/` 与 `~/.local/share/fcitx5/addon/`；登录自启
 入口写入 `~/.config/autostart/`。脚本幂等，可重复执行。
@@ -57,7 +62,8 @@ scripts/install-user.sh
 
 ## 使用
 
-1. 重新登录 DDE X11 会话（或手动 `systemctl --user restart fun-voice-worker fun-voice-daemon`）。
+1. 重新登录 DDE X11 会话（或手动 `systemctl --user restart fun-voice-daemon`）。worker
+   与 Qwen 都不会在登录时加载；有效录音后才按需启动。
 2. 在任意输入框**按住** `Super+C` 说话，松开后文本上屏到录音开始时的焦点窗口。
 3. 自检与诊断：
 
@@ -65,6 +71,7 @@ scripts/install-user.sh
 fun-voice-selftest --format json
 journalctl --user -u fun-voice-worker -f
 journalctl --user -u fun-voice-daemon -f
+fun-voice-benchmark --manifest /path/to/private-manifest.jsonl
 ```
 
 详见 `docs/operations.md`；真实环境人工验收见 `docs/acceptance-checklist.md`。

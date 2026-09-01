@@ -286,7 +286,7 @@ class XpuLeaseCoordinator:
     def release_asr_for_qwen(self, profile: Literal["nano", "sensevoice"]) -> bool: ...
 ```
 
-- [ ] **Step 1: Write failing mutual-exclusion tests**
+- [x] **Step 1: Write failing mutual-exclusion tests**
 
 ```python
 def test_qwen_lease_stops_the_producing_asr_profile() -> None:
@@ -303,13 +303,13 @@ def test_daemon_skips_qwen_and_commits_raw_when_release_is_unconfirmed() -> None
     assert harness.clipboard.writes == ["get commit"]
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_xpu_lease.py tests/test_daemon.py tests/test_end_to_end_fakes.py -q`
 
 Expected: FAIL because daemon invokes Qwen while ASR remains warm.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Have `SenseVoiceRuntime` return `Transcription(engine="sensevoice")`; Nano defaults to `"nano"`. Implement `default_stop_worker_service(profile) -> bool`: stop exactly `fun-voice-worker@<profile>.service`, then poll its `ActiveState` until only `inactive` or `failed` is observed, with a 30-second limit. The lease uses this callback. Right before `corrector.correct`, daemon acquires the lease for `transcription.engine`; if false it records `correction="skipped_lease"` and commits raw text. It must never start Qwen after failed confirmation or invoke SenseVoice as a correction fallback.
 
@@ -329,7 +329,7 @@ pgrep -af 'VLLM::EngineCore|fun_voice.corrector' || true
 
 Expected: Qwen follows inactive Nano/SenseVoice, then exits.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/fun_voice/xpu_lease.py src/fun_voice/contracts.py src/fun_voice/nano_runtime.py src/fun_voice/daemon.py tests/test_xpu_lease.py tests/test_daemon.py tests/test_end_to_end_fakes.py
@@ -346,7 +346,7 @@ git commit -m "feat: serialize ASR and Qwen XPU residency"
 - Modify: `docs/xpu-poc.md`
 - Modify: `tests/test_install_scripts.py`
 
-- [ ] **Step 1: Write a failing documentation contract test**
+- [x] **Step 1: Write a failing documentation contract test**
 
 ```python
 def test_operations_document_benchmark_preload_and_serial_qwen() -> None:
@@ -356,13 +356,13 @@ def test_operations_document_benchmark_preload_and_serial_qwen() -> None:
     assert "停止 Nano" in text
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_install_scripts.py -q`
 
 Expected: FAIL until the new operating flow is documented.
 
-- [ ] **Step 3: Implement and verify**
+- [x] **Step 3: Implement and verify**
 
 Document manifest ownership, aggregate-only output, baseline collection order, P1 first-use behavior, ASR/Qwen swap and raw fallback. Correct stale POC text from `.35/4096` to active Nano `.15/1536`.
 
@@ -370,7 +370,7 @@ Run: `PYTHONPATH=src .venv/bin/pytest -q && .venv/bin/ruff check src tests && .v
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add README.md docs/operations.md docs/acceptance-checklist.md docs/xpu-poc.md tests/test_install_scripts.py

@@ -24,7 +24,7 @@
 
 加载约定沿用 FunASR 官方 `funasr/models/fun_asr_nano/inference_vllm.py`
 (`FunASRNanoVLLM.from_pretrained`):`device="xpu:0"`、`dtype="bf16"`、
-`tensor_parallel_size=1`、`gpu_memory_utilization=0.35`、`max_model_len=4096`、
+`tensor_parallel_size=1`、`gpu_memory_utilization=0.15`、`max_model_len=1536`、
 `enforce_eager=True`。音频 encoder、adaptor、prompt embedding 由 FunASR 显式移动到
 `xpu:0`。
 

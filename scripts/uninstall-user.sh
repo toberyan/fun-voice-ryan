@@ -4,7 +4,7 @@
 # Reverses exactly what install-user.sh wrote, in order:
 #   1. systemctl --user disable --now worker + daemon
 #   2. Remove the systemd units, autostart desktop entry, and Fcitx addon files
-#   3. Remove the four console scripts from ~/.local/bin
+#   3. Remove the six console scripts from ~/.local/bin
 #   4. Remove the runtime sockets and capture shards
 #
 # The model cache and user config are always preserved unless --purge is given,
@@ -20,7 +20,10 @@ AUTOSTART_DIR="${HOME}/.config/autostart"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/fun-voice-ryan"
 MODELS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/models"
 
-CONSOLE_SCRIPTS=(fun-voice-daemon fun-voice-worker fun-voice-preflight fun-voice-selftest)
+CONSOLE_SCRIPTS=(
+  fun-voice-daemon fun-voice-worker fun-voice-preflight fun-voice-selftest
+  fun-voice-corrector fun-voice-benchmark
+)
 SYSTEMD_SERVICES=(fun-voice-worker.service fun-voice-worker@nano.service fun-voice-worker@sensevoice.service fun-voice-daemon.service)
 
 log() { printf '[uninstall-user] %s\n' "$*"; }
