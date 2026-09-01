@@ -22,12 +22,15 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 from fun_voice import config
+from fun_voice.contracts import CORRECTION_REJECTION_REASONS, CorrectionTiming
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 DEVICE = "xpu:0"
@@ -55,13 +58,46 @@ _PROTECTED_PATTERNS = (
     ),
 )
 
+_DEFAULT_REJECTION_REASON = {
+    "correction.input_too_large": "input_too_large",
+    "correction.model_load": "model_load",
+    "correction.oom": "oom",
+    "correction.device": "device",
+    "correction.protocol": "protocol",
+    "correction.no_output": "no_output",
+    "correction.generation": "generation",
+    "correction.timeout": "timeout",
+    "correction.unavailable": "unavailable",
+    "correction.internal": "internal",
+}
+
 
 class CorrectionError(RuntimeError):
     """A correction error represented by a stable, non-text-bearing code."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        reason: str | None = None,
+        timing: CorrectionTiming | None = None,
+    ) -> None:
         self.code = code
+        self.reason = (
+            reason
+            if reason in CORRECTION_REJECTION_REASONS
+            else _DEFAULT_REJECTION_REASON.get(code, "internal")
+        )
+        self.timing = timing
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class GeneratedCorrection:
+    """Verified child-model output plus its private stage durations."""
+
+    text: str
+    timing: CorrectionTiming
 
 
 Runner = Callable[[Sequence[str], str, float], str]
@@ -101,13 +137,17 @@ def parse_correction_output(output: str) -> str:
     whether it can replace the ASR text.
     """
     if not output.startswith(_OPEN):
-        raise CorrectionError("correction.invalid_output")
+        raise CorrectionError("correction.invalid_output", reason="envelope_missing")
     text = output[len(_OPEN) :]
     if text.endswith(_CLOSE):
         text = text[: -len(_CLOSE)]
+    if _OPEN in text or _CLOSE in text:
+        raise CorrectionError("correction.invalid_output", reason="envelope_malformed")
     text = text.strip()
-    if not text or _OPEN in text or _CLOSE in text or len(text) > MAX_OUTPUT_CHARACTERS:
-        raise CorrectionError("correction.invalid_output")
+    if not text:
+        raise CorrectionError("correction.invalid_output", reason="output_empty")
+    if len(text) > MAX_OUTPUT_CHARACTERS:
+        raise CorrectionError("correction.invalid_output", reason="output_too_long")
     return text
 
 
@@ -146,14 +186,14 @@ def validate_correction(
 ) -> str:
     """Reject candidates that are too dissimilar to safely auto-commit."""
     if len(corrected_text) > max(32, len(raw_text) * 2):
-        raise CorrectionError("correction.invalid_output")
+        raise CorrectionError("correction.invalid_output", reason="output_too_long")
     if SequenceMatcher(None, raw_text, corrected_text).ratio() < 0.60:
-        raise CorrectionError("correction.invalid_output")
+        raise CorrectionError("correction.invalid_output", reason="similarity")
     candidate_offset = 0
     for token in extract_protected_tokens(raw_text, protected_terms):
         index = corrected_text.find(token, candidate_offset)
         if index < 0:
-            raise CorrectionError("correction.invalid_output")
+            raise CorrectionError("correction.invalid_output", reason="protected_token")
         candidate_offset = index + len(token)
     return corrected_text
 
@@ -166,7 +206,7 @@ def _is_oom(exc: BaseException) -> bool:
 
 def generate_enveloped_correction(
     raw_text: str, *, inference: config.EnhancedInferenceConfig
-) -> str:
+) -> GeneratedCorrection:
     """Load Qwen on XPU, generate one envelope, then release the model.
 
     vLLM 0.28's Qwen3.5 hybrid-attention XPU path emits corrupt text on the
@@ -179,6 +219,7 @@ def generate_enveloped_correction(
     if inference.correction_model != MODEL_ID:
         raise CorrectionError("correction.model_load")
     model: Any | None = None
+    model_load_started = time.perf_counter()
     try:
         import torch
         from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
@@ -193,9 +234,13 @@ def generate_enveloped_correction(
         )
     except Exception as exc:  # noqa: BLE001 - model details are not logged
         raise CorrectionError(
-            "correction.oom" if _is_oom(exc) else "correction.model_load"
+            "correction.oom" if _is_oom(exc) else "correction.model_load",
+            timing=CorrectionTiming(model_load_ms=_elapsed_ms(model_load_started)),
         ) from exc
 
+    model_load_ms = _elapsed_ms(model_load_started)
+    generate_started = time.perf_counter()
+    validate_started: float | None = None
     try:
         devices = {parameter.device.type for parameter in model.parameters()}
         if devices != {"xpu"}:
@@ -228,19 +273,37 @@ def generate_enveloped_correction(
         if not decoded or not isinstance(decoded[0], str):
             raise CorrectionError("correction.no_output")
         output = decoded[0]
+        generate_ms = _elapsed_ms(generate_started)
         # Validate in the model-owning process as well.  The parent repeats the
         # validation because it treats the child output as an untrusted IPC.
+        validate_started = time.perf_counter()
         validate_correction(
             raw_text,
             parse_correction_output(output),
             inference.correction_protected_terms,
         )
-        return output
-    except CorrectionError:
-        raise
+        return GeneratedCorrection(
+            text=output,
+            timing=CorrectionTiming(
+                model_load_ms=model_load_ms,
+                generate_ms=generate_ms,
+                validate_ms=_elapsed_ms(validate_started),
+            ),
+        )
+    except CorrectionError as exc:
+        raise _with_timing(
+            exc,
+            model_load_ms=model_load_ms,
+            generate_ms=_elapsed_ms(generate_started),
+            validate_ms=_elapsed_ms(validate_started),
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - normalise vLLM failures
         raise CorrectionError(
-            "correction.oom" if _is_oom(exc) else "correction.generation"
+            "correction.oom" if _is_oom(exc) else "correction.generation",
+            timing=CorrectionTiming(
+                model_load_ms=model_load_ms,
+                generate_ms=_elapsed_ms(generate_started),
+            ),
         ) from exc
     finally:
         del model
@@ -251,6 +314,71 @@ def generate_enveloped_correction(
             torch.xpu.empty_cache()
         except Exception:
             pass
+
+
+def _elapsed_ms(started: float | None) -> int | None:
+    """Return a non-negative monotonic duration, or ``None`` for an unstarted stage."""
+    if started is None:
+        return None
+    return max(0, round((time.perf_counter() - started) * 1000))
+
+
+def _with_timing(
+    exc: CorrectionError,
+    *,
+    model_load_ms: int | None,
+    generate_ms: int | None,
+    validate_ms: int | None = None,
+) -> CorrectionError:
+    """Attach only scalar stage durations while retaining the stable error code."""
+    return CorrectionError(
+        exc.code,
+        reason=exc.reason,
+        timing=CorrectionTiming(
+            model_load_ms=model_load_ms,
+            generate_ms=generate_ms,
+            validate_ms=validate_ms,
+        ),
+    )
+
+
+def _timing_from_payload(payload: object) -> CorrectionTiming | None:
+    """Decode only known non-negative duration fields from child JSON."""
+    if not isinstance(payload, dict):
+        return None
+
+    def duration(name: str) -> int | None:
+        value = payload.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
+
+    timing = CorrectionTiming(
+        model_load_ms=duration("model_load_ms"),
+        generate_ms=duration("generate_ms"),
+        validate_ms=duration("validate_ms"),
+    )
+    if all(
+        value is None
+        for value in (
+            timing.model_load_ms,
+            timing.generate_ms,
+            timing.validate_ms,
+        )
+    ):
+        return None
+    return timing
+
+
+def _timing_payload(timing: CorrectionTiming | None) -> dict[str, int | None]:
+    """Serialize scalar child timings without exposing text or model internals."""
+    if timing is None:
+        return {}
+    return {
+        "model_load_ms": timing.model_load_ms,
+        "generate_ms": timing.generate_ms,
+        "validate_ms": timing.validate_ms,
+    }
 
 
 def _default_runner(command: Sequence[str], request: str, timeout: float) -> str:
@@ -306,8 +434,10 @@ class OnDemandQwenCorrector:
             else float(self._inference.correction_timeout_seconds)
         )
         self._runner = runner
+        self.last_timing: CorrectionTiming | None = None
 
     def correct(self, raw_text: str) -> str:
+        self.last_timing = None
         if (
             not raw_text
             or len(raw_text) > self._inference.correction_max_source_characters
@@ -324,19 +454,34 @@ class OnDemandQwenCorrector:
             raise CorrectionError("correction.protocol") from exc
         if not isinstance(decoded, dict):
             raise CorrectionError("correction.protocol")
+        timing = _timing_from_payload(decoded.get("timing_ms"))
+        self.last_timing = timing
         if decoded.get("status") != "ok":
             code = decoded.get("error_code")
             raise CorrectionError(
-                code if isinstance(code, str) else "correction.failed"
+                code if isinstance(code, str) else "correction.failed",
+                reason=(
+                    decoded.get("error_reason")
+                    if isinstance(decoded.get("error_reason"), str)
+                    else None
+                ),
+                timing=timing,
             )
         output = decoded.get("text")
         if not isinstance(output, str):
-            raise CorrectionError("correction.protocol")
-        return validate_correction(
-            raw_text,
-            parse_correction_output(output),
-            self._inference.correction_protected_terms,
-        )
+            raise CorrectionError("correction.protocol", timing=timing)
+        try:
+            return validate_correction(
+                raw_text,
+                parse_correction_output(output),
+                self._inference.correction_protected_terms,
+            )
+        except CorrectionError as exc:
+            raise CorrectionError(
+                exc.code,
+                reason=exc.reason,
+                timing=timing,
+            ) from exc
 
     def close(self) -> None:
         """No process is retained between calls."""
@@ -359,14 +504,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.parse_args(argv)
     try:
         inference = config.load_config().enhanced
-        output = generate_enveloped_correction(_read_request(), inference=inference)
+        result = generate_enveloped_correction(_read_request(), inference=inference)
     except CorrectionError as exc:
-        print(json.dumps({"status": "error", "error_code": exc.code}))
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error_code": exc.code,
+                    "error_reason": exc.reason,
+                    "timing_ms": _timing_payload(exc.timing),
+                }
+            )
+        )
         return 1
     except Exception:  # noqa: BLE001 - do not expose local details or text
-        print(json.dumps({"status": "error", "error_code": "correction.internal"}))
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "correction.internal",
+                    "error_reason": "internal",
+                    "timing_ms": {},
+                }
+            )
+        )
         return 1
-    print(json.dumps({"status": "ok", "text": output}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "text": result.text,
+                "timing_ms": _timing_payload(result.timing),
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

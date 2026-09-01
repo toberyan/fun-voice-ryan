@@ -12,6 +12,8 @@ from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Any, Final, cast
 
+from fun_voice.contracts import CORRECTION_REJECTION_REASONS
+
 _TIMING_FIELDS: Final = frozenset(
     {
         "capture_duration_ms",
@@ -27,6 +29,9 @@ _TIMING_FIELDS: Final = frozenset(
         "asr_generate_ms",
         "asr_release_ms",
         "correction_ms",
+        "correction_model_load_ms",
+        "correction_generate_ms",
+        "correction_validate_ms",
         "commit_ms",
         "end_to_end_ms",
     }
@@ -37,6 +42,7 @@ _ENUM_FIELDS: Final = frozenset(
         "nano_preload",
         "nano_warmup",
         "correction",
+        "correction_rejection",
         "error_code",
         "nano_was_stopped_for_qwen",
     }
@@ -88,12 +94,16 @@ class SessionMetric:
     asr_generate_ms: int | None = None
     asr_release_ms: int | None = None
     correction_ms: int | None = None
+    correction_model_load_ms: int | None = None
+    correction_generate_ms: int | None = None
+    correction_validate_ms: int | None = None
     commit_ms: int | None = None
     end_to_end_ms: int | None = None
     asr_profile: str | None = None
     nano_preload: str = "not_requested"
     nano_warmup: str = "not_requested"
     correction: str = "disabled"
+    correction_rejection: str | None = None
     error_code: str | None = None
     nano_was_stopped_for_qwen: bool = False
 
@@ -153,6 +163,7 @@ class MetricsLedger:
             "nano_preload",
             "nano_warmup",
             "correction",
+            "correction_rejection",
             "error_code",
         ):
             values = [getattr(row, field) for row in rows]
@@ -195,6 +206,11 @@ class MetricsLedger:
             and updates["correction"] not in _ALLOWED_CORRECTION
         ):
             raise ValueError("invalid correction")
+        if (
+            "correction_rejection" in updates
+            and updates["correction_rejection"] not in CORRECTION_REJECTION_REASONS
+        ):
+            raise ValueError("invalid correction_rejection")
         if (
             "error_code" in updates
             and updates["error_code"] not in _ALLOWED_ERROR_CODES

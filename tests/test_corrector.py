@@ -31,16 +31,26 @@ def test_parse_correction_output_accepts_clean_opening_only_envelope() -> None:
     assert parse_correction_output("[[FINAL]]git commit\n") == "git commit"
 
 
+def test_missing_envelope_keeps_generic_error_code_with_fixed_reason() -> None:
+    with pytest.raises(CorrectionError) as caught:
+        parse_correction_output("git commit")
+
+    assert caught.value.code == "correction.invalid_output"
+    assert caught.value.reason == "envelope_missing"
+
+
 def test_candidate_must_remain_similar_to_the_raw_asr_text() -> None:
     assert validate_correction("get commit", "git commit") == "git commit"
 
-    with pytest.raises(CorrectionError, match="invalid_output"):
+    with pytest.raises(CorrectionError, match="invalid_output") as caught:
         validate_correction("get commit", "完全无关的长文本")
+    assert caught.value.reason == "similarity"
 
 
 def test_changed_protected_command_is_rejected() -> None:
-    with pytest.raises(CorrectionError, match="invalid_output"):
+    with pytest.raises(CorrectionError, match="invalid_output") as caught:
         validate_correction("运行 git commit --amend", "运行 get commit --amend")
+    assert caught.value.reason == "protected_token"
 
 
 @pytest.mark.parametrize(
@@ -84,6 +94,34 @@ def test_qwen_process_failure_is_exposed_for_raw_text_fallback() -> None:
 
     with pytest.raises(CorrectionError, match="correction.oom"):
         corrector.correct("get commit")
+
+
+def test_qwen_parent_preserves_child_rejection_reason_and_stage_timing() -> None:
+    def runner(_command: Sequence[str], _request: str, _timeout: float) -> str:
+        return json.dumps(
+            {
+                "status": "error",
+                "error_code": "correction.invalid_output",
+                "error_reason": "similarity",
+                "timing_ms": {
+                    "model_load_ms": 4,
+                    "generate_ms": 8,
+                    "validate_ms": 1,
+                },
+            }
+        )
+
+    corrector = OnDemandQwenCorrector(command=("qwen-corrector",), runner=runner)
+
+    with pytest.raises(CorrectionError) as caught:
+        corrector.correct("get commit")
+
+    assert caught.value.code == "correction.invalid_output"
+    assert caught.value.reason == "similarity"
+    assert caught.value.timing is not None
+    assert caught.value.timing.model_load_ms == 4
+    assert caught.value.timing.generate_ms == 8
+    assert caught.value.timing.validate_ms == 1
 
 
 def test_qwen_client_accepts_only_the_final_json_frame_after_engine_logs() -> None:

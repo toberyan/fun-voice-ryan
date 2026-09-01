@@ -46,6 +46,7 @@ from fun_voice.contracts import (
     AsrStageTiming,
     CaptureArtifact,
     CommitResult,
+    CorrectionTiming,
     DaemonState,
     ErrorCode,
     FocusSnapshot,
@@ -956,6 +957,7 @@ class VoiceDaemon:
             correction_started = self._monotonic()
             try:
                 candidate = corrector.correct(raw_text)
+                self._record_correction_timing(getattr(corrector, "last_timing", None))
                 self._record_metric(
                     correction_ms=_elapsed_ms(correction_started, self._monotonic()),
                     correction="corrected" if candidate else "raw_fallback",
@@ -964,13 +966,30 @@ class VoiceDaemon:
             except CorrectionError as exc:
                 # Raw ASR remains usable; do not show a noisy secondary alert.
                 logger.warning("correction unavailable: %s", exc.code)
+                self._record_correction_timing(exc.timing)
+                self._record_metric(correction_rejection=exc.reason)
             except Exception as exc:  # noqa: BLE001 - raw text is resilient
                 logger.warning("correction unavailable: %s", type(exc).__name__)
+                self._record_metric(correction_rejection="internal")
             self._record_metric(
                 correction_ms=_elapsed_ms(correction_started, self._monotonic()),
                 correction="failed",
             )
             return raw_text
+
+    def _record_correction_timing(self, timing: object) -> None:
+        """Retain only bounded Qwen duration fields from a local child result."""
+        if not isinstance(timing, CorrectionTiming):
+            return
+        updates: dict[str, object] = {}
+        if timing.model_load_ms is not None:
+            updates["correction_model_load_ms"] = timing.model_load_ms
+        if timing.generate_ms is not None:
+            updates["correction_generate_ms"] = timing.generate_ms
+        if timing.validate_ms is not None:
+            updates["correction_validate_ms"] = timing.validate_ms
+        if updates:
+            self._record_metric(**updates)
 
     def _commit(self, text: str) -> None:
         session = self._session

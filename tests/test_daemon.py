@@ -25,6 +25,7 @@ from fun_voice.contracts import (
     AsrStageTiming,
     CaptureArtifact,
     CommitResult,
+    CorrectionTiming,
     DaemonState,
     ErrorCode,
     FocusSnapshot,
@@ -718,6 +719,33 @@ def test_correction_error_keeps_raw_text_usable() -> None:
 
     assert h.clipboard.writes == ["get commit"]
     assert h.fcitx.commits == [("tok-123", "get commit")]
+
+
+def test_correction_failure_aggregates_fixed_reason_and_stage_timings() -> None:
+    h = Harness(
+        worker=FakeWorker(text="运行 git commit --amend"),
+        corrector=FakeCorrector(
+            error=CorrectionError(
+                "correction.invalid_output",
+                reason="protected_token",
+                timing=CorrectionTiming(
+                    model_load_ms=4, generate_ms=8, validate_ms=1
+                ),
+            )
+        ),
+    )
+
+    _started(h)
+    h.daemon.stop()
+
+    report = h.daemon.dispatch({"op": "metrics"})
+
+    assert report["correction"] == {"failed": 1}
+    assert report["correction_rejection"] == {"protected_token": 1}
+    assert report["correction_model_load_ms"] == {"p50": 4, "p95": 4}
+    assert report["correction_generate_ms"] == {"p50": 8, "p95": 8}
+    assert report["correction_validate_ms"] == {"p50": 1, "p95": 1}
+    assert h.clipboard.writes == ["运行 git commit --amend"]
 
 
 def test_unexpected_correction_error_also_keeps_raw_text_usable() -> None:

@@ -17,7 +17,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 
 # --- Size limits ------------------------------------------------------------
 
@@ -160,6 +160,37 @@ class PreloadTiming:
     runtime_load_ms: int | None = None
     warmup_ms: int | None = None
     warmup_status: Literal["not_requested", "ready", "failed"] = "not_requested"
+
+
+CORRECTION_REJECTION_REASONS: Final = frozenset(
+    {
+        "envelope_missing",
+        "envelope_malformed",
+        "output_empty",
+        "output_too_long",
+        "similarity",
+        "protected_token",
+        "input_too_large",
+        "model_load",
+        "oom",
+        "device",
+        "protocol",
+        "no_output",
+        "generation",
+        "timeout",
+        "unavailable",
+        "internal",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CorrectionTiming:
+    """Non-sensitive durations emitted by one isolated Qwen correction call."""
+
+    model_load_ms: int | None = None
+    generate_ms: int | None = None
+    validate_ms: int | None = None
 
 
 @dataclass(frozen=True)
