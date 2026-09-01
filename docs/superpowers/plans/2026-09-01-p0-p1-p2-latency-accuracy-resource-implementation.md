@@ -228,7 +228,7 @@ def extract_protected_tokens(raw_text: str, configured_terms: Sequence[str]) -> 
 def validate_correction(raw_text: str, corrected_text: str, protected_terms: Sequence[str] = ()) -> str: ...
 ```
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```python
 def test_live_qwen_limits_are_loaded_from_config() -> None:
@@ -241,17 +241,17 @@ def test_changed_protected_command_is_rejected() -> None:
         validate_correction("运行 git commit --amend", "运行 get commit --amend")
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_config.py tests/test_corrector.py -q`
 
 Expected: FAIL because these controls and preservation validation are absent.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Remove ignored Transformers-Qwen `gpu_memory_utilization` and `max_model_len` fields. Parse and validate the three live limits plus an optional list of configured protected terms. Extract ordered unique URL, path, backtick code, option, version, `snake_case`, `CamelCase` and configured spans. Candidate validation requires every protected token at strictly increasing positions. Pass generation/timeout settings to the Qwen child; any failure remains a raw-text fallback.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_config.py tests/test_corrector.py tests/test_daemon.py -q && .venv/bin/ruff check src/fun_voice/config.py src/fun_voice/corrector.py && .venv/bin/mypy src`
 

@@ -170,16 +170,51 @@ def test_enhanced_inference_uses_low_kv_bounds_for_qwen() -> None:
         config_module.EnhancedInferenceConfig()
     )
 
-    assert value.correction_gpu_memory_utilization == 0.15
-    assert value.correction_max_model_len == 1536
+    assert value.correction_max_source_characters == 512
+    assert value.correction_max_new_tokens == 512
     assert value.enabled is True
 
-    with pytest.raises(ConfigError, match="correction.gpu_memory_utilization"):
+    with pytest.raises(ConfigError, match="correction.max_new_tokens"):
         config_module.validate_enhanced_inference_config(
             config_module.EnhancedInferenceConfig(
-                correction_gpu_memory_utilization=0.25
+                correction_max_new_tokens=513
             )
         )
+
+
+def test_live_qwen_limits_are_loaded_from_config() -> None:
+    value = config_module.validate_enhanced_inference_config(
+        config_module.EnhancedInferenceConfig()
+    )
+
+    assert value.correction_timeout_seconds == 30
+    assert value.correction_max_source_characters == 512
+    assert value.correction_max_new_tokens == 512
+
+
+def test_load_config_parses_live_qwen_limits_and_protected_terms(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[correction]",
+                "max_source_characters = 400",
+                "max_new_tokens = 256",
+                "timeout_seconds = 20",
+                'protected_terms = ["OpenAI SDK", "FunASR"]',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    correction = load_config(path).enhanced
+
+    assert correction.correction_max_source_characters == 400
+    assert correction.correction_max_new_tokens == 256
+    assert correction.correction_timeout_seconds == 20
+    assert correction.correction_protected_terms == ("OpenAI SDK", "FunASR")
 
 
 def test_load_config_rejects_non_positive_commit_timeout(tmp_path: Path) -> None:

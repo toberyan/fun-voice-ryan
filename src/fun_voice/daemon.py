@@ -1214,7 +1214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     corrector: TextCorrector | None = None
     if cfg.enhanced.enabled:
-        corrector = OnDemandQwenCorrector()
+        corrector = OnDemandQwenCorrector(inference=cfg.enhanced)
     daemon = VoiceDaemon(
         guard=guard,
         recorder=recorder,

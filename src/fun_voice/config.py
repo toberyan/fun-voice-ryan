@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # --- Permission policy ------------------------------------------------------
@@ -72,8 +72,10 @@ class EnhancedInferenceConfig:
     correction_model: str = "Qwen/Qwen3.5-0.8B"
     correction_device: str = XPU_DEVICE
     correction_dtype: str = "bf16"
-    correction_gpu_memory_utilization: float = 0.15
-    correction_max_model_len: int = 1536
+    correction_max_source_characters: int = 512
+    correction_max_new_tokens: int = 512
+    correction_timeout_seconds: int = 30
+    correction_protected_terms: tuple[str, ...] = ()
     correction_enable_thinking: bool = False
     identity_enabled: bool = False
     identity_device: str = XPU_DEVICE
@@ -202,6 +204,29 @@ def _positive_int(value: object, *, key: str, default: int) -> int:
     return value
 
 
+def _protected_terms(value: object) -> tuple[str, ...]:
+    """Parse bounded local technical terms without accepting arbitrary objects."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(term, str) for term in value):
+        raise ConfigError("correction.protected_terms must be a list of strings")
+    if len(value) > 64:
+        raise ConfigError("correction.protected_terms must contain at most 64 terms")
+    normalized: list[str] = []
+    for term in value:
+        candidate = term.strip()
+        if (
+            not candidate
+            or len(candidate) > 128
+            or "\n" in candidate
+            or "\r" in candidate
+        ):
+            raise ConfigError("correction.protected_terms contains an invalid term")
+        if candidate not in normalized:
+            normalized.append(candidate)
+    return tuple(normalized)
+
+
 def validate_inference_config(inference: InferenceConfig) -> InferenceConfig:
     """Validate the only inference settings compatible with this XPU-only app."""
     if inference.device != XPU_DEVICE:
@@ -233,12 +258,13 @@ def validate_enhanced_inference_config(
         raise ConfigError("correction.model must be 'Qwen/Qwen3.5-0.8B'")
     if value.correction_dtype != "bf16":
         raise ConfigError("correction.dtype must be 'bf16'")
-    if not 0.10 <= value.correction_gpu_memory_utilization <= 0.20:
-        raise ConfigError(
-            "correction.gpu_memory_utilization must be in [0.10, 0.20]"
-        )
-    if not 1024 <= value.correction_max_model_len <= 1536:
-        raise ConfigError("correction.max_model_len must be in [1024, 1536]")
+    if not 1 <= value.correction_max_source_characters <= 512:
+        raise ConfigError("correction.max_source_characters must be in [1, 512]")
+    if not 1 <= value.correction_max_new_tokens <= 512:
+        raise ConfigError("correction.max_new_tokens must be in [1, 512]")
+    if not 1 <= value.correction_timeout_seconds <= 60:
+        raise ConfigError("correction.timeout_seconds must be in [1, 60]")
+    protected_terms = _protected_terms(list(value.correction_protected_terms))
     if value.correction_enable_thinking:
         raise ConfigError("correction.enable_thinking must be false")
     if (
@@ -248,7 +274,7 @@ def validate_enhanced_inference_config(
         raise ConfigError(
             "enhanced result retention is fixed at 8 entries / 600 seconds"
         )
-    return value
+    return replace(value, correction_protected_terms=protected_terms)
 
 
 def load_config(path: str | Path | None = None) -> Config:
@@ -318,13 +344,23 @@ def load_config(path: str | Path | None = None) -> Config:
             ),
             correction_device=_str(correction.get("device"), XPU_DEVICE),
             correction_dtype=_str(correction.get("dtype"), "bf16"),
-            correction_gpu_memory_utilization=_float(
-                correction.get("gpu_memory_utilization"), 0.15
+            correction_max_source_characters=_positive_int(
+                correction.get("max_source_characters"),
+                key="correction.max_source_characters",
+                default=512,
             ),
-            correction_max_model_len=_positive_int(
-                correction.get("max_model_len"),
-                key="correction.max_model_len",
-                default=1536,
+            correction_max_new_tokens=_positive_int(
+                correction.get("max_new_tokens"),
+                key="correction.max_new_tokens",
+                default=512,
+            ),
+            correction_timeout_seconds=_positive_int(
+                correction.get("timeout_seconds"),
+                key="correction.timeout_seconds",
+                default=30,
+            ),
+            correction_protected_terms=_protected_terms(
+                correction.get("protected_terms")
             ),
             correction_enable_thinking=_bool(
                 correction.get("enable_thinking"), False

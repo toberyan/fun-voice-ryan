@@ -41,7 +41,10 @@ model = "Qwen/Qwen3.5-0.8B"
 device = "xpu:0"
 dtype = "bf16"
 # Qwen 使用 Transformers 的 XPU 直推：只为当前请求分配动态 KV，不预留 vLLM KV pool。
-# 下列两个上界保留为短请求安全契约（0.10..0.20、1024..1536）。
-gpu_memory_utilization = 0.15
-max_model_len = 1536
+# 单次修正的原始文本、生成 token 与子进程时限上界；不保留模型或 KV Cache。
+max_source_characters = 512
+max_new_tokens = 512
+timeout_seconds = 30
+# 可选：业务中绝不能被改写的技术词；仅当词本身出现在原始转写中时才要求原样保留。
+protected_terms = []
 enable_thinking = false

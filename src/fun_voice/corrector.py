@@ -18,6 +18,7 @@ import contextlib
 import gc
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -30,9 +31,8 @@ from fun_voice import config
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 DEVICE = "xpu:0"
-MAX_SOURCE_CHARACTERS = 512
 MAX_OUTPUT_CHARACTERS = 1536
-DEFAULT_TIMEOUT_SECONDS = 180.0
+DEFAULT_TIMEOUT_SECONDS = 30.0
 _OPEN = "[[FINAL]]"
 _CLOSE = "[[/FINAL]]"
 _SYSTEM_PROMPT = """你是本地语音输入的文本校对器。保留原意和语言顺序，只修正明确的同音、
@@ -41,6 +41,19 @@ _SYSTEM_PROMPT = """你是本地语音输入的文本校对器。保留原意和
 
 只输出以下包裹格式，包裹外不能有任何字符：
 [[FINAL]]修正后的完整文本[[/FINAL]]"""
+_PROTECTED_PATTERNS = (
+    re.compile(r"`[^`\n]+`"),
+    re.compile(r"https?://[^\s<>()\[\]{}\"'，。！？；：]+"),
+    re.compile(r"(?<!\w)(?:~?/|\.{1,2}/)[^\s<>|;&，。！？；：]+"),
+    re.compile(r"(?<!\w)--?[A-Za-z][A-Za-z0-9-]*"),
+    re.compile(r"\b(?:v?\d+(?:\.\d+){1,})\b"),
+    re.compile(r"\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]*\b"),
+    re.compile(r"\b[A-Z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*)+\b"),
+    re.compile(
+        r"\b(?:git|pytest|python|pip|uv|npm|pnpm|docker|kubectl|systemctl|"
+        r"journalctl|grep|rg|bash|zsh)\b"
+    ),
+)
 
 
 class CorrectionError(RuntimeError):
@@ -98,18 +111,51 @@ def parse_correction_output(output: str) -> str:
     return text
 
 
-def validate_correction(raw_text: str, corrected_text: str) -> str:
+def extract_protected_tokens(
+    raw_text: str, configured_terms: Sequence[str] = ()
+) -> tuple[str, ...]:
+    """Return ordered, non-overlapping technical spans from the raw text."""
+    matches: list[tuple[int, int, str]] = []
+    for pattern in _PROTECTED_PATTERNS:
+        matches.extend(
+            (match.start(), match.end(), match.group(0))
+            for match in pattern.finditer(raw_text)
+        )
+    for term in configured_terms:
+        if not isinstance(term, str) or not term:
+            continue
+        start = raw_text.find(term)
+        while start != -1:
+            matches.append((start, start + len(term), term))
+            start = raw_text.find(term, start + len(term))
+
+    selected: list[str] = []
+    last_end = -1
+    for start, end, token in sorted(matches, key=lambda item: (item[0], -item[1])):
+        if start < last_end or token in selected:
+            continue
+        selected.append(token)
+        last_end = end
+    return tuple(selected)
+
+
+def validate_correction(
+    raw_text: str,
+    corrected_text: str,
+    protected_terms: Sequence[str] = (),
+) -> str:
     """Reject candidates that are too dissimilar to safely auto-commit."""
     if len(corrected_text) > max(32, len(raw_text) * 2):
         raise CorrectionError("correction.invalid_output")
     if SequenceMatcher(None, raw_text, corrected_text).ratio() < 0.60:
         raise CorrectionError("correction.invalid_output")
+    candidate_offset = 0
+    for token in extract_protected_tokens(raw_text, protected_terms):
+        index = corrected_text.find(token, candidate_offset)
+        if index < 0:
+            raise CorrectionError("correction.invalid_output")
+        candidate_offset = index + len(token)
     return corrected_text
-
-
-def _max_tokens(raw_text: str) -> int:
-    """Bound the request-local dynamic KV cache used by generation."""
-    return min(512, max(64, len(raw_text) + 64))
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -128,7 +174,7 @@ def generate_enveloped_correction(
     native XPU path.  It creates only the request-local generation cache (no
     vLLM KV pool), and process exit remains the release guarantee.
     """
-    if not raw_text or len(raw_text) > MAX_SOURCE_CHARACTERS:
+    if not raw_text or len(raw_text) > inference.correction_max_source_characters:
         raise CorrectionError("correction.input_too_large")
     if inference.correction_model != MODEL_ID:
         raise CorrectionError("correction.model_load")
@@ -174,7 +220,7 @@ def generate_enveloped_correction(
             raise CorrectionError("correction.protocol")
         generated_ids = model.generate(
             **model_inputs,
-            max_new_tokens=_max_tokens(raw_text),
+            max_new_tokens=inference.correction_max_new_tokens,
             do_sample=False,
         )
         output_ids = generated_ids[:, input_ids.shape[1] :]
@@ -184,7 +230,11 @@ def generate_enveloped_correction(
         output = decoded[0]
         # Validate in the model-owning process as well.  The parent repeats the
         # validation because it treats the child output as an untrusted IPC.
-        validate_correction(raw_text, parse_correction_output(output))
+        validate_correction(
+            raw_text,
+            parse_correction_output(output),
+            inference.correction_protected_terms,
+        )
         return output
     except CorrectionError:
         raise
@@ -242,15 +292,26 @@ class OnDemandQwenCorrector:
         self,
         *,
         command: Sequence[str] | None = None,
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        inference: config.EnhancedInferenceConfig | None = None,
+        timeout_seconds: float | None = None,
         runner: Runner = _default_runner,
     ) -> None:
+        self._inference = config.validate_enhanced_inference_config(
+            inference if inference is not None else config.EnhancedInferenceConfig()
+        )
         self._command = tuple(command or (sys.executable, "-m", "fun_voice.corrector"))
-        self._timeout_seconds = timeout_seconds
+        self._timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else float(self._inference.correction_timeout_seconds)
+        )
         self._runner = runner
 
     def correct(self, raw_text: str) -> str:
-        if not raw_text or len(raw_text) > MAX_SOURCE_CHARACTERS:
+        if (
+            not raw_text
+            or len(raw_text) > self._inference.correction_max_source_characters
+        ):
             raise CorrectionError("correction.input_too_large")
         request = json.dumps({"text": raw_text}, ensure_ascii=False)
         response = self._runner(self._command, request, self._timeout_seconds)
@@ -271,7 +332,11 @@ class OnDemandQwenCorrector:
         output = decoded.get("text")
         if not isinstance(output, str):
             raise CorrectionError("correction.protocol")
-        return validate_correction(raw_text, parse_correction_output(output))
+        return validate_correction(
+            raw_text,
+            parse_correction_output(output),
+            self._inference.correction_protected_terms,
+        )
 
     def close(self) -> None:
         """No process is retained between calls."""

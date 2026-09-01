@@ -17,7 +17,7 @@ from fun_voice.corrector import (
 
 
 def test_qwen_on_demand_timeout_has_a_safe_upper_bound() -> None:
-    assert DEFAULT_TIMEOUT_SECONDS == 180.0
+    assert DEFAULT_TIMEOUT_SECONDS == 30.0
 
 
 def test_parse_correction_output_accepts_only_the_final_envelope() -> None:
@@ -36,6 +36,11 @@ def test_candidate_must_remain_similar_to_the_raw_asr_text() -> None:
 
     with pytest.raises(CorrectionError, match="invalid_output"):
         validate_correction("get commit", "完全无关的长文本")
+
+
+def test_changed_protected_command_is_rejected() -> None:
+    with pytest.raises(CorrectionError, match="invalid_output"):
+        validate_correction("运行 git commit --amend", "运行 get commit --amend")
 
 
 @pytest.mark.parametrize(
