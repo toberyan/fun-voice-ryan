@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal, cast
 
@@ -132,6 +132,15 @@ class Segment:
 
 
 @dataclass(frozen=True)
+class AsrStageTiming:
+    """Non-sensitive duration stages produced inside an ASR runtime."""
+
+    audio_load_ms: int | None = None
+    vad_ms: int | None = None
+    generate_ms: int | None = None
+
+
+@dataclass(frozen=True)
 class Transcription:
     """Worker result: raw model text plus time-ordered segments."""
 
@@ -139,6 +148,18 @@ class Transcription:
     segments: tuple[Segment, ...] = ()
     request_id: str | None = None
     engine: Literal["nano", "sensevoice"] = "nano"
+    timing: AsrStageTiming = field(default_factory=AsrStageTiming)
+    worker_elapsed_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class PreloadTiming:
+    """Non-sensitive duration stages for lazy ASR runtime materialization."""
+
+    worker_elapsed_ms: int | None = None
+    runtime_load_ms: int | None = None
+    warmup_ms: int | None = None
+    warmup_status: Literal["not_requested", "ready", "failed"] = "not_requested"
 
 
 @dataclass(frozen=True)

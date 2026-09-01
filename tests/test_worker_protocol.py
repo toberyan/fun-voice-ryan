@@ -67,6 +67,16 @@ class FlakyRuntime(FakeRuntime):
         return self.transcription
 
 
+class WarmableRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.warmup_calls = 0
+
+    def warmup(self) -> int:
+        self.warmup_calls += 1
+        return 7
+
+
 @pytest.fixture
 def server(tmp_path) -> Iterator[tuple[WorkerServer, FakeRuntime, str]]:
     runtime = FakeRuntime()
@@ -203,6 +213,28 @@ def test_preload_constructs_lazy_runtime_once_then_transcribe_reuses_it() -> Non
     assert preload["model_ready"] is True
     assert transcribe["status"] == "ok"
     assert len(loaded) == 1
+
+
+def test_preload_response_exposes_only_duration_stages() -> None:
+    loaded: list[WarmableRuntime] = []
+
+    def load() -> WarmableRuntime:
+        runtime = WarmableRuntime()
+        loaded.append(runtime)
+        return runtime
+
+    response = Worker(LazyTranscriber(load, device="xpu:0")).handle(
+        {"id": "p", "op": "preload"}
+    )
+
+    assert response["status"] == "ok"
+    assert response["warmup_status"] == "ready"
+    assert response["warmup_ms"] == 7
+    assert isinstance(response["elapsed_ms"], int)
+    assert isinstance(response["runtime_load_ms"], int)
+    assert loaded[0].warmup_calls == 1
+    assert "audio" not in repr(response)
+    assert "你好" not in repr(response)
 
 
 def test_lazy_transcriber_maps_load_failure_to_stable_worker_error() -> None:

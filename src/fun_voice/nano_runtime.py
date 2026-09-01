@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import threading
+import time
 import wave
 from collections.abc import Mapping
 from pathlib import Path
@@ -30,7 +31,13 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from fun_voice.contracts import ErrorCode, Segment, Transcription, WorkerHealth
+from fun_voice.contracts import (
+    AsrStageTiming,
+    ErrorCode,
+    Segment,
+    Transcription,
+    WorkerHealth,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +49,7 @@ VAD_MAX_SINGLE_SEGMENT_TIME_MS = 30000  # FSMN-VAD hard cap per speech segment (
 
 DEFAULT_TIMEOUT_SECONDS = 120.0
 MAX_NEW_TOKENS = 512
+WARMUP_SAMPLE_COUNT = 16_000
 
 # Model cache layout mirrors scripts/run-nano-xpu-poc.sh:
 #   ${XDG_DATA_HOME:-~/.local/share}/fun-voice-ryan/models/
@@ -166,6 +174,11 @@ def _is_oom_error(exc: BaseException) -> bool:
     name = type(exc).__name__.lower()
     message = str(exc).lower()
     return "outofmemory" in name or "out of memory" in message
+
+
+def _elapsed_ms(started: float) -> int:
+    """Return a non-negative monotonic duration rounded to milliseconds."""
+    return max(0, round((time.perf_counter() - started) * 1000))
 
 
 # --- Audio loading ----------------------------------------------------------
@@ -327,12 +340,16 @@ class NanoRuntime:
         """Transcribe an audio path, refusing non-XPU devices before any work."""
         try:
             check_engine_devices(self.engine)
+            load_started = time.perf_counter()
             samples = _load_audio_samples(audio, sample_rate)
         except NanoRuntimeError as exc:
             self.last_error = exc.error_code
             raise
         return self.transcribe_samples(
-            samples, sample_rate=sample_rate, timeout=timeout
+            samples,
+            sample_rate=sample_rate,
+            timeout=timeout,
+            audio_load_ms=_elapsed_ms(load_started),
         )
 
     def transcribe_samples(
@@ -341,11 +358,15 @@ class NanoRuntime:
         *,
         sample_rate: int = 16000,
         timeout: float | None = None,
+        audio_load_ms: int | None = None,
     ) -> Transcription:
         """VAD -> slice (with overlap) -> ASR -> verbatim concatenation."""
         try:
             return self._transcribe_impl(
-                samples, sample_rate=sample_rate, timeout=timeout
+                samples,
+                sample_rate=sample_rate,
+                timeout=timeout,
+                audio_load_ms=audio_load_ms,
             )
         except NanoRuntimeError as exc:
             self.last_error = exc.error_code
@@ -357,8 +378,11 @@ class NanoRuntime:
         *,
         sample_rate: int,
         timeout: float | None,
+        audio_load_ms: int | None,
     ) -> Transcription:
+        vad_started = time.perf_counter()
         regions = self.vad.detect(samples, sample_rate)
+        vad_ms = _elapsed_ms(vad_started)
         if not regions:
             raise EmptySpeechError("VAD detected no speech")
 
@@ -366,7 +390,9 @@ class NanoRuntime:
         regions = sorted(regions, key=lambda region: region[0])
         windows = _slice_windows(regions, len(samples), sample_rate)
         slices = [samples[start:end] for start, end in windows]
+        generate_started = time.perf_counter()
         texts = self._run_asr(slices, timeout)
+        generate_ms = _elapsed_ms(generate_started)
 
         text = "".join(texts)  # direct concatenation: never insert/delete
         segments = tuple(
@@ -374,7 +400,30 @@ class NanoRuntime:
             for (start_ms, end_ms), text_i in zip(regions, texts, strict=True)
         )
         logger.debug("transcribed %d segments -> %d chars", len(segments), len(text))
-        return Transcription(text=text, segments=segments)
+        return Transcription(
+            text=text,
+            segments=segments,
+            timing=AsrStageTiming(
+                audio_load_ms=audio_load_ms,
+                vad_ms=vad_ms,
+                generate_ms=generate_ms,
+            ),
+        )
+
+    def warmup(self) -> int:
+        """Compile the Nano generate path with a fixed in-memory PCM buffer.
+
+        The synthetic zero PCM intentionally bypasses VAD, never touches a user
+        audio handle, and discards all model output. ``_run_asr`` preserves the
+        existing engine serialization guarantee against real transcription.
+        """
+        if self._closed:
+            raise ModelLoadError("Nano runtime is closed")
+        started = time.perf_counter()
+        self._run_asr(
+            [np.zeros(WARMUP_SAMPLE_COUNT, dtype=np.float32)], self.default_timeout
+        )
+        return _elapsed_ms(started)
 
     # -- ASR with timeout + error taxonomy -----------------------------------
 

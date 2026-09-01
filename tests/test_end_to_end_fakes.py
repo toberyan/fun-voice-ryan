@@ -664,6 +664,31 @@ def test_worker_client_round_trip(tmp_path: Path) -> None:
         server.close()
 
 
+def test_worker_client_parses_only_scalar_asr_timing(tmp_path: Path) -> None:
+    def responder(request: dict) -> dict:
+        response = _ok_responder(request)
+        response["timing_ms"] = {
+            "audio_load_ms": 3,
+            "vad_ms": 5,
+            "generate_ms": 9,
+        }
+        return response
+
+    server = _WorkerSocket(tmp_path / "worker.sock", responder)
+    try:
+        result = SocketWorkerClient(tmp_path / "worker.sock", timeout=2.0).transcribe(
+            ARTIFACT
+        )
+        assert result.worker_elapsed_ms == 12
+        assert result.timing.audio_load_ms == 3
+        assert result.timing.vad_ms == 5
+        assert result.timing.generate_ms == 9
+        assert "/proc/" not in repr(result.timing)
+        assert "你好" not in repr(result.timing)
+    finally:
+        server.close()
+
+
 def test_worker_client_preload_sends_no_audio(tmp_path: Path) -> None:
     server = _WorkerSocket(tmp_path / "worker.sock", _ok_responder)
     try:

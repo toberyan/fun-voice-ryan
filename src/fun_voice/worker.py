@@ -32,7 +32,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from fun_voice import config
 from fun_voice.contracts import (
@@ -40,6 +40,7 @@ from fun_voice.contracts import (
     WORKER_RESPONSE_MAX_BYTES,
     ErrorCode,
     MessageTooLarge,
+    PreloadTiming,
     ProtocolError,
     Transcription,
     WorkerHealth,
@@ -63,6 +64,11 @@ SOCKET_BACKLOG = 4
 DEFAULT_TIMEOUT_MS = int(DEFAULT_TIMEOUT_SECONDS * 1000)
 
 
+def _elapsed_ms(started: float) -> int:
+    """Return a non-negative monotonic duration rounded to milliseconds."""
+    return max(0, round((time.perf_counter() - started) * 1000))
+
+
 class Transcriber(Protocol):
     """The runtime seam the worker depends on (``NanoRuntime`` implements it)."""
 
@@ -84,11 +90,21 @@ class LazyTranscriber:
         self._runtime: Transcriber | None = None
         self._last_error: ErrorCode | None = None
         self._lock = threading.Lock()
+        self._warmup_attempted = False
+        self._warmup_ms: int | None = None
+        self._warmup_status: Literal["not_requested", "ready", "failed"] = (
+            "not_requested"
+        )
 
     def _get_runtime(self) -> Transcriber:
+        runtime, _runtime_load_ms = self._get_runtime_with_load_time()
+        return runtime
+
+    def _get_runtime_with_load_time(self) -> tuple[Transcriber, int | None]:
         with self._lock:
             if self._runtime is not None:
-                return self._runtime
+                return self._runtime, None
+            started = time.perf_counter()
             try:
                 self._runtime = self._loader()
             except NanoRuntimeError as exc:
@@ -97,7 +113,7 @@ class LazyTranscriber:
             except Exception as exc:  # noqa: BLE001 - hide local model details
                 self._last_error = ModelLoadError.error_code
                 raise ModelLoadError(type(exc).__name__) from exc
-            return self._runtime
+            return self._runtime, _elapsed_ms(started)
 
     def transcribe(
         self, audio: str, *, sample_rate: int = 16000, timeout: float | None = None
@@ -106,9 +122,46 @@ class LazyTranscriber:
             audio, sample_rate=sample_rate, timeout=timeout
         )
 
-    def preload(self) -> WorkerHealth:
-        """Materialize the profile runtime without accepting audio input."""
-        return self._get_runtime().health()
+    def preload(self) -> PreloadTiming:
+        """Materialize and once-warm the profile runtime without user audio."""
+        with self._lock:
+            runtime_load_ms: int | None = None
+            if self._runtime is None:
+                started = time.perf_counter()
+                try:
+                    self._runtime = self._loader()
+                except NanoRuntimeError as exc:
+                    self._last_error = exc.error_code
+                    raise
+                except Exception as exc:  # noqa: BLE001 - hide model details
+                    self._last_error = ModelLoadError.error_code
+                    raise ModelLoadError(type(exc).__name__) from exc
+                runtime_load_ms = _elapsed_ms(started)
+            runtime = self._runtime
+            assert runtime is not None
+            if not self._warmup_attempted:
+                self._warmup_attempted = True
+                warmup = getattr(runtime, "warmup", None)
+                if callable(warmup):
+                    started = time.perf_counter()
+                    try:
+                        result = warmup()
+                    except Exception:  # warmup never invalidates loaded runtime
+                        self._warmup_status = "failed"
+                    else:
+                        self._warmup_status = "ready"
+                        self._warmup_ms = (
+                            result
+                            if isinstance(result, int)
+                            and not isinstance(result, bool)
+                            and result >= 0
+                            else _elapsed_ms(started)
+                        )
+            return PreloadTiming(
+                runtime_load_ms=runtime_load_ms,
+                warmup_ms=self._warmup_ms,
+                warmup_status=self._warmup_status,
+            )
 
     def health(self) -> WorkerHealth:
         runtime = self._runtime
@@ -162,6 +215,11 @@ def _ok_response(
         ],
         "engine": transcription.engine,
         "elapsed_ms": elapsed_ms,
+        "timing_ms": {
+            "audio_load_ms": transcription.timing.audio_load_ms,
+            "vad_ms": transcription.timing.vad_ms,
+            "generate_ms": transcription.timing.generate_ms,
+        },
         "error_code": None,
     }
 
@@ -242,7 +300,9 @@ class Worker:
         started = time.perf_counter()
         try:
             preload = getattr(self.runtime, "preload", None)
-            health = preload() if callable(preload) else self.runtime.health()
+            result = preload() if callable(preload) else PreloadTiming()
+            timing = result if isinstance(result, PreloadTiming) else PreloadTiming()
+            health = self.runtime.health()
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             code = _error_code_of(exc)
@@ -251,6 +311,7 @@ class Worker:
             )
             logger.warning("preload failed: %s (%s)", code, type(exc).__name__)
             return _error_response(request_id, code, detail, elapsed)
+        elapsed = _elapsed_ms(started)
         return {
             "id": request_id,
             "status": "ok",
@@ -259,6 +320,10 @@ class Worker:
             "xpu_ready": health.xpu_ready,
             "device": health.device,
             "last_error": str(health.last_error) if health.last_error else None,
+            "elapsed_ms": elapsed,
+            "runtime_load_ms": timing.runtime_load_ms,
+            "warmup_ms": timing.warmup_ms,
+            "warmup_status": timing.warmup_status,
         }
 
     def _health(self, message: Mapping[str, Any]) -> dict[str, Any]:

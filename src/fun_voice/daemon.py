@@ -43,12 +43,14 @@ from fun_voice.capture import CaptureConfig, CaptureError, PipeWireRecorder
 from fun_voice.contracts import (
     MAX_MESSAGE_BYTES,
     WORKER_RESPONSE_MAX_BYTES,
+    AsrStageTiming,
     CaptureArtifact,
     CommitResult,
     DaemonState,
     ErrorCode,
     FocusSnapshot,
     MessageTooLarge,
+    PreloadTiming,
     ProtocolError,
     Segment,
     Transcription,
@@ -158,6 +160,14 @@ def _parse_error_code(value: object) -> ErrorCode:
     if sep and category == "worker" and code in _ALLOWED_WORKER_CODES:
         return ErrorCode(category, code)
     return ErrorCode("worker", "internal")
+
+
+def _optional_duration(payload: Mapping[str, Any], field: str) -> int | None:
+    """Accept one bounded, scalar duration from an untrusted local peer."""
+    value = payload.get(field)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
 
 # --- Adapter seams (the fakes implement these) -------------------------------
@@ -398,14 +408,14 @@ class SocketWorkerClient:
             self._start_service()
             return self._wait_for_worker(request, first_failure)
 
-    def preload(self) -> None:
+    def preload(self) -> PreloadTiming:
         """Request model materialization without sending any audio."""
         request = {"id": uuid.uuid4().hex, "op": "preload"}
         try:
-            self._parse_preload_response(self._round_trip(request))
+            return self._parse_preload_response(self._round_trip(request))
         except _WorkerConnectFailure as first_failure:
             self._start_service()
-            self._wait_for_preload(request, first_failure)
+            return self._wait_for_preload(request, first_failure)
 
     def _wait_for_worker(
         self, request: Mapping[str, Any], first_failure: _WorkerConnectFailure
@@ -422,13 +432,12 @@ class SocketWorkerClient:
 
     def _wait_for_preload(
         self, request: Mapping[str, Any], first_failure: _WorkerConnectFailure
-    ) -> None:
+    ) -> PreloadTiming:
         deadline = self._monotonic() + self._startup_timeout
         last = first_failure
         while self._monotonic() < deadline:
             try:
-                self._parse_preload_response(self._round_trip(request))
-                return
+                return self._parse_preload_response(self._round_trip(request))
             except _WorkerConnectFailure as exc:
                 last = exc
                 self._sleep(WORKER_STARTUP_POLL_SECONDS)
@@ -472,11 +481,21 @@ class SocketWorkerClient:
             engine: Literal["nano", "sensevoice"] = (
                 "sensevoice" if response.get("engine") == "sensevoice" else "nano"
             )
+            timing_value = response.get("timing_ms")
+            timing_payload = (
+                timing_value if isinstance(timing_value, Mapping) else {}
+            )
             return Transcription(
                 text=text if isinstance(text, str) else "",
                 segments=segments,
                 request_id=request_id,
                 engine=engine,
+                timing=AsrStageTiming(
+                    audio_load_ms=_optional_duration(timing_payload, "audio_load_ms"),
+                    vad_ms=_optional_duration(timing_payload, "vad_ms"),
+                    generate_ms=_optional_duration(timing_payload, "generate_ms"),
+                ),
+                worker_elapsed_ms=_optional_duration(response, "elapsed_ms"),
             )
         code = _parse_error_code(response.get("error_code"))
         detail = str(response.get("error_message") or "")
@@ -485,9 +504,20 @@ class SocketWorkerClient:
         raise WorkerError(code, detail)
 
     @staticmethod
-    def _parse_preload_response(response: Mapping[str, Any]) -> None:
+    def _parse_preload_response(response: Mapping[str, Any]) -> PreloadTiming:
         if response.get("status") == "ok" and response.get("model_ready") is True:
-            return
+            status = response.get("warmup_status")
+            warmup_status: Literal["not_requested", "ready", "failed"] = (
+                status
+                if status in {"not_requested", "ready", "failed"}
+                else "not_requested"
+            )
+            return PreloadTiming(
+                worker_elapsed_ms=_optional_duration(response, "elapsed_ms"),
+                runtime_load_ms=_optional_duration(response, "runtime_load_ms"),
+                warmup_ms=_optional_duration(response, "warmup_ms"),
+                warmup_status=warmup_status,
+            )
         code = _parse_error_code(response.get("error_code"))
         detail = str(response.get("error_message") or "")
         raise WorkerError(code, detail)
@@ -552,7 +582,7 @@ class VoiceDaemon:
         corrector: TextCorrector | None = None,
         xpu_lease: XpuLease | None = None,
         metrics: MetricsLedger | None = None,
-        nano_preloader: Callable[[], None] | None = None,
+        nano_preloader: Callable[[], PreloadTiming | None] | None = None,
         auto_stop_event: threading.Event | None = None,
         capture_config: CaptureConfig | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -728,7 +758,7 @@ class VoiceDaemon:
     def _preload_nano(
         self,
         sequence: int,
-        preloader: Callable[[], None],
+        preloader: Callable[[], PreloadTiming | None],
         cancelled: threading.Event,
     ) -> None:
         with self._preload_lock:

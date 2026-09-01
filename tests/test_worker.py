@@ -203,6 +203,23 @@ def test_segment_text_is_empty_string_when_model_outputs_empty() -> None:
     assert [seg.text for seg in result.segments] == ["", "ok"]
 
 
+def test_nano_warmup_generates_synthetic_audio_without_vad() -> None:
+    engine = FakeEngine(texts=[""])
+    vad = FakeVad([(0, 100)])
+    runtime = _runtime(engine, vad)
+
+    elapsed_ms = runtime.warmup()
+
+    assert elapsed_ms >= 0
+    assert len(engine.inputs) == 1
+    inputs, max_new_tokens = engine.inputs[0]
+    assert len(inputs) == 1
+    assert inputs[0].shape == (16_000,)
+    assert inputs[0].dtype == np.float32
+    assert max_new_tokens == 512
+    assert vad.detect_calls == []
+
+
 # --- FSMN-VAD adapter (real parse path) -------------------------------------
 
 
