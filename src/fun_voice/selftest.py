@@ -124,7 +124,13 @@ def check_super_c_conflict(client: DdeKeybindingClient) -> SelfTestResult:
 
 
 def check_bridge_timing() -> SelfTestResult:
-    """POC: the bridge maps C-held -> start_if_idle and C-released -> stop."""
+    """POC: the bridge maps C-held -> start_if_idle and C-released -> stop.
+
+    The automated half covers the bridge's key-state mapping and the daemon's
+    key-state read plus its 500 ms press confirmation. The real DDE hold-phase
+    trigger (whether DDE actually invokes the action while the key is held) can
+    only be confirmed by a human against the daemon journal.
+    """
 
     class _FakeGuard:
         def __init__(self, down: bool) -> None:
@@ -142,7 +148,16 @@ def check_bridge_timing() -> SelfTestResult:
         payload = json.loads(sent[0].decode("utf-8"))
         return str(payload.get("op")) if isinstance(payload, dict) else None
 
-    detail: dict[str, Any] = {"held": _op(True), "released": _op(False)}
+    detail: dict[str, Any] = {
+        "held": _op(True),
+        "released": _op(False),
+        "automated": "bridge key-state mapping + 500 ms C-key confirmation",
+        "manual_verify": (
+            "hold Super+C and confirm `journalctl --user -u fun-voice-daemon` "
+            "shows `c_pressed_at_trigger=true`"
+        ),
+        "docs": "docs/operations.md",
+    }
     ok = detail["held"] == "start_if_idle" and detail["released"] == "stop"
     return SelfTestResult(
         "bridge_hold_timing", STATUS_PASS if ok else STATUS_FAIL, detail

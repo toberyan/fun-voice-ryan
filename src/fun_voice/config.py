@@ -9,8 +9,9 @@ current user, otherwise the caller must refuse to start.
 from __future__ import annotations
 
 import os
+import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # --- Permission policy ------------------------------------------------------
@@ -29,33 +30,39 @@ SOCKET_MODE = 0o600
 RUNTIME_DIR_NAME = "fun-voice-ryan"
 WORKER_SOCKET_NAME = "worker.sock"
 DAEMON_SOCKET_NAME = "daemon.sock"
+CONFIG_DIR_NAME = "fun-voice-ryan"
+CONFIG_FILE_NAME = "config.toml"
 FCITX_SOCKET_NAME = "fun-voice-ryan-fcitx.sock"
 
 
 class ConfigError(RuntimeError):
-    """Raised when the runtime environment cannot be used safely."""
+    """Raised when the configuration or runtime environment cannot be used safely."""
+
+@dataclass(frozen=True)
+class InferenceConfig:
+    """Inference (worker) settings; defaults mirror the preflight constants."""
+
+    device: str = "xpu:0"
+    dtype: str = "bf16"
+    gpu_memory_utilization: float = 0.35
+    enforce_eager: bool = True
 
 
 @dataclass(frozen=True)
 class Config:
     """Typed application configuration with safe defaults.
 
-    Mirrors the TOML configuration described in the design document; loading
-    and persistence are out of scope for this module.
+    Loaded from the single TOML file under
+    ``${XDG_CONFIG_HOME:-~/.config}/fun-voice-ryan/config.toml`` (see
+    :func:`load_config`). The non-configurable safety bounds
+    (``max_recording_minutes`` / ``memory_threshold_minutes``) are intentionally
+    absent: they are capture-side invariants, never user-tunable.
     """
 
-    hotkey: str = "<Super>C"
     audio_source: str = "default"
-    input_method: str = "fcitx5"
-    commit_timeout_ms: int = 500
+    fcitx_commit_timeout_ms: float = 0.5
     allow_x11_paste_fallback: bool = True
-    model: str = "FunAudioLLM/Fun-ASR-Nano-2512"
-    device: str = "xpu:0"
-    dtype: str = "bf16"
-    gpu_memory_utilization: float = 0.35
-    enforce_eager: bool = True
-    keep_warm_until_logout: bool = True
-    retain_history: bool = False
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
 
 
 @dataclass(frozen=True)
@@ -124,4 +131,73 @@ def build_runtime_paths(runtime_dir: Path) -> RuntimePaths:
         worker_socket=runtime_dir / WORKER_SOCKET_NAME,
         daemon_socket=runtime_dir / DAEMON_SOCKET_NAME,
         fcitx_socket=runtime_dir.parent / FCITX_SOCKET_NAME,
+    )
+
+
+def default_config_path() -> Path:
+    """Return the default TOML config path (respects ``XDG_CONFIG_HOME``)."""
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base) if base else Path.home() / ".config"
+    return root / CONFIG_DIR_NAME / CONFIG_FILE_NAME
+
+
+def _table(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def _str(value: object, default: str) -> str:
+    return value if isinstance(value, str) else default
+
+
+def _bool(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _float(value: object, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    return default
+
+
+def load_config(path: str | Path | None = None) -> Config:
+    """Load the single TOML configuration, or return the safe defaults.
+
+    ``path`` overrides the default location
+    (``${XDG_CONFIG_HOME:-~/.config}/fun-voice-ryan/config.toml``). A missing
+    file yields :class:`Config` defaults; a corrupt or unreadable file raises
+    :class:`ConfigError`. Unknown keys and sections are ignored for forward
+    compatibility.
+    """
+    config_path = Path(path) if path is not None else default_config_path()
+    if not config_path.is_file():
+        return Config()
+    try:
+        raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"cannot load config {config_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError(f"config {config_path} must be a TOML table")
+
+    audio = _table(raw.get("audio"))
+    input_method = _table(raw.get("input_method"))
+    inference = _table(raw.get("inference"))
+
+    return Config(
+        audio_source=_str(audio.get("source"), "default"),
+        fcitx_commit_timeout_ms=_float(
+            input_method.get("fcitx_commit_timeout_ms"), 0.5
+        ),
+        allow_x11_paste_fallback=_bool(
+            input_method.get("allow_x11_paste_fallback"), True
+        ),
+        inference=InferenceConfig(
+            device=_str(inference.get("device"), "xpu:0"),
+            dtype=_str(inference.get("dtype"), "bf16"),
+            gpu_memory_utilization=_float(
+                inference.get("gpu_memory_utilization"), 0.35
+            ),
+            enforce_eager=_bool(inference.get("enforce_eager"), True),
+        ),
     )

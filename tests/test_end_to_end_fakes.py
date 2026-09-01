@@ -114,7 +114,7 @@ class FakeRecorder:
         self.stop_calls = 0
         self.cleanup_calls = 0
 
-    def start(self) -> None:
+    def start(self, config: object | None = None) -> None:
         self.start_calls += 1
         if self.start_error is not None:
             raise self.start_error

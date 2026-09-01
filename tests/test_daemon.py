@@ -15,7 +15,8 @@ from collections.abc import Callable
 
 import pytest
 
-from fun_voice.capture import CaptureError
+from fun_voice.capture import CaptureConfig, CaptureError
+from fun_voice.config import Config
 from fun_voice.contracts import (
     CaptureArtifact,
     CommitResult,
@@ -33,9 +34,12 @@ from fun_voice.daemon import (
     EmptySpeechError,
     VoiceDaemon,
     WorkerError,
+    _DisabledInjector,
+    build_fcitx_factory,
+    build_injector,
 )
-from fun_voice.desktop import ClipboardError, X11Error, XTestError
-from fun_voice.fcitx import FcitxCommitError
+from fun_voice.desktop import ClipboardError, X11Error, X11FocusGuard, XTestError, XTestInjector
+from fun_voice.fcitx import FcitxClient, FcitxCommitError
 
 ARTIFACT = CaptureArtifact(
     audio="/proc/self/fd/3", sample_rate=16000, channels=1, format="s16le",
@@ -57,10 +61,12 @@ class FakeGuard:
         *,
         error: X11Error | None = None,
         c_down: bool = True,
+        c_error: X11Error | None = None,
     ) -> None:
         self._snapshots = list(snapshots) if snapshots else [SNAPSHOT]
         self._error = error
         self.c_down = c_down
+        self.c_error = c_error
         self.captures = 0
 
     def capture(self) -> FocusSnapshot:
@@ -80,6 +86,8 @@ class FakeGuard:
         )
 
     def c_is_down(self) -> bool:
+        if self.c_error is not None:
+            raise self.c_error
         return self.c_down
 
 
@@ -98,9 +106,11 @@ class FakeRecorder:
         self.stop_calls = 0
         self.cleanup_calls = 0
         self.cancel_calls = 0
+        self.start_configs: list[CaptureConfig] = []
 
-    def start(self) -> None:
+    def start(self, config: CaptureConfig | None = None) -> None:
         self.start_calls += 1
+        self.start_configs.append(config if config is not None else CaptureConfig())
         if self.start_error is not None:
             raise self.start_error
 
@@ -214,6 +224,7 @@ class Harness:
         worker: FakeWorker | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
+        capture_config: CaptureConfig | None = None,
     ) -> None:
         self.guard = guard if guard is not None else FakeGuard()
         self.recorder = recorder if recorder is not None else FakeRecorder()
@@ -244,6 +255,9 @@ class Harness:
             worker=self.worker,
             monotonic=monotonic if monotonic is not None else time.monotonic,
             sleep=sleep if sleep is not None else time.sleep,
+            capture_config=(
+                capture_config if capture_config is not None else CaptureConfig()
+            ),
         )
 
     @property
@@ -549,3 +563,90 @@ def test_auto_stop_outside_recording_is_noop() -> None:
     h.daemon.handle_auto_stop()
     assert h.recorder.stop_calls == 0
     assert h.notifier.messages == []
+
+
+# --- C-release polling (fix 1: reliable Super+C release) ---------------------
+
+
+def test_c_release_poll_stops_after_sustained_up() -> None:
+    clock = [0.0]
+    h = Harness(monotonic=lambda: clock[0])
+    _started(h)
+    h.guard.c_down = False  # C released
+    h.daemon.poll_c_release()  # first up read
+    clock[0] += 0.010
+    h.daemon.poll_c_release()  # up for 10 ms
+    clock[0] += 0.010
+    h.daemon.poll_c_release()  # up for 20 ms
+    clock[0] += 0.010
+    h.daemon.poll_c_release()  # up for 30 ms >= 25 ms -> stop
+    assert h.recorder.stop_calls == 1
+    assert h.daemon.state is DaemonState.IDLE
+    assert NOTIFY_TRANSCRIBING in h.notifier.messages
+
+
+def test_c_release_poll_ignores_brief_release() -> None:
+    clock = [0.0]
+    h = Harness(monotonic=lambda: clock[0])
+    _started(h)
+    h.guard.c_down = False
+    h.daemon.poll_c_release()  # first up read
+    clock[0] += 0.015
+    h.daemon.poll_c_release()  # up for 15 ms (< 25 ms)
+    h.guard.c_down = True  # back down
+    h.daemon.poll_c_release()  # resets the release timer
+    assert h.recorder.stop_calls == 0
+    assert h.daemon.state is DaemonState.RECORDING
+
+
+def test_c_release_poll_x11_error_aborts_to_idle() -> None:
+    h = Harness()
+    _started(h)
+    h.guard.c_error = X11Error("X down")
+    h.daemon.poll_c_release()
+    assert h.daemon.state is DaemonState.IDLE
+    assert h.recorder.cleanup_calls == 1
+    assert NOTIFY_RECOGNITION_FAILED.format(category="x11") in h.notifier.messages
+    assert h.worker.transcriptions == []  # never injects / never transcribes
+
+
+# --- Configuration wiring (fix 4: config.toml lands) -------------------------
+
+
+def test_start_passes_configured_source_to_recorder() -> None:
+    h = Harness(capture_config=CaptureConfig(source="alsa_input.custom"))
+    _started(h)
+    assert h.recorder.start_configs == [CaptureConfig(source="alsa_input.custom")]
+
+
+def test_build_fcitx_factory_wires_timeout() -> None:
+    factory = build_fcitx_factory(Config(fcitx_commit_timeout_ms=2.5))
+    assert factory.func is FcitxClient  # type: ignore[attr-defined]
+    assert factory.keywords == {"timeout": 2.5}  # type: ignore[attr-defined]
+
+
+def test_build_injector_enabled_uses_guard_display() -> None:
+    class _StubDisplay:
+        pass
+
+    display = _StubDisplay()
+    guard = X11FocusGuard(display=display, monotonic=lambda: 0)
+    injector = build_injector(Config(allow_x11_paste_fallback=True), guard)
+    assert isinstance(injector, XTestInjector)
+    assert injector.display is display
+
+
+def test_build_injector_disabled_uses_noop() -> None:
+    guard = X11FocusGuard(display=object(), monotonic=lambda: 0)
+    injector = build_injector(Config(allow_x11_paste_fallback=False), guard)
+    assert isinstance(injector, _DisabledInjector)
+    with pytest.raises(XTestError):
+        injector.paste_ctrl_v()
+
+
+def test_disabled_xtest_fallback_notifies_without_injecting() -> None:
+    h = Harness(fcitx=FakeFcitx(token=None), injector=_DisabledInjector())
+    _started(h)
+    h.daemon.stop()
+    assert h.clipboard.writes == ["你好"]  # still mirrored to clipboard
+    assert NOTIFY_RECOGNITION_FAILED.format(category="injection") in h.notifier.messages

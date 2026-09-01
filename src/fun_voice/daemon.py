@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import logging
 import os
 import signal
@@ -38,9 +39,10 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from fun_voice import config
-from fun_voice.capture import CaptureError, PipeWireRecorder
+from fun_voice.capture import CaptureConfig, CaptureError, PipeWireRecorder
 from fun_voice.contracts import (
     MAX_MESSAGE_BYTES,
+    WORKER_RESPONSE_MAX_BYTES,
     CaptureArtifact,
     CommitResult,
     DaemonState,
@@ -91,6 +93,12 @@ STOP_LOCK_TIMEOUT_SECONDS = 2.0
 # confirm C is still physically held within this window before recording.
 C_CONFIRM_TIMEOUT_SECONDS = 0.5
 C_CONFIRM_POLL_SECONDS = 0.05
+
+# Release detection during RECORDING: the bridge only reports a press (DDE
+# gives no release event), so the daemon polls the physical C key on a short
+# cadence and stops once it has read "up" continuously for this long.
+C_RELEASE_CONFIRM_SECONDS = 0.025
+C_RELEASE_POLL_SECONDS = 0.01
 
 
 # --- Structured worker errors ------------------------------------------------
@@ -159,7 +167,7 @@ class FocusGuard(Protocol):
 
 
 class Recorder(Protocol):
-    def start(self) -> None: ...
+    def start(self, config: CaptureConfig | None = None) -> None: ...
 
     def stop(self) -> CaptureArtifact: ...
 
@@ -209,6 +217,13 @@ class _NullFcitx:
 
     def close(self) -> None:
         pass
+
+
+class _DisabledInjector:
+    """XTEST fallback turned off by configuration; never injects."""
+
+    def paste_ctrl_v(self) -> None:
+        raise XTestError("XTEST fallback disabled by configuration")
 
 
 # --- Notifier (notify-send) --------------------------------------------------
@@ -302,13 +317,13 @@ class SocketWorkerClient:
                 sock.settimeout(self._timeout)
                 sock.connect(str(self._socket_path))
                 sock.sendall(encode_message(request) + b"\n")
-                line = _read_line(sock)
+                line = _read_line(sock, WORKER_RESPONSE_MAX_BYTES)
         except (OSError, ProtocolError) as exc:
             raise _WorkerConnectFailure(str(exc)) from exc
         if line is None:
             raise _WorkerConnectFailure("worker closed the connection without a reply")
         try:
-            return decode_message(line)
+            return decode_message(line, WORKER_RESPONSE_MAX_BYTES)
         except ProtocolError as exc:
             raise _WorkerConnectFailure(f"invalid worker reply: {exc}") from exc
 
@@ -368,6 +383,7 @@ class VoiceDaemon:
         notifier: Notifier,
         worker: WorkerClient,
         auto_stop_event: threading.Event | None = None,
+        capture_config: CaptureConfig | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -379,11 +395,15 @@ class VoiceDaemon:
         self._notifier = notifier
         self._worker = worker
         self._auto_stop_event = auto_stop_event
+        self._capture_config = (
+            capture_config if capture_config is not None else CaptureConfig()
+        )
         self._monotonic = monotonic
         self._sleep = sleep
         self._state = DaemonState.IDLE
         self._session: _Session | None = None
         self._lock = threading.Lock()
+        self._c_up_since: float | None = None
 
     @property
     def state(self) -> DaemonState:
@@ -418,6 +438,14 @@ class VoiceDaemon:
                 logger.info("start_if_idle ignored: state=%s", self._state.value)
                 return "busy"
 
+            # Hold-phase POC diagnostic: record the live C-key state at trigger
+            # time (no transcription or audio content is ever logged).
+            try:
+                c_down = self._guard.c_is_down()
+            except X11Error:
+                c_down = False
+            logger.info("c_pressed_at_trigger=%s", "true" if c_down else "false")
+
             try:
                 snapshot = self._guard.capture()
             except X11Error:
@@ -444,7 +472,7 @@ class VoiceDaemon:
 
             self._session = _Session(snapshot=snapshot, token=token, fcitx=fcitx)
             try:
-                self._recorder.start()
+                self._recorder.start(self._capture_config)
             except CaptureError:
                 logger.warning("start failed: capture could not start")
                 self._cleanup()
@@ -497,8 +525,50 @@ class VoiceDaemon:
             if self._state is not DaemonState.RECORDING:
                 logger.info("stop ignored: state=%s", self._state.value)
                 return
-            self._notify(NOTIFY_TRANSCRIBING)
-            self._transcribe_and_commit()
+            self._stop_locked()
+        finally:
+            self._lock.release()
+
+    def _stop_locked(self) -> None:
+        """Notify and transcribe; caller holds the lock and observed RECORDING."""
+        self._notify(NOTIFY_TRANSCRIBING)
+        self._transcribe_and_commit()
+
+    def poll_c_release(self) -> None:
+        """Sample the physical C key once and stop on a sustained release.
+
+        Runs on the server's release-poller thread every ~10 ms while RECORDING.
+        Acquires the state-machine lock non-blocking so it never races a
+        concurrent stop/start on the shared X11 display (skipping the sample
+        while the lock is busy). A confirmed release — ``C_RELEASE_CONFIRM_SECONDS``
+        of continuous "up", measured from the first up read — stops recording
+        exactly like the bridge. An X11 query failure aborts back to IDLE with a
+        notification and never injects.
+        """
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            if self._state is not DaemonState.RECORDING:
+                return
+            try:
+                down = self._guard.c_is_down()
+            except X11Error:
+                self._c_up_since = None
+                logger.warning("recording aborted: X11 key state unavailable")
+                self._cleanup()
+                self._notify(NOTIFY_RECOGNITION_FAILED.format(category="x11"))
+                return
+            if down:
+                self._c_up_since = None
+                return
+            now = self._monotonic()
+            if self._c_up_since is None:
+                self._c_up_since = now
+                return
+            if now - self._c_up_since >= C_RELEASE_CONFIRM_SECONDS:
+                self._c_up_since = None
+                logger.info("C released (poll-confirmed); stopping recording")
+                self._stop_locked()
         finally:
             self._lock.release()
 
@@ -666,6 +736,7 @@ class VoiceDaemon:
         if session is not None:
             with contextlib.suppress(Exception):
                 session.fcitx.close()
+        self._c_up_since = None
         self._state = DaemonState.IDLE
 
     def _notify(self, message: str) -> None:
@@ -764,6 +835,7 @@ class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.uid = os.getuid() if uid is None else uid
         self.socket_path = socket_path
         self._auto_stop_event = auto_stop_event
+        self._release_poller: threading.Thread | None = None
         self.allow_reuse_address = True
         self.request_queue_size = SOCKET_BACKLOG
         super().__init__(str(socket_path), DaemonRequestHandler)
@@ -773,11 +845,12 @@ class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         return peer_uid(conn) == self.uid
 
     def service_actions(self) -> None:
-        """Poll the recorder's 30-minute auto-stop signal every loop iteration.
+        """Run the main-loop side effects every ``poll_interval`` tick.
 
-        The pipeline runs on a short-lived worker thread so the accept loop
-        stays responsive; the state machine lock serializes it against any
-        concurrent request.
+        Polls the recorder's 30-minute auto-stop signal and keeps a single
+        release-poller thread alive while RECORDING. Both pipeline actions run
+        off the accept loop so it never blocks on transcription; the state
+        machine lock serializes them against any concurrent request.
         """
         event = self._auto_stop_event
         if event is not None and event.is_set():
@@ -786,6 +859,24 @@ class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                 target=self.daemon.handle_auto_stop, daemon=True
             )
             thread.start()
+        self._ensure_release_poller()
+
+    def _ensure_release_poller(self) -> None:
+        """Start the C-release poller when recording and not already running."""
+        if self.daemon.state is not DaemonState.RECORDING:
+            return
+        poller = self._release_poller
+        if poller is not None and poller.is_alive():
+            return
+        self._release_poller = threading.Thread(
+            target=self._poll_c_release_loop, daemon=True, name="c-release-poller"
+        )
+        self._release_poller.start()
+
+    def _poll_c_release_loop(self) -> None:
+        while self.daemon.state is DaemonState.RECORDING:
+            self.daemon.poll_c_release()
+            time.sleep(C_RELEASE_POLL_SECONDS)
 
 
 def _unlink_socket(path: Path) -> None:
@@ -837,6 +928,23 @@ def serve(
     return 0
 
 
+def build_fcitx_factory(cfg: config.Config) -> Callable[[], FcitxClient]:
+    """Return the Fcitx client factory implied by the configuration."""
+    return functools.partial(FcitxClient, timeout=cfg.fcitx_commit_timeout_ms)
+
+
+def build_injector(cfg: config.Config, guard: X11FocusGuard) -> InjectorLike:
+    """Return the XTEST injector implied by the configuration.
+
+    The injector shares the focus guard's live X11 display so injection never
+    fails with "requires an X11 display". When the fallback is disabled by
+    configuration it returns a no-op injector that only ever reports failure.
+    """
+    if cfg.allow_x11_paste_fallback:
+        return XTestInjector(display=guard.display)
+    return _DisabledInjector()
+
+
 # --- CLI ---------------------------------------------------------------------
 
 
@@ -857,6 +965,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=sys.stderr,
     )
     try:
+        cfg = config.load_config()
+    except config.ConfigError as exc:
+        logger.error("cannot load config: %s", exc)
+        return 1
+    try:
         paths = config.build_runtime_paths(config.resolve_runtime_dir())
     except config.ConfigError as exc:
         logger.error("cannot resolve runtime dir: %s", exc)
@@ -871,15 +984,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         on_auto_stop=auto_stop_event.set,
         runtime_dir=paths.runtime_dir,
     )
+    guard = X11FocusGuard()
     daemon = VoiceDaemon(
-        guard=X11FocusGuard(),
+        guard=guard,
         recorder=recorder,
-        fcitx_factory=FcitxClient,
+        fcitx_factory=build_fcitx_factory(cfg),
         clipboard=ClipboardMirror(),
-        injector=XTestInjector(),
+        injector=build_injector(cfg, guard),
         notifier=notifier,
         worker=SocketWorkerClient(paths.worker_socket),
         auto_stop_event=auto_stop_event,
+        capture_config=CaptureConfig(source=cfg.audio_source),
     )
     return serve(paths.daemon_socket, daemon, auto_stop_event=auto_stop_event)
 

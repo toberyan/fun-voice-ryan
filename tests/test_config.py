@@ -15,8 +15,11 @@ from fun_voice.config import (
     RUNTIME_DIR_NAME,
     SOCKET_MODE,
     WORKER_SOCKET_NAME,
+    Config,
     ConfigError,
+    InferenceConfig,
     build_runtime_paths,
+    load_config,
     resolve_runtime_dir,
 )
 
@@ -69,3 +72,68 @@ def test_resolved_paths_are_private_and_expected(
     assert paths.worker_socket == tmp_path / RUNTIME_DIR_NAME / WORKER_SOCKET_NAME
     assert paths.daemon_socket == tmp_path / RUNTIME_DIR_NAME / DAEMON_SOCKET_NAME
     assert paths.fcitx_socket == tmp_path / FCITX_SOCKET_NAME
+
+
+def test_config_defaults() -> None:
+    cfg = Config()
+    assert cfg.audio_source == "default"
+    assert cfg.fcitx_commit_timeout_ms == 0.5
+    assert cfg.allow_x11_paste_fallback is True
+    assert cfg.inference == InferenceConfig()
+
+
+def test_load_config_defaults_when_missing(tmp_path: Path) -> None:
+    missing = tmp_path / "no-such" / "config.toml"
+    assert load_config(missing) == Config()
+
+
+def test_load_config_parses_toml_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[audio]",
+                'source = "alsa_input.custom"',
+                "",
+                "[input_method]",
+                "fcitx_commit_timeout_ms = 2.5",
+                "allow_x11_paste_fallback = false",
+                "",
+                "[inference]",
+                'device = "cpu"',
+                'dtype = "fp32"',
+                "gpu_memory_utilization = 0.8",
+                "enforce_eager = false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert cfg.audio_source == "alsa_input.custom"
+    assert cfg.fcitx_commit_timeout_ms == 2.5
+    assert cfg.allow_x11_paste_fallback is False
+    assert cfg.inference == InferenceConfig(
+        device="cpu", dtype="fp32", gpu_memory_utilization=0.8, enforce_eager=False
+    )
+
+
+def test_load_config_ignores_unknown_sections(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[shortcut]\nhotkey = "<Super>X"\n', encoding="utf-8")
+    assert load_config(path) == Config()
+
+
+def test_load_config_corrupt_toml_raises(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("not [ valid toml", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_default_config_path_respects_xdg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    from fun_voice.config import default_config_path
+
+    assert default_config_path() == tmp_path / "fun-voice-ryan" / "config.toml"

@@ -1,0 +1,38 @@
+# Fun Voice Ryan 单一配置文件示例。
+#
+# 复制为 ${XDG_CONFIG_HOME:-~/.config}/fun-voice-ryan/config.toml 后由
+# daemon 启动时通过 tomllib 读取。缺失该文件时使用代码内安全默认值；
+# 未知节与未知键会被忽略（向前兼容）。
+#
+# 注意：录音上限（max_recording_minutes）与内存阈值（memory_threshold_minutes）
+# 是捕获侧的安全上界，不在此处暴露、不可配置。
+
+[shortcut]
+# DDE 自定义快捷键（按住说话）。
+hotkey = "<Super>C"
+
+[audio]
+# PipeWire 输入源；原样传给 `pw-record --target`。
+source = "default"
+
+[input_method]
+# 首选输入法通道（当前固定为 fcitx5，未接线）。
+primary = "fcitx5"
+# Fcitx 提交超时，单位：秒（0.5 即 500 毫秒）。
+fcitx_commit_timeout_ms = 0.5
+# fcitx 上屏失败时是否允许 XTEST Ctrl+V 回退；false 时只通知失败，不注入。
+allow_x11_paste_fallback = true
+
+[inference]
+# Worker 推理配置；默认值与 preflight 硬门检查常量一致。
+model = "FunAudioLLM/Fun-ASR-Nano-2512"
+device = "xpu:0"
+dtype = "bf16"
+gpu_memory_utilization = 0.35
+enforce_eager = true
+# Worker 预热策略（当前未接线，保留为文档占位）。
+keep_warm_until_logout = true
+
+[privacy]
+# 是否保留历史（当前未接线，恒为 false；不持久化录音或转写文本）。
+retain_history = false

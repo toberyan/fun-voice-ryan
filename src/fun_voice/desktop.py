@@ -581,6 +581,11 @@ class XTestInjector:
         self._display = display
         self._fake_input = fake_input
 
+    @property
+    def display(self) -> XDisplay | None:
+        """The X11 display used for injection, or ``None`` when not provided."""
+        return self._display
+
     def paste_ctrl_v(self, display: XDisplay | None = None) -> None:
         """Inject Ctrl+V via the XTEST extension.
 
