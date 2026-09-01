@@ -298,12 +298,21 @@ class NanoRuntime:
     # -- lifecycle ----------------------------------------------------------
 
     def health(self) -> WorkerHealth:
+        xpu_ready = self._xpu_ready()
+        model_ready = self._model_ready()
         return WorkerHealth(
             version=VERSION,
-            xpu_ready=self._xpu_ready(),
-            model_ready=self._model_ready(),
+            xpu_ready=xpu_ready,
+            model_ready=model_ready,
             device=self.device,
             last_error=self.last_error,
+            lifecycle=(
+                "inactive"
+                if self._closed
+                else "failed"
+                if self.last_error is not None or not (xpu_ready and model_ready)
+                else "ready"
+            ),
         )
 
     def close(self) -> None:
@@ -602,6 +611,13 @@ class SenseVoiceRuntime:
             model_ready=ready,
             device=self.device,
             last_error=self.last_error,
+            lifecycle=(
+                "inactive"
+                if self._closed
+                else "failed"
+                if self.last_error is not None or not ready
+                else "ready"
+            ),
         )
 
     def close(self) -> None:

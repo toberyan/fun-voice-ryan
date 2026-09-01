@@ -172,6 +172,7 @@ class LazyTranscriber:
                 model_ready=False,
                 device=self._device,
                 last_error=self._last_error,
+                lifecycle="failed" if self._last_error is not None else "inactive",
             )
         return runtime.health()
 
@@ -320,6 +321,7 @@ class Worker:
             "xpu_ready": health.xpu_ready,
             "device": health.device,
             "last_error": str(health.last_error) if health.last_error else None,
+            "lifecycle": health.lifecycle,
             "elapsed_ms": elapsed,
             "runtime_load_ms": timing.runtime_load_ms,
             "warmup_ms": timing.warmup_ms,
@@ -336,6 +338,7 @@ class Worker:
             "xpu_ready": health.xpu_ready,
             "device": health.device,
             "last_error": str(health.last_error) if health.last_error else None,
+            "lifecycle": health.lifecycle,
         }
 
     def close(self) -> None:

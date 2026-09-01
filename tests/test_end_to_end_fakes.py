@@ -29,6 +29,7 @@ from fun_voice.contracts import (
     ErrorCode,
     FocusSnapshot,
     Transcription,
+    WorkerHealth,
     split_utf8,
 )
 from fun_voice.daemon import (
@@ -791,6 +792,78 @@ def test_worker_client_waits_for_socket_after_start(tmp_path: Path) -> None:
     finally:
         if "server" in holder:
             holder["server"].close()
+
+
+def test_worker_client_can_wait_for_a_scheduler_started_service(tmp_path: Path) -> None:
+    path = tmp_path / "worker.sock"
+    starts: list[None] = []
+    holder: dict[str, _WorkerSocket] = {}
+
+    timer = threading.Timer(
+        0.03,
+        lambda: holder.setdefault("server", _WorkerSocket(path, _ok_responder)),
+    )
+    timer.daemon = True
+    timer.start()
+    client = SocketWorkerClient(
+        path,
+        timeout=1.0,
+        start_service=lambda: starts.append(None),
+        auto_start_service=False,
+        startup_timeout=0.5,
+    )
+    try:
+        assert client.transcribe(ARTIFACT).text == "你好"
+        assert starts == []
+    finally:
+        if "server" in holder:
+            holder["server"].close()
+
+
+def test_worker_client_reads_fixed_lifecycle_health_without_starting_service(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker.sock"
+    server = _WorkerSocket(
+        path,
+        lambda request: {
+            "id": request["id"],
+            "status": "ok",
+            "version": "test",
+            "model_ready": True,
+            "xpu_ready": True,
+            "device": "xpu:0",
+            "last_error": None,
+            "lifecycle": "ready",
+        },
+    )
+    try:
+        health: WorkerHealth = SocketWorkerClient(path, timeout=1.0).health()
+        assert health.lifecycle == "ready"
+        assert health.model_ready is True
+        assert health.last_error is None
+    finally:
+        server.close()
+
+
+def test_worker_client_fails_closed_for_an_unknown_health_lifecycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker.sock"
+    server = _WorkerSocket(
+        path,
+        lambda request: {
+            "id": request["id"],
+            "status": "ok",
+            "model_ready": True,
+            "xpu_ready": True,
+            "lifecycle": "unknown",
+        },
+    )
+    try:
+        assert SocketWorkerClient(path, timeout=1.0).health().lifecycle == "failed"
+    finally:
+        server.close()
 
 
 @pytest.mark.parametrize("code", ("worker.model_load", "worker.oom"))

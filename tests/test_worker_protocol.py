@@ -170,6 +170,7 @@ def test_health_over_socket(server) -> None:
     assert response["model_ready"] is True
     assert response["xpu_ready"] is True
     assert response["device"] == "xpu:0"
+    assert response["lifecycle"] == "ready"
     assert "audio" not in response
     assert "text" not in response
 

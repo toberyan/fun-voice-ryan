@@ -51,10 +51,13 @@ from fun_voice.contracts import (
     ErrorCode,
     FocusSnapshot,
     MessageTooLarge,
+    ModelTaskKind,
     PreloadTiming,
     ProtocolError,
     Segment,
+    SessionKey,
     Transcription,
+    WorkerHealth,
     decode_message,
     encode_message,
 )
@@ -73,7 +76,12 @@ from fun_voice.desktop import (
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
 from fun_voice.metrics import MetricsLedger
-from fun_voice.xpu_lease import XpuLeaseCoordinator
+from fun_voice.scheduler import (
+    CorrectionOutcome,
+    ModelLifecycle,
+    TaskHandle,
+    XpuScheduler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +226,91 @@ class WorkerClient(Protocol):
     def close(self) -> None: ...
 
 
+AsrProfile = Literal["nano", "sensevoice"]
+
+
+class HealthWorkerClient(Protocol):
+    """Private-socket worker endpoint used only for a bounded health probe."""
+
+    def health(self) -> WorkerHealth: ...
+
+
+class ModelProfileSupervisor(Protocol):
+    """The scheduler's sole authority for ASR worker process transitions."""
+
+    def start_profile(self, profile: AsrProfile) -> bool: ...
+
+    def stop_profile(self, profile: AsrProfile) -> bool: ...
+
+    def health_profile(self, profile: AsrProfile) -> ModelLifecycle: ...
+
+
+class SystemdModelProfileSupervisor:
+    """Pair systemd lifecycle confirmation with a same-UID worker health probe.
+
+    A socket outage is considered inactive only after this instance has
+    successfully stopped that profile through systemd.  It is never treated as
+    proof that an unconfirmed model release freed the XPU.
+    """
+
+    def __init__(
+        self,
+        *,
+        workers: Mapping[AsrProfile, HealthWorkerClient],
+        start_service: Callable[[AsrProfile], bool] | None = None,
+        stop_service: Callable[[AsrProfile], bool] | None = None,
+    ) -> None:
+        self._workers = dict(workers)
+        self._start_service = (
+            start_service if start_service is not None else default_start_worker_service
+        )
+        self._stop_service = (
+            stop_service if stop_service is not None else default_stop_worker_service
+        )
+        self._confirmed_inactive: dict[AsrProfile, bool] = {
+            "nano": False,
+            "sensevoice": False,
+        }
+
+    def start_profile(self, profile: AsrProfile) -> bool:
+        try:
+            started = self._start_service(profile)
+        except Exception:  # noqa: BLE001 - deny start on supervisor uncertainty
+            return False
+        if started:
+            self._confirmed_inactive[profile] = False
+        return started
+
+    def stop_profile(self, profile: AsrProfile) -> bool:
+        try:
+            stopped = self._stop_service(profile)
+        except Exception:  # noqa: BLE001 - deny release on supervisor uncertainty
+            return False
+        if stopped:
+            self._confirmed_inactive[profile] = True
+        return stopped
+
+    def health_profile(self, profile: AsrProfile) -> ModelLifecycle:
+        worker = self._workers.get(profile)
+        if worker is None:
+            return (
+                ModelLifecycle.INACTIVE
+                if self._confirmed_inactive[profile]
+                else ModelLifecycle.FAILED
+            )
+        try:
+            lifecycle = ModelLifecycle(worker.health().lifecycle)
+        except Exception:  # noqa: BLE001 - no untrusted worker error propagation
+            return (
+                ModelLifecycle.INACTIVE
+                if self._confirmed_inactive[profile]
+                else ModelLifecycle.FAILED
+            )
+        if lifecycle in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
+            self._confirmed_inactive[profile] = True
+        return lifecycle
+
+
 class TextCorrector(Protocol):
     """A text-only candidate corrector; it never owns ASR state."""
 
@@ -302,11 +395,11 @@ def worker_service_name(profile: str) -> str:
     return WORKER_TEMPLATE.format(profile)
 
 
-def default_start_worker_service(profile: str = "nano") -> None:
-    """Best-effort start of one on-demand model-worker template instance."""
+def default_start_worker_service(profile: str = "nano") -> bool:
+    """Start one on-demand worker and return whether systemd accepted it."""
     service = worker_service_name(profile)
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["systemctl", "--user", "start", service],
             check=False,
             capture_output=True,
@@ -314,6 +407,11 @@ def default_start_worker_service(profile: str = "nano") -> None:
         )
     except (OSError, subprocess.TimeoutExpired):
         logger.warning("could not start %s", service)
+        return False
+    if result.returncode != 0:
+        logger.warning("could not start %s", service)
+        return False
+    return True
 
 
 def default_stop_worker_service(profile: str = "nano") -> bool:
@@ -382,7 +480,8 @@ class SocketWorkerClient:
         socket_path: Path | str,
         *,
         timeout: float = WORKER_RESPONSE_TIMEOUT_SECONDS,
-        start_service: Callable[[], None] | None = None,
+        start_service: Callable[[], object] | None = None,
+        auto_start_service: bool = True,
         startup_timeout: float = WORKER_STARTUP_TIMEOUT_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -392,6 +491,7 @@ class SocketWorkerClient:
         self._start_service = (
             start_service if start_service is not None else default_start_worker_service
         )
+        self._auto_start_service = auto_start_service
         self._startup_timeout = startup_timeout
         self._monotonic = monotonic
         self._sleep = sleep
@@ -406,7 +506,8 @@ class SocketWorkerClient:
         try:
             return self._parse_response(self._round_trip(request))
         except _WorkerConnectFailure as first_failure:
-            self._start_service()
+            if self._auto_start_service:
+                self._start_service()
             return self._wait_for_worker(request, first_failure)
 
     def preload(self) -> PreloadTiming:
@@ -415,8 +516,37 @@ class SocketWorkerClient:
         try:
             return self._parse_preload_response(self._round_trip(request))
         except _WorkerConnectFailure as first_failure:
-            self._start_service()
+            if self._auto_start_service:
+                self._start_service()
             return self._wait_for_preload(request, first_failure)
+
+    def health(self) -> WorkerHealth:
+        """Read the worker's fixed health state without starting a model."""
+        request = {"id": uuid.uuid4().hex, "op": "health"}
+        try:
+            response = self._round_trip(request)
+        except _WorkerConnectFailure as exc:
+            raise WorkerError(ErrorCode("worker", "unavailable")) from exc
+        if response.get("status") != "ok":
+            raise WorkerError(_parse_error_code(response.get("error_code")))
+        lifecycle_value = response.get("lifecycle")
+        lifecycle: Literal["loading", "ready", "inactive", "failed"] = (
+            lifecycle_value
+            if lifecycle_value in {"loading", "ready", "inactive", "failed"}
+            else "failed"
+        )
+        device = response.get("device")
+        error_value = response.get("last_error")
+        return WorkerHealth(
+            version=str(response.get("version") or "unknown"),
+            xpu_ready=response.get("xpu_ready") is True,
+            model_ready=response.get("model_ready") is True,
+            device=device if isinstance(device, str) else None,
+            last_error=(
+                _parse_error_code(error_value) if isinstance(error_value, str) else None
+            ),
+            lifecycle=lifecycle,
+        )
 
     def _wait_for_worker(
         self, request: Mapping[str, Any], first_failure: _WorkerConnectFailure
@@ -559,6 +689,7 @@ class FallbackWorkerClient:
 class _Session:
     """State held for one recording → commit session."""
 
+    key: SessionKey
     snapshot: FocusSnapshot
     token: str | None
     fcitx: FcitxClientLike
@@ -580,10 +711,12 @@ class VoiceDaemon:
         injector: InjectorLike,
         notifier: Notifier,
         worker: WorkerClient,
+        fallback_worker: WorkerClient | None = None,
         corrector: TextCorrector | None = None,
         xpu_lease: XpuLease | None = None,
         metrics: MetricsLedger | None = None,
         nano_preloader: Callable[[], PreloadTiming | None] | None = None,
+        scheduler: XpuScheduler | None = None,
         auto_stop_event: threading.Event | None = None,
         capture_config: CaptureConfig | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -596,13 +729,20 @@ class VoiceDaemon:
         self._injector = injector
         self._notifier = notifier
         self._worker = worker
+        self._fallback_worker = fallback_worker
         self._corrector = corrector
         self._xpu_lease = xpu_lease
+        self._scheduler = scheduler if scheduler is not None else XpuScheduler(
+            start_profile=self._start_asr_for_scheduler,
+            stop_profile=self._release_asr_for_scheduler,
+            health_profile=self._asr_lifecycle_after_release,
+        )
         self._metrics = metrics if metrics is not None else MetricsLedger()
         self._metric_sequence: int | None = None
         self._nano_preloader = nano_preloader
         self._preload_lock = threading.Lock()
         self._preload_cancel: threading.Event | None = None
+        self._preload_handle: TaskHandle | None = None
         self._auto_stop_event = auto_stop_event
         self._capture_config = (
             capture_config if capture_config is not None else CaptureConfig()
@@ -611,6 +751,7 @@ class VoiceDaemon:
         self._sleep = sleep
         self._state = DaemonState.IDLE
         self._session: _Session | None = None
+        self._session_generation = 0
         self._lock = threading.Lock()
         # Ephemeral X11 hotkey evidence. It is deliberately only booleans:
         # no timestamp, audio, text, focus snapshot, or Fcitx token is retained.
@@ -698,7 +839,14 @@ class VoiceDaemon:
             except FcitxCommitError:
                 token = None  # decision: still record; clipboard + XTEST only
 
-            self._session = _Session(snapshot=snapshot, token=token, fcitx=fcitx)
+            self._session_generation += 1
+            key = SessionKey(
+                session_id=uuid.uuid4().hex, generation=self._session_generation
+            )
+            self._session = _Session(
+                key=key, snapshot=snapshot, token=token, fcitx=fcitx
+            )
+            self._scheduler.activate(key)
             try:
                 self._recorder.start(self._capture_config)
             except CaptureError:
@@ -744,17 +892,18 @@ class VoiceDaemon:
     def _schedule_nano_preload(self, sequence: int) -> None:
         """Start one non-blocking Nano preload after capture has begun."""
         preloader = self._nano_preloader
-        if preloader is None:
+        session = self._session
+        if preloader is None or session is None:
             return
         cancelled = threading.Event()
         self._preload_cancel = cancelled
         self._metrics.record(sequence, nano_preload="scheduled")
-        threading.Thread(
-            target=self._preload_nano,
-            args=(sequence, preloader, cancelled),
-            daemon=True,
-            name="nano-preload",
-        ).start()
+        self._preload_handle = self._scheduler.run_asr(
+            session.key,
+            "nano",
+            lambda: self._preload_nano(sequence, preloader, cancelled),
+            kind=ModelTaskKind.STABLE_SEGMENT,
+        )
 
     def _preload_nano(
         self,
@@ -840,9 +989,13 @@ class VoiceDaemon:
             self._cleanup()
             with contextlib.suppress(Exception):
                 self._worker.close()
+            if self._fallback_worker is not None:
+                with contextlib.suppress(Exception):
+                    self._fallback_worker.close()
             if self._corrector is not None:
                 with contextlib.suppress(Exception):
                     self._corrector.close()
+            self._scheduler.close()
         finally:
             self._lock.release()
 
@@ -853,6 +1006,8 @@ class VoiceDaemon:
         logger.info("state -> transcribing")
         if self._preload_cancel is not None:
             self._preload_cancel.set()
+        if self._preload_handle is not None:
+            self._preload_handle.cancel()
         pipeline_started = self._monotonic()
         try:
             try:
@@ -869,7 +1024,7 @@ class VoiceDaemon:
 
             asr_started = self._monotonic()
             try:
-                transcription = self._worker.transcribe(artifact)
+                transcription = self._transcribe_on_scheduler(artifact)
             except EmptySpeechError:
                 self._record_metric(
                     asr_ms=_elapsed_ms(asr_started, self._monotonic()),
@@ -933,30 +1088,35 @@ class VoiceDaemon:
         raw_text: str,
         profile: Literal["nano", "sensevoice"],
     ) -> str:
-        """Run Qwen only while no current or queued Nano preload can start."""
+        """Run Qwen on the single scheduler after an ASR-release confirmation."""
         with self._preload_lock:
-            lease = self._xpu_lease
-            permitted = False
-            if lease is not None:
-                try:
-                    permitted = lease.release_asr_for_qwen(profile)
-                except Exception as exc:  # noqa: BLE001 - deny on uncertainty
-                    logger.warning("XPU lease unavailable: %s", type(exc).__name__)
-                release_ms = getattr(lease, "last_release_ms", None)
+            session = self._session
+            if session is None:
+                self._record_metric(correction="skipped_lease")
+                return raw_text
+            correction_started = self._monotonic()
+            try:
+                task = self._scheduler.run_correction(
+                    session.key, profile, lambda: corrector.correct(raw_text)
+                )
+                if not task.wait(timeout=WORKER_RESPONSE_TIMEOUT_SECONDS):
+                    task.cancel()
+                    self._record_metric(correction="skipped_lease")
+                    return raw_text
+                outcome = task.result()
+                if not isinstance(outcome, CorrectionOutcome) or not outcome.permitted:
+                    self._record_metric(correction="skipped_lease")
+                    return raw_text
+                candidate = outcome.value if isinstance(outcome.value, str) else ""
+                release_ms = getattr(self._xpu_lease, "last_release_ms", None)
                 if (
                     isinstance(release_ms, int)
                     and not isinstance(release_ms, bool)
                     and release_ms >= 0
                 ):
                     self._record_metric(asr_release_ms=release_ms)
-            if not permitted:
-                self._record_metric(correction="skipped_lease")
-                return raw_text
-            if profile == "nano":
-                self._record_metric(nano_was_stopped_for_qwen=True)
-            correction_started = self._monotonic()
-            try:
-                candidate = corrector.correct(raw_text)
+                if profile == "nano":
+                    self._record_metric(nano_was_stopped_for_qwen=True)
                 self._record_correction_timing(getattr(corrector, "last_timing", None))
                 self._record_metric(
                     correction_ms=_elapsed_ms(correction_started, self._monotonic()),
@@ -976,6 +1136,76 @@ class VoiceDaemon:
                 correction="failed",
             )
             return raw_text
+
+    def _transcribe_on_scheduler(self, artifact: CaptureArtifact) -> Transcription:
+        """Execute the final ASR request on the single model dispatcher."""
+        session = self._session
+        if session is None:
+            raise WorkerError(ErrorCode("worker", "unavailable"))
+        try:
+            return self._run_asr_profile(
+                session.key, "nano", lambda: self._worker.transcribe(artifact)
+            )
+        except WorkerError as exc:
+            fallback = self._fallback_worker
+            if fallback is None or exc.code.code not in {"model_load", "oom"}:
+                raise
+            return self._run_asr_profile(
+                session.key,
+                "sensevoice",
+                lambda: fallback.transcribe(artifact),
+            )
+
+    def _run_asr_profile(
+        self,
+        key: SessionKey,
+        profile: Literal["nano", "sensevoice"],
+        fn: Callable[[], Transcription],
+    ) -> Transcription:
+        """Execute one profile through the scheduler and preserve worker errors."""
+        task = self._scheduler.run_asr(key, profile, fn)
+        if not task.wait(timeout=WORKER_RESPONSE_TIMEOUT_SECONDS):
+            task.cancel()
+            raise WorkerError(ErrorCode("worker", "timeout"))
+        try:
+            result = task.result()
+        except (EmptySpeechError, WorkerError):
+            raise
+        except Exception as exc:  # scheduler/profile errors stay a worker failure
+            raise WorkerError(ErrorCode("worker", "unavailable")) from exc
+        if not isinstance(result, Transcription):
+            raise WorkerError(ErrorCode("worker", "internal"))
+        return result
+
+    def _release_asr_for_scheduler(
+        self, profile: Literal["nano", "sensevoice"]
+    ) -> bool:
+        lease = self._xpu_lease
+        if lease is None:
+            return False
+        try:
+            return lease.release_asr_for_qwen(profile)
+        except Exception:  # noqa: BLE001 - deny XPU release uncertainty
+            return False
+
+    @staticmethod
+    def _start_asr_for_scheduler(profile: Literal["nano", "sensevoice"]) -> bool:
+        """Permit a scheduled socket client to start its selected profile.
+
+        ``main()`` always injects :class:`SystemdModelProfileSupervisor`, so
+        production process control remains explicit.  This compatibility path
+        deliberately performs no lifecycle side effect during construction or
+        tests; a legacy auto-starting socket client can only start from the
+        scheduler callback that follows it.
+        """
+        del profile
+        return True
+
+    def _asr_lifecycle_after_release(
+        self, _profile: Literal["nano", "sensevoice"]
+    ) -> ModelLifecycle:
+        """The existing lease is affirmative only after systemd saw inactive."""
+        return ModelLifecycle.INACTIVE
 
     def _record_correction_timing(self, timing: object) -> None:
         """Retain only bounded Qwen duration fields from a local child result."""
@@ -1359,20 +1589,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     nano_worker = SocketWorkerClient(
         paths.worker_socket,
         start_service=functools.partial(default_start_worker_service, "nano"),
+        auto_start_service=False,
     )
-    worker: WorkerClient = nano_worker
+    profile_workers: dict[AsrProfile, HealthWorkerClient] = {"nano": nano_worker}
+    fallback_worker: WorkerClient | None = None
     if cfg.inference.allow_sensevoice_fallback:
         sensevoice_worker = SocketWorkerClient(
             paths.runtime_dir / "worker-sensevoice.sock",
             start_service=functools.partial(
                 default_start_worker_service, "sensevoice"
             ),
+            auto_start_service=False,
         )
-        worker = FallbackWorkerClient(
-            nano_worker,
-            sensevoice_worker,
-            stop_primary=functools.partial(default_stop_worker_service, "nano"),
-        )
+        fallback_worker = sensevoice_worker
+        profile_workers["sensevoice"] = sensevoice_worker
+    supervisor = SystemdModelProfileSupervisor(workers=profile_workers)
+    scheduler = XpuScheduler(
+        start_profile=supervisor.start_profile,
+        stop_profile=supervisor.stop_profile,
+        health_profile=supervisor.health_profile,
+    )
     corrector: TextCorrector | None = None
     if cfg.enhanced.enabled:
         corrector = OnDemandQwenCorrector(inference=cfg.enhanced)
@@ -1383,10 +1619,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         clipboard=ClipboardMirror(),
         injector=build_injector(cfg, guard),
         notifier=notifier,
-        worker=worker,
+        worker=nano_worker,
+        fallback_worker=fallback_worker,
         corrector=corrector,
-        xpu_lease=XpuLeaseCoordinator(stop_service=default_stop_worker_service),
         nano_preloader=nano_worker.preload,
+        scheduler=scheduler,
         auto_stop_event=auto_stop_event,
         capture_config=CaptureConfig(source=cfg.audio_source),
     )

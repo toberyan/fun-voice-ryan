@@ -182,6 +182,7 @@ def test_runtime_tracks_last_error_category() -> None:
     with pytest.raises(VllmError):
         runtime.transcribe_samples(_silence())
     assert runtime.health().last_error == ErrorCode("worker", "vllm")
+    assert runtime.health().lifecycle == "failed"
 
 def test_slice_windows_apply_fixed_overlap_and_clamp() -> None:
     overlap = int(VAD_OVERLAP_MS * 16000 / 1000)  # 4000 samples at 16 kHz

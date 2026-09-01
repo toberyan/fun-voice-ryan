@@ -31,6 +31,7 @@ from fun_voice.contracts import (
     FocusSnapshot,
     PreloadTiming,
     Transcription,
+    WorkerHealth,
 )
 from fun_voice.corrector import CorrectionError
 from fun_voice.daemon import (
@@ -57,6 +58,7 @@ from fun_voice.desktop import (
     XTestInjector,
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
+from fun_voice.scheduler import ModelLifecycle, XpuScheduler
 
 ARTIFACT = CaptureArtifact(
     audio="/proc/self/fd/3", sample_rate=16000, channels=1, format="s16le",
@@ -270,12 +272,14 @@ class Harness:
         clipboard: FakeClipboard | None = None,
         injector: FakeInjector | None = None,
         worker: FakeWorker | None = None,
+        fallback_worker: FakeWorker | None = None,
         corrector: FakeCorrector | None = None,
         xpu_lease: AllowingLease | RejectingLease | None = None,
         nano_preloader: Callable[[], PreloadTiming | None] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         capture_config: CaptureConfig | None = None,
+        scheduler: XpuScheduler | None = None,
     ) -> None:
         self.guard = guard if guard is not None else FakeGuard()
         self.recorder = recorder if recorder is not None else FakeRecorder()
@@ -305,6 +309,7 @@ class Harness:
             injector=self.injector,
             notifier=self.notifier,
             worker=self.worker,
+            fallback_worker=fallback_worker,
             corrector=self.corrector,
             xpu_lease=(
                 xpu_lease if xpu_lease is not None else AllowingLease()
@@ -317,6 +322,7 @@ class Harness:
             capture_config=(
                 capture_config if capture_config is not None else CaptureConfig()
             ),
+            scheduler=scheduler,
         )
 
     @property
@@ -423,6 +429,39 @@ def test_worker_stop_confirms_inactive_before_qwen(
     ]
 
 
+def test_systemd_profile_supervisor_confirms_worker_health_after_stop() -> None:
+    class HealthWorker:
+        unavailable = False
+
+        def health(self) -> WorkerHealth:
+            if self.unavailable:
+                raise WorkerError(ErrorCode("worker", "unavailable"))
+            return WorkerHealth(
+                version="test",
+                xpu_ready=True,
+                model_ready=True,
+                device="xpu:0",
+                lifecycle="ready",
+            )
+
+    worker = HealthWorker()
+    started: list[str] = []
+    stopped: list[str] = []
+    supervisor = daemon_mod.SystemdModelProfileSupervisor(
+        workers={"nano": worker},
+        start_service=lambda profile: started.append(profile) or True,
+        stop_service=lambda profile: stopped.append(profile) or True,
+    )
+
+    assert supervisor.start_profile("nano") is True
+    assert supervisor.health_profile("nano") is ModelLifecycle.READY
+    worker.unavailable = True
+    assert supervisor.stop_profile("nano") is True
+    assert supervisor.health_profile("nano") is ModelLifecycle.INACTIVE
+    assert started == ["nano"]
+    assert stopped == ["nano"]
+
+
 def test_completed_session_metrics_contain_only_aggregate_stage_data() -> None:
     h = Harness()
     _started(h)
@@ -475,10 +514,19 @@ def test_daemon_aggregates_worker_and_preload_stage_durations() -> None:
     assert "你好" not in repr(report)
 
 
-def test_daemon_requests_nano_preload_only_after_recording_starts() -> None:
+def test_daemon_requests_nano_preload_only_after_recording_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     called = threading.Event()
     states: list[DaemonState] = []
     holder: dict[str, VoiceDaemon] = {}
+    starts: list[str] = []
+
+    monkeypatch.setattr(
+        daemon_mod,
+        "default_start_worker_service",
+        lambda profile="nano": starts.append(profile) or True,
+    )
 
     def preload() -> None:
         states.append(holder["daemon"].state)
@@ -490,6 +538,7 @@ def test_daemon_requests_nano_preload_only_after_recording_starts() -> None:
     assert h.daemon.start_if_idle() == "started"
     assert called.wait(timeout=2.0)
     assert states == [DaemonState.RECORDING]
+    assert starts == []
 
 
 def test_release_cancels_a_queued_nano_preload_before_qwen_starts() -> None:
@@ -676,6 +725,66 @@ def test_stop_transitions_through_pipeline_to_idle() -> None:
     assert h.recorder.stop_calls == 1
     assert h.worker.transcriptions == [ARTIFACT]
     assert NOTIFY_TRANSCRIBING in h.notifier.messages
+
+
+def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> None:
+    worker_threads: list[str] = []
+    corrector_threads: list[str] = []
+
+    class ThreadWorker(FakeWorker):
+        def transcribe(self, artifact: CaptureArtifact) -> Transcription:
+            worker_threads.append(threading.current_thread().name)
+            return super().transcribe(artifact)
+
+    class ThreadCorrector(FakeCorrector):
+        def correct(self, raw_text: str) -> str:
+            corrector_threads.append(threading.current_thread().name)
+            return super().correct(raw_text)
+
+    scheduler = XpuScheduler(
+        start_profile=lambda _profile: True,
+        stop_profile=lambda _profile: True,
+        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+    )
+    h = Harness(
+        worker=ThreadWorker(text="get commit"),
+        corrector=ThreadCorrector(text="git commit"),
+        scheduler=scheduler,
+    )
+    try:
+        _started(h)
+        h.daemon.stop()
+
+        assert worker_threads == ["fun-voice-xpu-scheduler"]
+        assert corrector_threads == ["fun-voice-xpu-scheduler"]
+        assert h.clipboard.writes == ["git commit"]
+    finally:
+        scheduler.close()
+
+
+def test_daemon_routes_model_load_fallback_through_scheduler_profile_switch() -> None:
+    starts: list[str] = []
+    stops: list[str] = []
+    scheduler = XpuScheduler(
+        start_profile=lambda profile: starts.append(profile) or True,
+        stop_profile=lambda profile: stops.append(profile) or True,
+        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+    )
+    fallback = FakeWorker(text="备用结果")
+    h = Harness(
+        worker=FakeWorker(error=WorkerError(ErrorCode("worker", "model_load"))),
+        fallback_worker=fallback,
+        scheduler=scheduler,
+    )
+    try:
+        _started(h)
+        h.daemon.stop()
+
+        assert h.clipboard.writes == ["备用结果"]
+        assert starts == ["nano", "sensevoice"]
+        assert stops == ["nano"]
+    finally:
+        scheduler.close()
 
 
 def test_corrected_text_is_committed_and_copied_instead_of_raw_text() -> None:
@@ -872,6 +981,8 @@ def test_hotkey_release_stops_in_a_background_thread() -> None:
     while h.recorder.stop_calls == 0 and time.monotonic() < deadline:
         time.sleep(0.01)
     assert h.recorder.stop_calls == 1
+    while h.daemon.state is not DaemonState.IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert h.daemon.state is DaemonState.IDLE
     assert NOTIFY_TRANSCRIBING in h.notifier.messages
 

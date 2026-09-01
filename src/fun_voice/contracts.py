@@ -246,6 +246,11 @@ class WorkerHealth:
     model_ready: bool
     device: str | None = None
     last_error: ErrorCode | None = None
+    lifecycle: Literal["loading", "ready", "inactive", "failed"] = "ready"
+
+    def __post_init__(self) -> None:
+        if self.lifecycle not in {"loading", "ready", "inactive", "failed"}:
+            raise ValueError("worker lifecycle is invalid")
 
 
 # --- JSON message codec -----------------------------------------------------
