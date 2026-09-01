@@ -138,6 +138,7 @@ class Transcription:
     text: str
     segments: tuple[Segment, ...] = ()
     request_id: str | None = None
+    engine: Literal["nano", "sensevoice"] = "nano"
 
 
 @dataclass(frozen=True)

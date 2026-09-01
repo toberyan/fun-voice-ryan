@@ -36,7 +36,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from fun_voice import config
 from fun_voice.capture import CaptureConfig, CaptureError, PipeWireRecorder
@@ -70,6 +70,7 @@ from fun_voice.desktop import (
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
 from fun_voice.metrics import MetricsLedger
+from fun_voice.xpu_lease import XpuLeaseCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,8 @@ NOTIFY_LIMIT_REACHED = "已达到 30 分钟录音上限，开始识别"
 WORKER_RESPONSE_TIMEOUT_SECONDS = 130.0
 WORKER_STARTUP_TIMEOUT_SECONDS = 15.0
 WORKER_STARTUP_POLL_SECONDS = 0.05
+WORKER_STOP_TIMEOUT_SECONDS = 30.0
+WORKER_STOP_POLL_SECONDS = 0.05
 WORKER_TEMPLATE = "fun-voice-worker@{}.service"
 SOCKET_BACKLOG = 4
 REQUEST_READ_TIMEOUT_SECONDS = 10.0
@@ -212,6 +215,14 @@ class TextCorrector(Protocol):
     def close(self) -> None: ...
 
 
+class XpuLease(Protocol):
+    """Confirms the producing ASR profile has yielded the XPU to Qwen."""
+
+    def release_asr_for_qwen(
+        self, profile: Literal["nano", "sensevoice"]
+    ) -> bool: ...
+
+
 class HotkeyLifecycle(Protocol):
     """Owns the X11 hotkey registration and event-loop lifetime."""
 
@@ -294,18 +305,57 @@ def default_start_worker_service(profile: str = "nano") -> None:
         logger.warning("could not start %s", service)
 
 
-def default_stop_worker_service(profile: str = "nano") -> None:
-    """Best-effort stop used before switching an OOM Nano request to fallback."""
+def default_stop_worker_service(profile: str = "nano") -> bool:
+    """Stop and confirm the exact ASR service is no longer active.
+
+    A false result is a hard denial for the Qwen lease. This conservative check
+    avoids concurrent model residency when no cross-process XPU telemetry is
+    available.
+    """
     service = worker_service_name(profile)
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["systemctl", "--user", "stop", service],
             check=False,
             capture_output=True,
-            timeout=30.0,
+            timeout=WORKER_STOP_TIMEOUT_SECONDS,
+            text=True,
         )
+        if result.returncode != 0:
+            logger.warning("could not stop %s", service)
+            return False
     except (OSError, subprocess.TimeoutExpired):
         logger.warning("could not stop %s", service)
+        return False
+
+    deadline = time.monotonic() + WORKER_STOP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            state = subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "--property=ActiveState",
+                    "--value",
+                    service,
+                ],
+                check=False,
+                capture_output=True,
+                timeout=5.0,
+                text=True,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.warning("could not confirm %s state", service)
+            return False
+        if state.returncode != 0:
+            logger.warning("could not confirm %s state", service)
+            return False
+        if state.stdout.strip() in {"inactive", "failed"}:
+            return True
+        time.sleep(WORKER_STOP_POLL_SECONDS)
+    logger.warning("timed out waiting for %s to stop", service)
+    return False
 
 
 class SocketWorkerClient:
@@ -419,10 +469,14 @@ class SocketWorkerClient:
             request_id = (
                 response.get("id") if isinstance(response.get("id"), str) else None
             )
+            engine: Literal["nano", "sensevoice"] = (
+                "sensevoice" if response.get("engine") == "sensevoice" else "nano"
+            )
             return Transcription(
                 text=text if isinstance(text, str) else "",
                 segments=segments,
                 request_id=request_id,
+                engine=engine,
             )
         code = _parse_error_code(response.get("error_code"))
         detail = str(response.get("error_message") or "")
@@ -447,7 +501,7 @@ class FallbackWorkerClient:
         nano: WorkerClient,
         sensevoice: WorkerClient,
         *,
-        stop_primary: Callable[[], None],
+        stop_primary: Callable[[], object],
     ) -> None:
         self._nano = nano
         self._sensevoice = sensevoice
@@ -496,6 +550,7 @@ class VoiceDaemon:
         notifier: Notifier,
         worker: WorkerClient,
         corrector: TextCorrector | None = None,
+        xpu_lease: XpuLease | None = None,
         metrics: MetricsLedger | None = None,
         nano_preloader: Callable[[], None] | None = None,
         auto_stop_event: threading.Event | None = None,
@@ -511,9 +566,12 @@ class VoiceDaemon:
         self._notifier = notifier
         self._worker = worker
         self._corrector = corrector
+        self._xpu_lease = xpu_lease
         self._metrics = metrics if metrics is not None else MetricsLedger()
         self._metric_sequence: int | None = None
         self._nano_preloader = nano_preloader
+        self._preload_lock = threading.Lock()
+        self._preload_cancel: threading.Event | None = None
         self._auto_stop_event = auto_stop_event
         self._capture_config = (
             capture_config if capture_config is not None else CaptureConfig()
@@ -657,31 +715,41 @@ class VoiceDaemon:
         preloader = self._nano_preloader
         if preloader is None:
             return
+        cancelled = threading.Event()
+        self._preload_cancel = cancelled
         self._metrics.record(sequence, nano_preload="scheduled")
         threading.Thread(
             target=self._preload_nano,
-            args=(sequence, preloader),
+            args=(sequence, preloader, cancelled),
             daemon=True,
             name="nano-preload",
         ).start()
 
-    def _preload_nano(self, sequence: int, preloader: Callable[[], None]) -> None:
-        started = self._monotonic()
-        try:
-            preloader()
-        except Exception as exc:  # noqa: BLE001 - recording stays unaffected
-            logger.info("nano preload unavailable: %s", type(exc).__name__)
+    def _preload_nano(
+        self,
+        sequence: int,
+        preloader: Callable[[], None],
+        cancelled: threading.Event,
+    ) -> None:
+        with self._preload_lock:
+            if cancelled.is_set():
+                return
+            started = self._monotonic()
+            try:
+                preloader()
+            except Exception as exc:  # noqa: BLE001 - recording stays unaffected
+                logger.info("nano preload unavailable: %s", type(exc).__name__)
+                self._metrics.record(
+                    sequence,
+                    preload_ms=_elapsed_ms(started, self._monotonic()),
+                    nano_preload="failed",
+                )
+                return
             self._metrics.record(
                 sequence,
                 preload_ms=_elapsed_ms(started, self._monotonic()),
-                nano_preload="failed",
+                nano_preload="ready",
             )
-            return
-        self._metrics.record(
-            sequence,
-            preload_ms=_elapsed_ms(started, self._monotonic()),
-            nano_preload="ready",
-        )
 
     def stop(self) -> None:
         """Handle a hotkey release; only acts while ``RECORDING``.
@@ -744,6 +812,8 @@ class VoiceDaemon:
     def _transcribe_and_commit(self) -> None:
         self._state = DaemonState.TRANSCRIBING
         logger.info("state -> transcribing")
+        if self._preload_cancel is not None:
+            self._preload_cancel.set()
         pipeline_started = self._monotonic()
         try:
             try:
@@ -776,7 +846,10 @@ class VoiceDaemon:
                 logger.warning("transcribe failed: %s", exc.code)
                 self._notify(NOTIFY_RECOGNITION_FAILED.format(category=str(exc.code)))
                 return
-            self._record_metric(asr_ms=_elapsed_ms(asr_started, self._monotonic()))
+            self._record_metric(
+                asr_ms=_elapsed_ms(asr_started, self._monotonic()),
+                asr_profile=transcription.engine,
+            )
 
             text = transcription.text
             if not text:
@@ -786,36 +859,7 @@ class VoiceDaemon:
 
             corrector = self._corrector
             if corrector is not None:
-                correction_started = self._monotonic()
-                try:
-                    candidate = corrector.correct(text)
-                    self._record_metric(
-                        correction_ms=_elapsed_ms(
-                            correction_started, self._monotonic()
-                        ),
-                        correction="corrected" if candidate else "raw_fallback",
-                    )
-                    if candidate:
-                        text = candidate
-                except CorrectionError as exc:
-                    # The raw ASR result remains the safe final output.  Keep
-                    # the code-only log and avoid an extra desktop notification
-                    # for every transient model failure.
-                    logger.warning("correction unavailable: %s", exc.code)
-                    self._record_metric(
-                        correction_ms=_elapsed_ms(
-                            correction_started, self._monotonic()
-                        ),
-                        correction="failed",
-                    )
-                except Exception as exc:  # noqa: BLE001 - raw text is resilient
-                    logger.warning("correction unavailable: %s", type(exc).__name__)
-                    self._record_metric(
-                        correction_ms=_elapsed_ms(
-                            correction_started, self._monotonic()
-                        ),
-                        correction="failed",
-                    )
+                text = self._correct_after_asr(corrector, text, transcription.engine)
 
             self._state = DaemonState.COMMITTING
             logger.info("state -> committing")
@@ -829,6 +873,45 @@ class VoiceDaemon:
                 end_to_end_ms=_elapsed_ms(pipeline_started, self._monotonic())
             )
             self._cleanup()
+
+    def _correct_after_asr(
+        self,
+        corrector: TextCorrector,
+        raw_text: str,
+        profile: Literal["nano", "sensevoice"],
+    ) -> str:
+        """Run Qwen only while no current or queued Nano preload can start."""
+        with self._preload_lock:
+            lease = self._xpu_lease
+            permitted = False
+            if lease is not None:
+                try:
+                    permitted = lease.release_asr_for_qwen(profile)
+                except Exception as exc:  # noqa: BLE001 - deny on uncertainty
+                    logger.warning("XPU lease unavailable: %s", type(exc).__name__)
+            if not permitted:
+                self._record_metric(correction="skipped_lease")
+                return raw_text
+            if profile == "nano":
+                self._record_metric(nano_was_stopped_for_qwen=True)
+            correction_started = self._monotonic()
+            try:
+                candidate = corrector.correct(raw_text)
+                self._record_metric(
+                    correction_ms=_elapsed_ms(correction_started, self._monotonic()),
+                    correction="corrected" if candidate else "raw_fallback",
+                )
+                return candidate or raw_text
+            except CorrectionError as exc:
+                # Raw ASR remains usable; do not show a noisy secondary alert.
+                logger.warning("correction unavailable: %s", exc.code)
+            except Exception as exc:  # noqa: BLE001 - raw text is resilient
+                logger.warning("correction unavailable: %s", type(exc).__name__)
+            self._record_metric(
+                correction_ms=_elapsed_ms(correction_started, self._monotonic()),
+                correction="failed",
+            )
+            return raw_text
 
     def _commit(self, text: str) -> None:
         session = self._session
@@ -1224,6 +1307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         notifier=notifier,
         worker=worker,
         corrector=corrector,
+        xpu_lease=XpuLeaseCoordinator(stop_service=default_stop_worker_service),
         nano_preloader=nano_worker.preload,
         auto_stop_event=auto_stop_event,
         capture_config=CaptureConfig(source=cfg.audio_source),

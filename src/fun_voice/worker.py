@@ -160,6 +160,7 @@ def _ok_response(
             }
             for segment in transcription.segments
         ],
+        "engine": transcription.engine,
         "elapsed_ms": elapsed_ms,
         "error_code": None,
     }

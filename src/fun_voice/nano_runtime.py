@@ -604,7 +604,7 @@ class SenseVoiceRuntime:
         if not text:
             self.last_error = EmptySpeechError.error_code
             raise EmptySpeechError("SenseVoiceSmall returned empty text")
-        return Transcription(text=text, segments=segments)
+        return Transcription(text=text, segments=segments, engine="sensevoice")
 
 
 def load_sensevoice_runtime(

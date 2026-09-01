@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -244,6 +245,16 @@ class FakeCorrector:
         pass
 
 
+class AllowingLease:
+    def release_asr_for_qwen(self, _profile: str) -> bool:
+        return True
+
+
+class RejectingLease:
+    def release_asr_for_qwen(self, _profile: str) -> bool:
+        return False
+
+
 class Harness:
     def __init__(
         self,
@@ -255,6 +266,7 @@ class Harness:
         injector: FakeInjector | None = None,
         worker: FakeWorker | None = None,
         corrector: FakeCorrector | None = None,
+        xpu_lease: AllowingLease | RejectingLease | None = None,
         nano_preloader: Callable[[], None] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -289,6 +301,11 @@ class Harness:
             notifier=self.notifier,
             worker=self.worker,
             corrector=self.corrector,
+            xpu_lease=(
+                xpu_lease if xpu_lease is not None else AllowingLease()
+                if corrector is not None
+                else None
+            ),
             nano_preloader=nano_preloader,
             monotonic=monotonic if monotonic is not None else time.monotonic,
             sleep=sleep if sleep is not None else time.sleep,
@@ -376,6 +393,31 @@ def test_dispatch_metrics_returns_empty_aggregate_without_session_data() -> None
     assert Harness().daemon.dispatch({"op": "metrics"}) == {"count": 0}
 
 
+def test_worker_stop_confirms_inactive_before_qwen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="inactive\n")
+
+    monkeypatch.setattr(daemon_mod.subprocess, "run", run)
+
+    assert daemon_mod.default_stop_worker_service("nano") is True
+    assert calls == [
+        ["systemctl", "--user", "stop", "fun-voice-worker@nano.service"],
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "--property=ActiveState",
+            "--value",
+            "fun-voice-worker@nano.service",
+        ],
+    ]
+
+
 def test_completed_session_metrics_contain_only_aggregate_stage_data() -> None:
     h = Harness()
     _started(h)
@@ -406,6 +448,36 @@ def test_daemon_requests_nano_preload_only_after_recording_starts() -> None:
     assert h.daemon.start_if_idle() == "started"
     assert called.wait(timeout=2.0)
     assert states == [DaemonState.RECORDING]
+
+
+def test_release_cancels_a_queued_nano_preload_before_qwen_starts() -> None:
+    calls: list[str] = []
+    corrector = FakeCorrector(text="git commit")
+    h = Harness(
+        worker=FakeWorker(text="get commit"),
+        corrector=corrector,
+        nano_preloader=lambda: calls.append("preload"),
+    )
+    h.daemon._preload_lock.acquire()  # noqa: SLF001 - force a queued preload
+    try:
+        _started(h)
+        release = threading.Thread(target=h.daemon.stop)
+        release.start()
+        deadline = time.monotonic() + 2.0
+        while (
+            h.daemon._preload_cancel is not None  # noqa: SLF001 - race probe
+            and not h.daemon._preload_cancel.is_set()  # noqa: SLF001 - race probe
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert h.daemon._preload_cancel is not None  # noqa: SLF001 - race probe
+        assert h.daemon._preload_cancel.is_set()  # noqa: SLF001 - race probe
+    finally:
+        h.daemon._preload_lock.release()  # noqa: SLF001 - unblock both paths
+    release.join(timeout=2.0)
+
+    assert calls == []
+    assert corrector.calls == ["get commit"]
 
 
 def test_start_cancels_when_c_not_pressed() -> None:
@@ -577,6 +649,21 @@ def test_corrected_text_is_committed_and_copied_instead_of_raw_text() -> None:
     assert corrector.calls == ["今天执行 get commit，然后运行 py test。"]
     assert h.clipboard.writes == ["今天执行 git commit，然后运行 pytest。"]
     assert h.fcitx.commits == [("tok-123", "今天执行 git commit，然后运行 pytest。")]
+
+
+def test_daemon_skips_qwen_and_commits_raw_when_release_is_unconfirmed() -> None:
+    corrector = FakeCorrector(text="git commit")
+    h = Harness(
+        worker=FakeWorker(text="get commit"),
+        corrector=corrector,
+        xpu_lease=RejectingLease(),
+    )
+
+    _started(h)
+    h.daemon.stop()
+
+    assert corrector.calls == []
+    assert h.clipboard.writes == ["get commit"]
 
 
 def test_correction_error_keeps_raw_text_usable() -> None:

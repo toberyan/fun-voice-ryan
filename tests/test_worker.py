@@ -365,6 +365,7 @@ def test_worker_transcribe_success_shape() -> None:
     assert response["id"] == "u1"
     assert response["text"] == "你好"
     assert response["segments"] == [{"start_ms": 0, "end_ms": 100, "text": "你好"}]
+    assert response["engine"] == "nano"
     assert response["elapsed_ms"] >= 0
     assert response["error_code"] is None
 
