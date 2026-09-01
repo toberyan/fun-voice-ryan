@@ -13,6 +13,8 @@ def test_qwen_lease_stops_the_producing_asr_profile() -> None:
 
     assert lease.release_asr_for_qwen("nano") is True
     assert calls == ["nano"]
+    assert lease.last_release_ms is not None
+    assert lease.last_release_ms >= 0
 
 
 def test_qwen_lease_converts_stop_errors_to_a_safe_rejection() -> None:

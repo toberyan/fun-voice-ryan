@@ -36,3 +36,27 @@ def test_metrics_ledger_is_bounded_and_rejects_unknown_fields() -> None:
         assert "unsupported" in str(exc)
     else:
         raise AssertionError("unknown metric field must be rejected")
+
+
+def test_metrics_aggregate_private_stage_durations_and_warmup_state() -> None:
+    ledger = MetricsLedger()
+    row = ledger.begin()
+    ledger.record(
+        row,
+        preload_runtime_load_ms=21,
+        preload_warmup_ms=8,
+        asr_worker_ms=12,
+        asr_generate_ms=7,
+        asr_release_ms=3,
+        nano_warmup="ready",
+    )
+
+    summary = ledger.summary()
+
+    assert summary["preload_runtime_load_ms"] == {"p50": 21, "p95": 21}
+    assert summary["preload_warmup_ms"] == {"p50": 8, "p95": 8}
+    assert summary["asr_worker_ms"] == {"p50": 12, "p95": 12}
+    assert summary["asr_generate_ms"] == {"p50": 7, "p95": 7}
+    assert summary["asr_release_ms"] == {"p50": 3, "p95": 3}
+    assert summary["nano_warmup"] == {"ready": 1}
+    assert "worker_response" not in repr(summary)

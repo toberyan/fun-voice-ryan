@@ -766,7 +766,7 @@ class VoiceDaemon:
                 return
             started = self._monotonic()
             try:
-                preloader()
+                timing = preloader()
             except Exception as exc:  # noqa: BLE001 - recording stays unaffected
                 logger.info("nano preload unavailable: %s", type(exc).__name__)
                 self._metrics.record(
@@ -775,11 +775,19 @@ class VoiceDaemon:
                     nano_preload="failed",
                 )
                 return
-            self._metrics.record(
-                sequence,
-                preload_ms=_elapsed_ms(started, self._monotonic()),
-                nano_preload="ready",
-            )
+            updates: dict[str, object] = {
+                "preload_ms": _elapsed_ms(started, self._monotonic()),
+                "nano_preload": "ready",
+            }
+            if timing is not None:
+                if timing.worker_elapsed_ms is not None:
+                    updates["preload_worker_ms"] = timing.worker_elapsed_ms
+                if timing.runtime_load_ms is not None:
+                    updates["preload_runtime_load_ms"] = timing.runtime_load_ms
+                if timing.warmup_ms is not None:
+                    updates["preload_warmup_ms"] = timing.warmup_ms
+                updates["nano_warmup"] = timing.warmup_status
+            self._metrics.record(sequence, **updates)
 
     def stop(self) -> None:
         """Handle a hotkey release; only acts while ``RECORDING``.
@@ -876,10 +884,24 @@ class VoiceDaemon:
                 logger.warning("transcribe failed: %s", exc.code)
                 self._notify(NOTIFY_RECOGNITION_FAILED.format(category=str(exc.code)))
                 return
-            self._record_metric(
-                asr_ms=_elapsed_ms(asr_started, self._monotonic()),
-                asr_profile=transcription.engine,
-            )
+            asr_elapsed_ms = _elapsed_ms(asr_started, self._monotonic())
+            asr_updates: dict[str, object] = {
+                "asr_ms": asr_elapsed_ms,
+                "asr_profile": transcription.engine,
+            }
+            if transcription.worker_elapsed_ms is not None:
+                asr_updates["asr_worker_ms"] = transcription.worker_elapsed_ms
+                asr_updates["asr_queue_transport_ms"] = max(
+                    0, asr_elapsed_ms - transcription.worker_elapsed_ms
+                )
+            timing = transcription.timing
+            if timing.audio_load_ms is not None:
+                asr_updates["asr_audio_load_ms"] = timing.audio_load_ms
+            if timing.vad_ms is not None:
+                asr_updates["asr_vad_ms"] = timing.vad_ms
+            if timing.generate_ms is not None:
+                asr_updates["asr_generate_ms"] = timing.generate_ms
+            self._record_metric(**asr_updates)
 
             text = transcription.text
             if not text:
@@ -919,6 +941,13 @@ class VoiceDaemon:
                     permitted = lease.release_asr_for_qwen(profile)
                 except Exception as exc:  # noqa: BLE001 - deny on uncertainty
                     logger.warning("XPU lease unavailable: %s", type(exc).__name__)
+                release_ms = getattr(lease, "last_release_ms", None)
+                if (
+                    isinstance(release_ms, int)
+                    and not isinstance(release_ms, bool)
+                    and release_ms >= 0
+                ):
+                    self._record_metric(asr_release_ms=release_ms)
             if not permitted:
                 self._record_metric(correction="skipped_lease")
                 return raw_text

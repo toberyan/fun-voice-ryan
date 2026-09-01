@@ -16,7 +16,16 @@ _TIMING_FIELDS: Final = frozenset(
     {
         "capture_duration_ms",
         "preload_ms",
+        "preload_worker_ms",
+        "preload_runtime_load_ms",
+        "preload_warmup_ms",
         "asr_ms",
+        "asr_worker_ms",
+        "asr_queue_transport_ms",
+        "asr_audio_load_ms",
+        "asr_vad_ms",
+        "asr_generate_ms",
+        "asr_release_ms",
         "correction_ms",
         "commit_ms",
         "end_to_end_ms",
@@ -26,6 +35,7 @@ _ENUM_FIELDS: Final = frozenset(
     {
         "asr_profile",
         "nano_preload",
+        "nano_warmup",
         "correction",
         "error_code",
         "nano_was_stopped_for_qwen",
@@ -35,6 +45,7 @@ _ALLOWED_ASR_PROFILES: Final = frozenset({"nano", "sensevoice"})
 _ALLOWED_NANO_PRELOAD: Final = frozenset(
     {"not_requested", "scheduled", "ready", "failed"}
 )
+_ALLOWED_NANO_WARMUP: Final = frozenset({"not_requested", "ready", "failed"})
 _ALLOWED_CORRECTION: Final = frozenset(
     {"disabled", "corrected", "raw_fallback", "skipped_lease", "failed"}
 )
@@ -66,12 +77,22 @@ class SessionMetric:
     sequence: int
     capture_duration_ms: int | None = None
     preload_ms: int | None = None
+    preload_worker_ms: int | None = None
+    preload_runtime_load_ms: int | None = None
+    preload_warmup_ms: int | None = None
     asr_ms: int | None = None
+    asr_worker_ms: int | None = None
+    asr_queue_transport_ms: int | None = None
+    asr_audio_load_ms: int | None = None
+    asr_vad_ms: int | None = None
+    asr_generate_ms: int | None = None
+    asr_release_ms: int | None = None
     correction_ms: int | None = None
     commit_ms: int | None = None
     end_to_end_ms: int | None = None
     asr_profile: str | None = None
     nano_preload: str = "not_requested"
+    nano_warmup: str = "not_requested"
     correction: str = "disabled"
     error_code: str | None = None
     nano_was_stopped_for_qwen: bool = False
@@ -127,7 +148,13 @@ class MetricsLedger:
                     "p95": _percentile(timings, 0.95),
                 }
 
-        for field in ("asr_profile", "nano_preload", "correction", "error_code"):
+        for field in (
+            "asr_profile",
+            "nano_preload",
+            "nano_warmup",
+            "correction",
+            "error_code",
+        ):
             values = [getattr(row, field) for row in rows]
             counts = Counter(value for value in values if value is not None)
             if counts:
@@ -158,6 +185,11 @@ class MetricsLedger:
             and updates["nano_preload"] not in _ALLOWED_NANO_PRELOAD
         ):
             raise ValueError("invalid nano_preload")
+        if (
+            "nano_warmup" in updates
+            and updates["nano_warmup"] not in _ALLOWED_NANO_WARMUP
+        ):
+            raise ValueError("invalid nano_warmup")
         if (
             "correction" in updates
             and updates["correction"] not in _ALLOWED_CORRECTION

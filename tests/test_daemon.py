@@ -22,11 +22,13 @@ from fun_voice import daemon as daemon_mod
 from fun_voice.capture import CaptureConfig, CaptureError
 from fun_voice.config import Config
 from fun_voice.contracts import (
+    AsrStageTiming,
     CaptureArtifact,
     CommitResult,
     DaemonState,
     ErrorCode,
     FocusSnapshot,
+    PreloadTiming,
     Transcription,
 )
 from fun_voice.corrector import CorrectionError
@@ -210,9 +212,11 @@ class FakeWorker:
         text: str = "你好",
         *,
         error: BaseException | None = None,
+        transcription: Transcription | None = None,
     ) -> None:
         self.text = text
         self.error = error
+        self.result = transcription
         self.transcriptions: list[CaptureArtifact] = []
         self.closed = False
 
@@ -220,7 +224,7 @@ class FakeWorker:
         self.transcriptions.append(artifact)
         if self.error is not None:
             raise self.error
-        return Transcription(text=self.text, segments=())
+        return self.result or Transcription(text=self.text, segments=())
 
     def close(self) -> None:
         self.closed = True
@@ -267,7 +271,7 @@ class Harness:
         worker: FakeWorker | None = None,
         corrector: FakeCorrector | None = None,
         xpu_lease: AllowingLease | RejectingLease | None = None,
-        nano_preloader: Callable[[], None] | None = None,
+        nano_preloader: Callable[[], PreloadTiming | None] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         capture_config: CaptureConfig | None = None,
@@ -431,6 +435,43 @@ def test_completed_session_metrics_contain_only_aggregate_stage_data() -> None:
     assert "commit_ms" in report
     assert "你好" not in repr(report)
     assert ARTIFACT.audio not in repr(report)
+
+
+def test_daemon_aggregates_worker_and_preload_stage_durations() -> None:
+    completed_preload = threading.Event()
+
+    def preload() -> PreloadTiming:
+        completed_preload.set()
+        return PreloadTiming(
+            worker_elapsed_ms=20,
+            runtime_load_ms=11,
+            warmup_ms=7,
+            warmup_status="ready",
+        )
+
+    worker = FakeWorker(
+        transcription=Transcription(
+            text="你好",
+            timing=AsrStageTiming(audio_load_ms=3, vad_ms=5, generate_ms=9),
+            worker_elapsed_ms=12,
+        )
+    )
+    h = Harness(worker=worker, nano_preloader=preload)
+    _started(h)
+    assert completed_preload.wait(timeout=2.0)
+    h.daemon.stop()
+
+    report = h.daemon.dispatch({"op": "metrics"})
+
+    assert report["preload_worker_ms"] == {"p50": 20, "p95": 20}
+    assert report["preload_runtime_load_ms"] == {"p50": 11, "p95": 11}
+    assert report["preload_warmup_ms"] == {"p50": 7, "p95": 7}
+    assert report["nano_warmup"] == {"ready": 1}
+    assert report["asr_worker_ms"] == {"p50": 12, "p95": 12}
+    assert report["asr_audio_load_ms"] == {"p50": 3, "p95": 3}
+    assert report["asr_vad_ms"] == {"p50": 5, "p95": 5}
+    assert report["asr_generate_ms"] == {"p50": 9, "p95": 9}
+    assert "你好" not in repr(report)
 
 
 def test_daemon_requests_nano_preload_only_after_recording_starts() -> None:
