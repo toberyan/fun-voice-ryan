@@ -16,10 +16,10 @@ Fun Voice Ryan 是一个运行在 Deepin DDE X11 上的本地语音输入助手�
 - Intel Arc 显卡，并装好 Intel GPU compute runtime 与 Level Zero。
 
 ```bash
-uv sync
-uv run pytest -q
-uv run ruff check src tests
-uv run mypy src
+uv sync --inexact
+.venv/bin/pytest -q
+.venv/bin/ruff check src tests
+.venv/bin/mypy src
 ```
 
 ## 隐私边界
@@ -37,13 +37,14 @@ uv run mypy src
 ```bash
 # 1) 先构建 fcitx addon 与 Python 环境（一次性）
 cmake -S native/fcitx5-fun-voice -B build/fcitx && cmake --build build/fcitx
-uv sync
+scripts/create-xpu-env.sh
+uv sync --inexact
 
-# 2) 安装到用户会话（systemd user 服务 + autostart + DDE Super+C 快捷键）
+# 2) 安装到用户会话（systemd user 服务 + 图形会话环境导入 + X11 Super+C grab）
 scripts/install-user.sh
 ```
 
-安装内容：5 个 console script 拷贝到 `~/.local/bin/`；两个 systemd user unit
+安装内容：4 个 console script 拷贝到 `~/.local/bin/`；两个 systemd user unit
 （worker、daemon）写入 `~/.config/systemd/user/`；fcitx addon 的 `.so` 与
 `.conf` 写入 `~/.local/lib/fcitx5/` 与 `~/.local/share/fcitx5/addon/`；登录自启
 入口写入 `~/.config/autostart/`。脚本幂等，可重复执行。
@@ -56,7 +57,7 @@ scripts/install-user.sh
 
 ## 使用
 
-1. 重新登录 DDE 会话（或手动 `systemctl --user start fun-voice-worker fun-voice-daemon`）。
+1. 重新登录 DDE X11 会话（或手动 `systemctl --user restart fun-voice-worker fun-voice-daemon`）。
 2. 在任意输入框**按住** `Super+C` 说话，松开后文本上屏到录音开始时的焦点窗口。
 3. 自检与诊断：
 

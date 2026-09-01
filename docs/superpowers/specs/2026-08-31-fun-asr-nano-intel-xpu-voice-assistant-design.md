@@ -7,6 +7,9 @@ scope: Deepin X11 上的按住说话、本地 Fun-ASR-Nano、Intel Arc XPU 输�
 
 # Fun Voice Ryan 本地语音输入助手技术方案
 
+> **已替代（2026-09-01）：** 本文中的 DDE/bridge 快捷键 POC 未满足按住时序；当前
+> 快捷键设计见 [X11 全局热键替换设计](2026-09-01-x11-hotkey-replacement-design.md)。
+
 ## 目标
 
 在当前 Deepin X11 桌面上提供一个本地语音输入助手：用户按住 `Super+C` 说普通话，松开后由 FunASR 的 Fun-ASR-Nano 转写，并把**未作术语纠正或格式化的模型原始文本**自动提交到录音开始时的焦点窗口。

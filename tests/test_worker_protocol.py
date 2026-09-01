@@ -16,6 +16,7 @@ from collections.abc import Iterator
 import pytest
 
 from fun_voice import worker as worker_mod
+from fun_voice.config import Config, InferenceConfig, RuntimePaths
 from fun_voice.contracts import (
     MAX_MESSAGE_BYTES,
     WORKER_RESPONSE_MAX_BYTES,
@@ -25,7 +26,7 @@ from fun_voice.contracts import (
     decode_message,
     encode_message,
 )
-from fun_voice.worker import Worker, WorkerServer, peer_uid
+from fun_voice.worker import LazyTranscriber, Worker, WorkerServer, peer_uid
 
 
 class FakeRuntime:
@@ -163,6 +164,51 @@ def test_health_over_socket(server) -> None:
     assert "text" not in response
 
 
+def test_lazy_transcriber_loads_only_for_first_transcription() -> None:
+    loaded: list[FakeRuntime] = []
+
+    def load() -> FakeRuntime:
+        runtime = FakeRuntime()
+        loaded.append(runtime)
+        return runtime
+
+    runtime = LazyTranscriber(load, device="xpu:0")
+    assert runtime.health().model_ready is False
+    assert loaded == []
+
+    first = runtime.transcribe("/tmp/a.wav")
+    second = runtime.transcribe("/tmp/b.wav")
+
+    assert first.text == "你好"
+    assert second.text == "你好"
+    assert len(loaded) == 1
+
+
+def test_lazy_transcriber_maps_load_failure_to_stable_worker_error() -> None:
+    def load() -> FakeRuntime:
+        raise RuntimeError("broken checkpoint")
+
+    response = Worker(LazyTranscriber(load, device="xpu:0")).handle(
+        {"id": "u1", "op": "transcribe", "audio": "/tmp/a.wav"}
+    )
+    assert response["status"] == "error"
+    assert response["error_code"] == "worker.model_load"
+
+
+def test_worker_server_idle_monitor_stops_only_after_idle_timeout(tmp_path) -> None:
+    socket_path = tmp_path / "idle.sock"
+    server = WorkerServer(socket_path, Worker(FakeRuntime()), uid=os.getuid())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        server.start_idle_monitor(0.02)
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+    finally:
+        server.stop_idle_monitor()
+        server.server_close()
+
+
 # --- Transcribe round trip --------------------------------------------------
 
 
@@ -229,6 +275,74 @@ def test_server_keeps_listening_after_error(tmp_path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_worker_main_uses_toml_inference_config(monkeypatch, tmp_path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    paths = RuntimePaths(
+        runtime_dir=runtime_dir,
+        worker_socket=runtime_dir / "worker.sock",
+        daemon_socket=runtime_dir / "daemon.sock",
+        fcitx_socket=tmp_path / "fcitx.sock",
+    )
+    cfg = Config(
+        inference=InferenceConfig(
+            device="xpu:0",
+            dtype="bf16",
+            gpu_memory_utilization=0.2,
+            enforce_eager=False,
+        )
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(worker_mod.config, "load_config", lambda: cfg)
+    monkeypatch.setattr(worker_mod.config, "resolve_runtime_dir", lambda: runtime_dir)
+    monkeypatch.setattr(worker_mod.config, "build_runtime_paths", lambda _path: paths)
+    monkeypatch.setattr(
+        worker_mod,
+        "load_nano_runtime",
+        lambda **kwargs: captured.update(kwargs) or FakeRuntime(),
+    )
+
+    def fake_serve(_path, worker, **_kwargs):
+        assert worker.handle({"op": "health"})["model_ready"] is False
+        assert worker.handle(
+            {"id": "u1", "op": "transcribe", "audio": "/tmp/a.wav"}
+        )["status"] == "ok"
+        return 0
+
+    monkeypatch.setattr(worker_mod, "serve", fake_serve)
+
+    assert worker_mod.main([]) == 0
+    assert captured["device"] == "xpu:0"
+    assert captured["dtype"] == "bf16"
+    assert captured["gpu_memory_utilization"] == 0.2
+    assert captured["max_model_len"] == 1536
+    assert captured["enforce_eager"] is False
+
+
+def test_worker_main_rejects_cpu_cli_override(monkeypatch, tmp_path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    paths = RuntimePaths(
+        runtime_dir=runtime_dir,
+        worker_socket=runtime_dir / "worker.sock",
+        daemon_socket=runtime_dir / "daemon.sock",
+        fcitx_socket=tmp_path / "fcitx.sock",
+    )
+    called = False
+
+    def _load_runtime(**_kwargs: object) -> FakeRuntime:
+        nonlocal called
+        called = True
+        return FakeRuntime()
+
+    monkeypatch.setattr(worker_mod.config, "load_config", Config)
+    monkeypatch.setattr(worker_mod.config, "resolve_runtime_dir", lambda: runtime_dir)
+    monkeypatch.setattr(worker_mod.config, "build_runtime_paths", lambda _path: paths)
+    monkeypatch.setattr(worker_mod, "load_nano_runtime", _load_runtime)
+    monkeypatch.setattr(worker_mod, "serve", lambda _path, _worker: 0)
+
+    assert worker_mod.main(["--device", "cpu"]) == 1
+    assert called is False
 
 
 # --- Framing / protocol errors ----------------------------------------------

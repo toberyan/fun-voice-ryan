@@ -33,6 +33,7 @@ DAEMON_SOCKET_NAME = "daemon.sock"
 CONFIG_DIR_NAME = "fun-voice-ryan"
 CONFIG_FILE_NAME = "config.toml"
 FCITX_SOCKET_NAME = "fun-voice-ryan-fcitx.sock"
+XPU_DEVICE = "xpu:0"
 
 
 class ConfigError(RuntimeError):
@@ -40,12 +41,42 @@ class ConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class InferenceConfig:
-    """Inference (worker) settings; defaults mirror the preflight constants."""
+    """Bounded XPU ASR settings for a transient worker process.
 
-    device: str = "xpu:0"
+    The vLLM allocation fraction and context length are deliberately capped so
+    a configuration edit cannot recreate the former multi-gibibyte idle KV
+    cache reservation.
+    """
+
+    device: str = XPU_DEVICE
     dtype: str = "bf16"
-    gpu_memory_utilization: float = 0.35
+    gpu_memory_utilization: float = 0.15
+    max_model_len: int = 1536
+    idle_unload_seconds: int = 120
+    allow_sensevoice_fallback: bool = True
     enforce_eager: bool = True
+
+
+@dataclass(frozen=True)
+class EnhancedInferenceConfig:
+    """Fixed safety bounds for enhanced XPU-only voice processing.
+
+    The individual model services read this one value object.  Keeping the
+    supported devices and model identifier fixed prevents a configuration typo
+    from silently selecting a CPU or an unvalidated correction model.
+    """
+
+    enabled: bool = True
+    result_ttl_seconds: int = 600
+    result_max_entries: int = 8
+    correction_model: str = "Qwen/Qwen3.5-0.8B"
+    correction_device: str = XPU_DEVICE
+    correction_dtype: str = "bf16"
+    correction_gpu_memory_utilization: float = 0.15
+    correction_max_model_len: int = 1536
+    correction_enable_thinking: bool = False
+    identity_enabled: bool = False
+    identity_device: str = XPU_DEVICE
 
 
 @dataclass(frozen=True)
@@ -60,9 +91,10 @@ class Config:
     """
 
     audio_source: str = "default"
-    fcitx_commit_timeout_ms: float = 0.5
+    fcitx_commit_timeout_ms: int = 500
     allow_x11_paste_fallback: bool = True
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+    enhanced: EnhancedInferenceConfig = field(default_factory=EnhancedInferenceConfig)
 
 
 @dataclass(frozen=True)
@@ -161,6 +193,64 @@ def _float(value: object, default: float) -> float:
     return default
 
 
+def _positive_int(value: object, *, key: str, default: int) -> int:
+    """Return a configured positive integer, rejecting invalid known keys."""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{key} must be a positive integer")
+    return value
+
+
+def validate_inference_config(inference: InferenceConfig) -> InferenceConfig:
+    """Validate the only inference settings compatible with this XPU-only app."""
+    if inference.device != XPU_DEVICE:
+        raise ConfigError(f"inference.device must be {XPU_DEVICE!r}")
+    if not 0.10 <= inference.gpu_memory_utilization <= 0.20:
+        raise ConfigError(
+            "inference.gpu_memory_utilization must be in [0.10, 0.20]"
+        )
+    if not 1024 <= inference.max_model_len <= 1536:
+        raise ConfigError("inference.max_model_len must be in [1024, 1536]")
+    if not 30 <= inference.idle_unload_seconds <= 300:
+        raise ConfigError("inference.idle_unload_seconds must be in [30, 300]")
+    return inference
+
+
+def validate_enhanced_inference_config(
+    value: EnhancedInferenceConfig,
+) -> EnhancedInferenceConfig:
+    """Reject unsupported enhanced-service settings before startup.
+
+    The result API intentionally has fixed capacity and lifetime: allowing a
+    longer retention period would change the local privacy boundary.
+    """
+    if value.correction_device != XPU_DEVICE:
+        raise ConfigError("correction.device must be 'xpu:0'")
+    if value.identity_device != XPU_DEVICE:
+        raise ConfigError("speaker_identity.device must be 'xpu:0'")
+    if value.correction_model != "Qwen/Qwen3.5-0.8B":
+        raise ConfigError("correction.model must be 'Qwen/Qwen3.5-0.8B'")
+    if value.correction_dtype != "bf16":
+        raise ConfigError("correction.dtype must be 'bf16'")
+    if not 0.10 <= value.correction_gpu_memory_utilization <= 0.20:
+        raise ConfigError(
+            "correction.gpu_memory_utilization must be in [0.10, 0.20]"
+        )
+    if not 1024 <= value.correction_max_model_len <= 1536:
+        raise ConfigError("correction.max_model_len must be in [1024, 1536]")
+    if value.correction_enable_thinking:
+        raise ConfigError("correction.enable_thinking must be false")
+    if (
+        not 1 <= value.result_max_entries <= 8
+        or value.result_ttl_seconds != 600
+    ):
+        raise ConfigError(
+            "enhanced result retention is fixed at 8 entries / 600 seconds"
+        )
+    return value
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Load the single TOML configuration, or return the safe defaults.
 
@@ -183,21 +273,76 @@ def load_config(path: str | Path | None = None) -> Config:
     audio = _table(raw.get("audio"))
     input_method = _table(raw.get("input_method"))
     inference = _table(raw.get("inference"))
+    enhanced = _table(raw.get("enhanced"))
+    correction = _table(raw.get("correction"))
+    speaker_identity = _table(raw.get("speaker_identity"))
 
+    inference_config = validate_inference_config(
+        InferenceConfig(
+            device=_str(inference.get("device"), XPU_DEVICE),
+            dtype=_str(inference.get("dtype"), "bf16"),
+            gpu_memory_utilization=_float(
+                inference.get("gpu_memory_utilization"), 0.15
+            ),
+            max_model_len=_positive_int(
+                inference.get("max_model_len"),
+                key="inference.max_model_len",
+                default=1536,
+            ),
+            idle_unload_seconds=_positive_int(
+                inference.get("idle_unload_seconds"),
+                key="inference.idle_unload_seconds",
+                default=120,
+            ),
+            allow_sensevoice_fallback=_bool(
+                inference.get("allow_sensevoice_fallback"), True
+            ),
+            enforce_eager=_bool(inference.get("enforce_eager"), True),
+        )
+    )
+    enhanced_config = validate_enhanced_inference_config(
+        EnhancedInferenceConfig(
+            enabled=_bool(enhanced.get("enabled"), True),
+            result_ttl_seconds=_positive_int(
+                enhanced.get("result_ttl_seconds"),
+                key="enhanced.result_ttl_seconds",
+                default=600,
+            ),
+            result_max_entries=_positive_int(
+                enhanced.get("result_max_entries"),
+                key="enhanced.result_max_entries",
+                default=8,
+            ),
+            correction_model=_str(
+                correction.get("model"), "Qwen/Qwen3.5-0.8B"
+            ),
+            correction_device=_str(correction.get("device"), XPU_DEVICE),
+            correction_dtype=_str(correction.get("dtype"), "bf16"),
+            correction_gpu_memory_utilization=_float(
+                correction.get("gpu_memory_utilization"), 0.15
+            ),
+            correction_max_model_len=_positive_int(
+                correction.get("max_model_len"),
+                key="correction.max_model_len",
+                default=1536,
+            ),
+            correction_enable_thinking=_bool(
+                correction.get("enable_thinking"), False
+            ),
+            identity_enabled=_bool(speaker_identity.get("enabled"), False),
+            identity_device=_str(speaker_identity.get("device"), XPU_DEVICE),
+        )
+    )
     return Config(
         audio_source=_str(audio.get("source"), "default"),
-        fcitx_commit_timeout_ms=_float(
-            input_method.get("fcitx_commit_timeout_ms"), 0.5
+        fcitx_commit_timeout_ms=_positive_int(
+            input_method.get("commit_timeout_ms"),
+            key="input_method.commit_timeout_ms",
+            default=500,
         ),
         allow_x11_paste_fallback=_bool(
             input_method.get("allow_x11_paste_fallback"), True
         ),
-        inference=InferenceConfig(
-            device=_str(inference.get("device"), "xpu:0"),
-            dtype=_str(inference.get("dtype"), "bf16"),
-            gpu_memory_utilization=_float(
-                inference.get("gpu_memory_utilization"), 0.35
-            ),
-            enforce_eager=_bool(inference.get("enforce_eager"), True),
-        ),
+        inference=inference_config,
+        enhanced=enhanced_config,
     )

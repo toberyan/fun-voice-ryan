@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pytest
 
+from fun_voice.nano_runtime import VAD_OVERLAP_MS
 from fun_voice.preflight import (
     CHECK_NAMES,
     DECODE_TOKENS_10S,
@@ -15,6 +17,8 @@ from fun_voice.preflight import (
     STATUS_PASS,
     CheckResult,
     PreflightReport,
+    _transcribe_segmented,
+    check_decode,
     check_vllm_xpu_decoder,
     check_worker_health,
     detect_cpu_fallback,
@@ -108,13 +112,45 @@ class _FakeNanoEngine:
         self.embed_tokens = _FakeModule(embed_type)
         self.vllm_engine = _FakeVLLMEngine(device_type)
         self._fail_tokens = fail_tokens or set()
+
     def generate(
-        self, inputs: list[str], max_new_tokens: int = 512, **kwargs: Any
+        self, inputs: list[Any], max_new_tokens: int = 512, **kwargs: Any
     ) -> list[dict[str, str]]:
         if max_new_tokens in self._fail_tokens:
             raise RuntimeError("fake decode failure")
-        return [{"key": "sample", "text": "hello world"}]
+        return [
+            {"key": f"sample_{index}", "text": "hello world"}
+            for index, _input in enumerate(inputs)
+        ]
 
+
+class _FakeVad:
+    """Fake VAD returning a caller-supplied list of ``(start_ms, end_ms)``."""
+
+    def __init__(self, regions: list[tuple[int, int]] | None = None) -> None:
+        self.regions = regions if regions is not None else [(0, 100), (200, 300)]
+        self.detect_calls: list[tuple[int, int]] = []
+
+    def detect(self, samples: Any, sample_rate: int) -> list[tuple[int, int]]:
+        self.detect_calls.append((len(samples), sample_rate))
+        return list(self.regions)
+
+
+class _SegmentedEngine:
+    """Fake Nano engine returning one text per input slice, in order."""
+
+    def __init__(self, texts: list[str]) -> None:
+        self.texts = texts
+        self.inputs: list[tuple[list[np.ndarray], int]] = []
+
+    def generate(
+        self, inputs: list[np.ndarray], max_new_tokens: int = 512, **kwargs: Any
+    ) -> list[dict[str, str]]:
+        self.inputs.append((list(inputs), max_new_tokens))
+        return [
+            {"key": f"sample_{i}", "text": text}
+            for i, text in enumerate(self.texts)
+        ]
 
 TOTAL = 8 * 2**30
 
@@ -122,20 +158,34 @@ TOTAL = 8 * 2**30
 def _run(**kwargs: Any) -> PreflightReport:
     torch = _FakeTorch()
     engine = _FakeNanoEngine()
+    vad = _FakeVad()
     if "torch" in kwargs:
         torch = kwargs.pop("torch")
     if "engine" in kwargs:
         engine = kwargs.pop("engine")
+    if "vad" in kwargs:
+        vad = kwargs.pop("vad")
     short = kwargs.pop("short", "short.wav")
     long = kwargs.pop("long", "long.wav")
     worker_health = kwargs.pop("worker_health", None)
     return run_preflight(
         torch=torch,
         engine=engine,
+        vad=vad,
         short_sample=short,
         long_sample=long,
         worker_health=worker_health,
     )
+
+
+@pytest.fixture(autouse=True)
+def _stub_audio_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never hit disk: return a fixed 1 s silence buffer for every sample."""
+
+    def _load(_path: str, sample_rate: int = 16000) -> np.ndarray:
+        return np.zeros(sample_rate, dtype=np.float32)
+
+    monkeypatch.setattr("fun_voice.preflight._load_audio_samples", _load)
 
 
 # --- Tests -------------------------------------------------------------------
@@ -278,6 +328,8 @@ def test_load_nano_engine_passes_triton_attn_backend(
     engine = load_nano_engine("/fake/model-dir")
     assert engine is not None
     assert captured["model"] == "/fake/model-dir"
+    assert captured["gpu_memory_utilization"] == 0.15
+    assert captured["max_model_len"] == 1536
     assert captured["device"] == "xpu:0"
     assert captured["dtype"] == "bf16"
     assert captured["vllm_kwargs"] == {"attention_backend": "TRITON_ATTN"}
@@ -387,3 +439,83 @@ def test_run_preflight_ready_true_when_worker_healthy() -> None:
     assert report.ready is True
     assert report.worker_health is not None
     assert report.worker_health.status == STATUS_PASS
+
+
+
+def test_transcribe_segmented_sorts_and_concatenates_in_time_order() -> None:
+    """VAD regions arrive out of order; text must follow sorted segment order."""
+    engine = _SegmentedEngine(["a", "b", "c"])
+    vad = _FakeVad([(300, 400), (0, 100), (600, 700)])
+    samples = np.zeros(16000, dtype=np.float32)
+
+    text, regions = _transcribe_segmented(engine, vad, samples, max_new_tokens=128)
+
+    assert regions == [(0, 100), (300, 400), (600, 700)]
+    assert text == "abc"
+    (slices, tokens) = engine.inputs[0]
+    assert tokens == 128
+    assert len(slices) == 3
+
+
+def test_transcribe_segmented_applies_fixed_overlap() -> None:
+    """Each VAD region is sliced with VAD_OVERLAP_MS added to both boundaries."""
+    engine = _SegmentedEngine(["ok"])
+    vad = _FakeVad([(1000, 2000)])
+    samples = np.arange(32000, dtype=np.float32)  # 2 s at 16 kHz
+
+    _transcribe_segmented(engine, vad, samples, max_new_tokens=128)
+
+    (slices, _tokens) = engine.inputs[0]
+    overlap = int(VAD_OVERLAP_MS * 16000 / 1000)
+    assert overlap == 4000
+    # start = 1000 ms * 16 - overlap = 12000; end = 2000 ms * 16 + overlap,
+    # clamped to total samples (32000).
+    assert slices[0][0] == 12000.0
+    assert slices[0][-1] == 31999.0
+
+
+def test_check_decode_records_segment_count_not_text() -> None:
+    """decode detail carries segment_count/text_length, never the transcript."""
+    result = check_decode(
+        "decode_60s",
+        _SegmentedEngine(["MARKER-ONE", "MARKER-TWO"]),
+        _FakeVad([(200, 300), (0, 100)]),
+        "unused.wav",
+        max_new_tokens=256,
+        min_segments=2,
+    )
+    assert result.status == STATUS_PASS
+    assert result.detail["segment_count"] == 2
+    assert result.detail["text_length"] == len("MARKER-ONEMARKER-TWO")
+    assert "MARKER" not in str(result.detail)
+
+
+@pytest.mark.parametrize("texts", [["only-one"], ["one", "two", "three"]])
+def test_check_decode_rejects_result_count_mismatch(texts: list[str]) -> None:
+    result = check_decode(
+        "decode_60s",
+        _SegmentedEngine(texts),
+        _FakeVad([(0, 100), (300, 400)]),
+        "unused.wav",
+        max_new_tokens=256,
+        min_segments=2,
+    )
+    assert result.status == STATUS_FAIL
+    assert result.detail["error_class"] == "ModelOutputError"
+
+
+def test_check_decode_rejects_non_string_segment_text() -> None:
+    class _MalformedEngine:
+        def generate(self, *_args: Any, **_kwargs: Any) -> list[dict[str, object]]:
+            return [{"text": "valid"}, {"text": None}]
+
+    result = check_decode(
+        "decode_60s",
+        _MalformedEngine(),
+        _FakeVad([(0, 100), (300, 400)]),
+        "unused.wav",
+        max_new_tokens=256,
+        min_segments=2,
+    )
+    assert result.status == STATUS_FAIL
+    assert result.detail["error_class"] == "ModelOutputError"

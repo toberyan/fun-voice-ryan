@@ -1,14 +1,20 @@
-# 真实 DDE X11 会话验收清单
+# 真实 Deepin X11 会话验收清单
 
 > 本清单由**人工**在真实 Deepin DDE **X11** 会话中执行。执行前先确认：
-> `fun-voice-selftest --format json` 全部 `pass`，且
 > `systemctl --user status fun-voice-worker fun-voice-daemon` 均为 `active`。
+> `x11_hotkey` 在本次 daemon 启动后首次真实按住 `Super+C` 前会是 `fail`；完成第 1 节的
+> 第一次按住/松开后重新运行 `fun-voice-selftest --format json`，应全部 `pass`。
 
-## 1. Super+C 无冲突，按住录音、松开识别
+## 1. X11 Super+C 独占、按住录音、松开识别
 
-- [ ] 在 DDE「控制中心 → 键盘 → 快捷键」中确认 `Super+C` 只属于「Fun Voice Ryan — 按住说话」，无红色冲突提示。
+- [ ] 执行一次 `Super+C` 按住/松开后运行 `fun-voice-selftest --format json`，确认
+      `x11_hotkey` 为 `pass`，且 detail 仅含 `registered=true`、`press_seen=true`。
 - [ ] 按住 `Super+C` 说一句普通话（如「今天天气不错」），松开后文本在**录音开始时**的焦点窗口上屏。
 - [ ] 松开后约 1~2 秒内完成识别与上屏，无重复上屏、无乱码。
+- [ ] 先松开 Super、保持 C 按下，确认录音不中断；最后松开 C 后才识别。
+- [ ] 长按触发自动重复时只产生一次录音；目标应用不收到字母 `c`。
+- [ ] 让其他 X11 客户端临时抢占 `Super+C` 后启动 daemon，确认服务退出码为 `2` 且不循环重启；
+      移除冲突后重启服务可重新抓取热键。
 
 ## 2. 中英夹杂 / 代码原样输入
 
@@ -17,11 +23,11 @@
 - [ ] 说一段含符号的口语（如「路径是 usr 斜杠 local 斜杠 bin」），确认输出为
       「路径是 usr/local/bin」等符合预期的原样文本，没有被翻译成中文或改写。
 
-## 3. 剪贴板留存
+## 3. 剪贴板留存（识别结果）
 
-- [ ] 先复制一段文本到剪贴板（Ctrl+C）。
 - [ ] 完成一次语音输入并成功上屏。
-- [ ] 再次粘贴（Ctrl+V），确认剪贴板里仍然是刚才 Ctrl+C 的原文，未被语音文本污染或清空。
+- [ ] 在别处粘贴（Ctrl+V），确认剪贴板内容为本次**识别结果文本**
+      （按已确认设计：成功注入后保留识别结果在系统剪贴板，不恢复旧剪贴板）。
 - [ ] （可选）在 Fcitx 不可用的场景触发剪贴板回退，确认语音文本进入剪贴板且可粘贴。
 
 ## 4. 切窗 / 异常 / 空音频不误输入
@@ -47,5 +53,5 @@
 
 - [ ] 注销并重新登录 DDE 会话。
 - [ ] 确认 `fun-voice-worker` / `fun-voice-daemon` 随登录自动运行（autostart 生效）。
-- [ ] 确认 `Super+C` 仍然可用（快捷键未因重启失效或重复注册）。
+- [ ] 确认 `Super+C` 仍然可用（X11 grab 未因重启失效）。
 - [ ] 确认没有残留的 `~/.local/bin/fun-voice-*` 之外的临时文件或 socket 遗留（`$XDG_RUNTIME_DIR/fun-voice-ryan/` 下仅应有运行时 socket，无 capture 分片残留）。

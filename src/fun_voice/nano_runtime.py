@@ -1,4 +1,4 @@
-"""Warm Fun-ASR-Nano runtime: CPU FSMN-VAD + XPU vLLM ASR.
+"""XPU ASR runtime adapters for Nano and SenseVoiceSmall.
 
 The runtime loads the Nano engine and the FSMN-VAD model exactly once and keeps
 them warm for the worker's lifetime. Each request reuses both models:
@@ -52,6 +52,18 @@ NANO_MODEL_RELPATH = (
     "snapshots",
     "master",
 )
+SENSEVOICE_MODEL_RELPATH = (
+    "models",
+    "iic--SenseVoiceSmall",
+    "snapshots",
+    "master",
+)
+VAD_MODEL_RELPATH = (
+    "models",
+    "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    "snapshots",
+    "master",
+)
 
 class NanoRuntimeError(RuntimeError):
     """Base class for worker-runtime errors; subclasses carry a stable code."""
@@ -93,6 +105,12 @@ class ModelOutputError(NanoRuntimeError):
     """The model returned no output or a malformed result."""
 
     error_code: ErrorCode = ErrorCode("worker", "no_output")
+
+
+class ModelLoadError(NanoRuntimeError):
+    """A local XPU model could not be constructed for a request."""
+
+    error_code: ErrorCode = ErrorCode("worker", "model_load")
 
 
 class AudioFormatError(NanoRuntimeError):
@@ -435,13 +453,23 @@ def nano_model_dir(env: Mapping[str, str] | None = None) -> Path:
     return models_root(env).joinpath(*NANO_MODEL_RELPATH)
 
 
+def sensevoice_model_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Return the locally installed SenseVoiceSmall snapshot directory."""
+    return models_root(env).joinpath(*SENSEVOICE_MODEL_RELPATH)
+
+
+def vad_model_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Return the locally installed FSMN-VAD snapshot directory."""
+    return models_root(env).joinpath(*VAD_MODEL_RELPATH)
+
+
 def load_nano_runtime(
     *,
     device: str = DEVICE,
     dtype: str = "bf16",
-    gpu_memory_utilization: float = 0.35,
+    gpu_memory_utilization: float = 0.15,
     enforce_eager: bool = True,
-    max_model_len: int = 4096,
+    max_model_len: int = 1536,
     default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> NanoRuntime:
     """Load the Fun-ASR-Nano engine and FSMN-VAD once, on XPU."""
@@ -458,19 +486,140 @@ def load_nano_runtime(
         enforce_eager=enforce_eager,
         max_model_len=max_model_len,
     )
-    vad = _load_vad()
+    vad = _load_vad(device)
     return NanoRuntime(
         engine=engine, vad=vad, device=device, default_timeout=default_timeout
     )
 
 
-def _load_vad() -> FsmnVadSegmenter:
+def _load_vad(device: str) -> FsmnVadSegmenter:
     from funasr import AutoModel
 
     model = AutoModel(
-        model="fsmn-vad",
-        device="cpu",
+        model=str(vad_model_dir()),
+        device=device,
         disable_update=True,
         max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
     )
     return FsmnVadSegmenter(model)
+
+
+def _assert_funasr_model_xpu(model: Any, *, name: str) -> None:
+    """Reject a FunASR model unless an inspectable module is entirely on XPU."""
+    for candidate in (
+        model,
+        getattr(model, "model", None),
+        getattr(model, "network", None),
+    ):
+        if candidate is None:
+            continue
+        parameters = getattr(candidate, "parameters", None)
+        if not callable(parameters):
+            continue
+        devices = {str(parameter.device.type) for parameter in parameters()}
+        if devices:
+            if devices != {EXPECTED_DEVICE_TYPE}:
+                raise DeviceMismatchError(f"{name} is not entirely on XPU")
+            return
+    raise DeviceMismatchError(f"{name} exposes no inspectable parameters")
+
+
+class SenseVoiceRuntime:
+    """Local-snapshot SenseVoiceSmall fallback, entirely on the Intel XPU."""
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        device: str = DEVICE,
+        default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        self._model = model
+        self.device = device
+        self.default_timeout = default_timeout
+        self.last_error: ErrorCode | None = None
+        self._closed = False
+
+    def health(self) -> WorkerHealth:
+        ready = not self._closed
+        if ready:
+            try:
+                _assert_funasr_model_xpu(self._model, name="SenseVoiceSmall")
+            except DeviceMismatchError:
+                ready = False
+        return WorkerHealth(
+            version=VERSION,
+            xpu_ready=ready,
+            model_ready=ready,
+            device=self.device,
+            last_error=self.last_error,
+        )
+
+    def close(self) -> None:
+        self._closed = True
+
+    def transcribe(
+        self, audio: str, *, sample_rate: int = 16000, timeout: float | None = None
+    ) -> Transcription:
+        del sample_rate, timeout
+        if self._closed:
+            raise ModelLoadError("SenseVoiceSmall runtime is closed")
+        try:
+            _assert_funasr_model_xpu(self._model, name="SenseVoiceSmall")
+            results = self._model.generate(input=audio)
+        except NanoRuntimeError as exc:
+            self.last_error = exc.error_code
+            raise
+        except BaseException as exc:  # noqa: BLE001 - stable worker taxonomy
+            if _is_oom_error(exc):
+                self.last_error = OomError.error_code
+                raise OomError("out of memory") from exc
+            self.last_error = VllmError.error_code
+            raise VllmError(type(exc).__name__) from exc
+        if not results or not isinstance(results[0], dict):
+            self.last_error = ModelOutputError.error_code
+            raise ModelOutputError("SenseVoiceSmall returned no result")
+        first = results[0]
+        sentence_info = first.get("sentence_info")
+        segments: tuple[Segment, ...] = ()
+        if isinstance(sentence_info, list):
+            parsed: list[Segment] = []
+            for item in sentence_info:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text", item.get("sentence", ""))
+                if not isinstance(text, str):
+                    continue
+                parsed.append(
+                    Segment(
+                        start_ms=int(item.get("start", 0)),
+                        end_ms=int(item.get("end", 0)),
+                        text=text,
+                    )
+                )
+            segments = tuple(parsed)
+        text = first.get("text")
+        if not isinstance(text, str):
+            text = "".join(segment.text for segment in segments)
+        if not text:
+            self.last_error = EmptySpeechError.error_code
+            raise EmptySpeechError("SenseVoiceSmall returned empty text")
+        return Transcription(text=text, segments=segments)
+
+
+def load_sensevoice_runtime(
+    *, device: str = DEVICE, default_timeout: float = DEFAULT_TIMEOUT_SECONDS
+) -> SenseVoiceRuntime:
+    """Load SenseVoiceSmall and FSMN-VAD from local snapshots on XPU only."""
+    os.environ.setdefault("MODELSCOPE_CACHE", str(models_root()))
+    from funasr import AutoModel
+
+    model = AutoModel(
+        model=str(sensevoice_model_dir()),
+        vad_model=str(vad_model_dir()),
+        device=device,
+        disable_update=True,
+        max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
+    )
+    _assert_funasr_model_xpu(model, name="SenseVoiceSmall")
+    return SenseVoiceRuntime(model, device=device, default_timeout=default_timeout)

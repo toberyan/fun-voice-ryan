@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import fun_voice.config as config_module
 from fun_voice.config import (
     DAEMON_SOCKET_NAME,
     DIRECTORY_MODE,
@@ -77,9 +78,13 @@ def test_resolved_paths_are_private_and_expected(
 def test_config_defaults() -> None:
     cfg = Config()
     assert cfg.audio_source == "default"
-    assert cfg.fcitx_commit_timeout_ms == 0.5
+    assert cfg.fcitx_commit_timeout_ms == 500
     assert cfg.allow_x11_paste_fallback is True
     assert cfg.inference == InferenceConfig()
+    assert cfg.inference.gpu_memory_utilization == 0.15
+    assert cfg.inference.max_model_len == 1536
+    assert cfg.inference.idle_unload_seconds == 120
+    assert cfg.inference.allow_sensevoice_fallback is True
 
 
 def test_load_config_defaults_when_missing(tmp_path: Path) -> None:
@@ -96,13 +101,16 @@ def test_load_config_parses_toml_overrides(tmp_path: Path) -> None:
                 'source = "alsa_input.custom"',
                 "",
                 "[input_method]",
-                "fcitx_commit_timeout_ms = 2.5",
+                "commit_timeout_ms = 2500",
                 "allow_x11_paste_fallback = false",
                 "",
                 "[inference]",
-                'device = "cpu"',
-                'dtype = "fp32"',
-                "gpu_memory_utilization = 0.8",
+                'device = "xpu:0"',
+                'dtype = "bf16"',
+                "gpu_memory_utilization = 0.2",
+                "max_model_len = 1024",
+                "idle_unload_seconds = 90",
+                "allow_sensevoice_fallback = false",
                 "enforce_eager = false",
             ]
         ),
@@ -110,11 +118,75 @@ def test_load_config_parses_toml_overrides(tmp_path: Path) -> None:
     )
     cfg = load_config(path)
     assert cfg.audio_source == "alsa_input.custom"
-    assert cfg.fcitx_commit_timeout_ms == 2.5
+    assert cfg.fcitx_commit_timeout_ms == 2500
     assert cfg.allow_x11_paste_fallback is False
     assert cfg.inference == InferenceConfig(
-        device="cpu", dtype="fp32", gpu_memory_utilization=0.8, enforce_eager=False
+        device="xpu:0",
+        dtype="bf16",
+        gpu_memory_utilization=0.2,
+        max_model_len=1024,
+        idle_unload_seconds=90,
+        allow_sensevoice_fallback=False,
+        enforce_eager=False,
     )
+
+
+def test_load_config_rejects_non_xpu_inference_device(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[inference]\ndevice = "cpu"\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="xpu:0"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("gpu_memory_utilization", "0.09", "0.10"),
+        ("gpu_memory_utilization", "0.21", "0.20"),
+        ("max_model_len", "1023", "1024"),
+        ("max_model_len", "1537", "1536"),
+        ("idle_unload_seconds", "29", "30"),
+        ("idle_unload_seconds", "301", "300"),
+    ],
+)
+def test_load_config_rejects_unsafe_model_lifecycle_bounds(
+    tmp_path: Path, key: str, value: str, message: str
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(f"[inference]\n{key} = {value}\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
+def test_enhanced_inference_rejects_non_xpu_corrector() -> None:
+    with pytest.raises(ConfigError, match="correction.device must be 'xpu:0'"):
+        config_module.validate_enhanced_inference_config(
+            config_module.EnhancedInferenceConfig(correction_device="cpu")
+        )
+
+
+def test_enhanced_inference_uses_low_kv_bounds_for_qwen() -> None:
+    value = config_module.validate_enhanced_inference_config(
+        config_module.EnhancedInferenceConfig()
+    )
+
+    assert value.correction_gpu_memory_utilization == 0.15
+    assert value.correction_max_model_len == 1536
+    assert value.enabled is True
+
+    with pytest.raises(ConfigError, match="correction.gpu_memory_utilization"):
+        config_module.validate_enhanced_inference_config(
+            config_module.EnhancedInferenceConfig(
+                correction_gpu_memory_utilization=0.25
+            )
+        )
+
+
+def test_load_config_rejects_non_positive_commit_timeout(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[input_method]\ncommit_timeout_ms = 0\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="commit_timeout_ms"):
+        load_config(path)
 
 
 def test_load_config_ignores_unknown_sections(tmp_path: Path) -> None:

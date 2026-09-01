@@ -1,11 +1,11 @@
 """Voice daemon: state machine, capture→worker→output pipeline, and socket server.
 
-The daemon owns the whole push-to-talk lifecycle. It listens on
+The daemon owns the whole push-to-talk lifecycle. An in-process X11 listener
+delivers the ``Super+C`` press/release lifecycle. It also listens on
 ``$XDG_RUNTIME_DIR/fun-voice-ryan/daemon.sock`` (mode ``0600``, same-uid
-``SO_PEERCRED`` gated) for single-line JSON requests from the bridge:
+``SO_PEERCRED`` gated) for diagnostics and local integration requests:
 
-    {"op": "start_if_idle"}   -> start recording if idle (ignore otherwise)
-    {"op": "stop"}            -> stop recording and run the pipeline
+    {"op": "diagnostics"}     -> return non-sensitive hotkey readiness booleans
 
 The pipeline is strictly linear: stop capture, transcribe via the worker, then
 route the text to the desktop (clipboard mirror first, then Fcitx commit with a
@@ -55,12 +55,15 @@ from fun_voice.contracts import (
     decode_message,
     encode_message,
 )
+from fun_voice.corrector import CorrectionError, OnDemandQwenCorrector
 from fun_voice.desktop import (
     ClipboardError,
     ClipboardMirror,
     Runner,
     X11Error,
     X11FocusGuard,
+    X11HotkeyListener,
+    X11HotkeyUnavailable,
     XTestError,
     XTestInjector,
     default_runner,
@@ -84,21 +87,18 @@ NOTIFY_LIMIT_REACHED = "已达到 30 分钟录音上限，开始识别"
 
 # The worker may need up to its 120s inference timeout; leave margin.
 WORKER_RESPONSE_TIMEOUT_SECONDS = 130.0
-FUN_VOICE_WORKER_SERVICE = "fun-voice-worker.service"
+WORKER_STARTUP_TIMEOUT_SECONDS = 15.0
+WORKER_STARTUP_POLL_SECONDS = 0.05
+WORKER_TEMPLATE = "fun-voice-worker@{}.service"
 SOCKET_BACKLOG = 4
 REQUEST_READ_TIMEOUT_SECONDS = 10.0
 STOP_LOCK_TIMEOUT_SECONDS = 2.0
+HOTKEY_UNAVAILABLE_EXIT = 2
 
-# Hold-to-talk confirmation: after the bridge reports C down, the daemon must
-# confirm C is still physically held within this window before recording.
+# Hold-to-talk confirmation: after an X11 press event, the daemon confirms C
+# is still physically held within this window before recording.
 C_CONFIRM_TIMEOUT_SECONDS = 0.5
 C_CONFIRM_POLL_SECONDS = 0.05
-
-# Release detection during RECORDING: the bridge only reports a press (DDE
-# gives no release event), so the daemon polls the physical C key on a short
-# cadence and stops once it has read "up" continuously for this long.
-C_RELEASE_CONFIRM_SECONDS = 0.025
-C_RELEASE_POLL_SECONDS = 0.01
 
 
 # --- Structured worker errors ------------------------------------------------
@@ -136,6 +136,7 @@ _ALLOWED_WORKER_CODES = frozenset(
         "internal",
         "protocol",
         "unavailable",
+        "model_load",
     }
 )
 
@@ -202,6 +203,22 @@ class WorkerClient(Protocol):
     def close(self) -> None: ...
 
 
+class TextCorrector(Protocol):
+    """A text-only candidate corrector; it never owns ASR state."""
+
+    def correct(self, raw_text: str) -> str: ...
+
+    def close(self) -> None: ...
+
+
+class HotkeyLifecycle(Protocol):
+    """Owns the X11 hotkey registration and event-loop lifetime."""
+
+    def start(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class _NullFcitx:
     """No-op Fcitx stand-in used when the client cannot be constructed."""
 
@@ -230,7 +247,7 @@ class _DisabledInjector:
 
 
 class NotifySendNotifier:
-    """Best-effort DDE notification via ``notify-send`` (org.freedesktop.Notifications).
+    """Best-effort desktop notification via ``notify-send``.
 
     Notification failure must never break the pipeline, so every call swallows
     its own errors.
@@ -255,25 +272,47 @@ class NotifySendNotifier:
 # --- Worker client (socket) --------------------------------------------------
 
 
-def default_start_worker_service() -> None:
-    """Best-effort, idempotent start of the worker user service."""
+def worker_service_name(profile: str) -> str:
+    """Return the non-enabled systemd template instance for an ASR profile."""
+    if profile not in {"nano", "sensevoice"}:
+        raise ValueError(f"unsupported worker profile: {profile}")
+    return WORKER_TEMPLATE.format(profile)
+
+
+def default_start_worker_service(profile: str = "nano") -> None:
+    """Best-effort start of one on-demand model-worker template instance."""
+    service = worker_service_name(profile)
     try:
         subprocess.run(
-            ["systemctl", "--user", "start", FUN_VOICE_WORKER_SERVICE],
+            ["systemctl", "--user", "start", service],
             check=False,
             capture_output=True,
             timeout=10.0,
         )
     except (OSError, subprocess.TimeoutExpired):
-        logger.warning("could not start %s", FUN_VOICE_WORKER_SERVICE)
+        logger.warning("could not start %s", service)
+
+
+def default_stop_worker_service(profile: str = "nano") -> None:
+    """Best-effort stop used before switching an OOM Nano request to fallback."""
+    service = worker_service_name(profile)
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "stop", service],
+            check=False,
+            capture_output=True,
+            timeout=30.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("could not stop %s", service)
 
 
 class SocketWorkerClient:
     """Speaks the worker's single-line JSON protocol over a Unix socket.
 
-    Opens a fresh connection per request and starts the worker user service
-    once (best-effort, idempotent) before a single retry when the socket is
-    unreachable.
+    Opens a fresh connection per request. When its socket is unreachable it
+    starts the assigned user service and polls for a successful request, so a
+    model-worker process has time to bind its private socket.
     """
 
     def __init__(
@@ -282,12 +321,18 @@ class SocketWorkerClient:
         *,
         timeout: float = WORKER_RESPONSE_TIMEOUT_SECONDS,
         start_service: Callable[[], None] | None = None,
+        startup_timeout: float = WORKER_STARTUP_TIMEOUT_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._socket_path = Path(socket_path)
         self._timeout = timeout
         self._start_service = (
             start_service if start_service is not None else default_start_worker_service
         )
+        self._startup_timeout = startup_timeout
+        self._monotonic = monotonic
+        self._sleep = sleep
 
     def transcribe(self, artifact: CaptureArtifact) -> Transcription:
         request = {
@@ -296,15 +341,23 @@ class SocketWorkerClient:
             "audio": artifact.audio,
             "sample_rate": artifact.sample_rate,
         }
-        last: _WorkerConnectFailure | None = None
-        for attempt in (0, 1):
+        try:
+            return self._parse_response(self._round_trip(request))
+        except _WorkerConnectFailure as first_failure:
+            self._start_service()
+            return self._wait_for_worker(request, first_failure)
+
+    def _wait_for_worker(
+        self, request: Mapping[str, Any], first_failure: _WorkerConnectFailure
+    ) -> Transcription:
+        deadline = self._monotonic() + self._startup_timeout
+        last = first_failure
+        while self._monotonic() < deadline:
             try:
-                response = self._round_trip(request)
-                return self._parse_response(response)
+                return self._parse_response(self._round_trip(request))
             except _WorkerConnectFailure as exc:
                 last = exc
-                if attempt == 0:
-                    self._start_service()
+                self._sleep(WORKER_STARTUP_POLL_SECONDS)
         raise WorkerError(ErrorCode("worker", "unavailable"), str(last))
 
     def close(self) -> None:
@@ -354,6 +407,34 @@ class SocketWorkerClient:
         raise WorkerError(code, detail)
 
 
+class FallbackWorkerClient:
+    """Use SenseVoiceSmall only when Nano could not load or exhausted XPU."""
+
+    def __init__(
+        self,
+        nano: WorkerClient,
+        sensevoice: WorkerClient,
+        *,
+        stop_primary: Callable[[], None],
+    ) -> None:
+        self._nano = nano
+        self._sensevoice = sensevoice
+        self._stop_primary = stop_primary
+
+    def transcribe(self, artifact: CaptureArtifact) -> Transcription:
+        try:
+            return self._nano.transcribe(artifact)
+        except WorkerError as exc:
+            if exc.code.code not in {"model_load", "oom"}:
+                raise
+            self._stop_primary()
+            return self._sensevoice.transcribe(artifact)
+
+    def close(self) -> None:
+        self._nano.close()
+        self._sensevoice.close()
+
+
 # --- Per-session state -------------------------------------------------------
 
 
@@ -382,6 +463,7 @@ class VoiceDaemon:
         injector: InjectorLike,
         notifier: Notifier,
         worker: WorkerClient,
+        corrector: TextCorrector | None = None,
         auto_stop_event: threading.Event | None = None,
         capture_config: CaptureConfig | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -394,6 +476,7 @@ class VoiceDaemon:
         self._injector = injector
         self._notifier = notifier
         self._worker = worker
+        self._corrector = corrector
         self._auto_stop_event = auto_stop_event
         self._capture_config = (
             capture_config if capture_config is not None else CaptureConfig()
@@ -403,7 +486,10 @@ class VoiceDaemon:
         self._state = DaemonState.IDLE
         self._session: _Session | None = None
         self._lock = threading.Lock()
-        self._c_up_since: float | None = None
+        # Ephemeral X11 hotkey evidence. It is deliberately only booleans:
+        # no timestamp, audio, text, focus snapshot, or Fcitx token is retained.
+        self._hotkey_registered = False
+        self._hotkey_press_seen = False
 
     @property
     def state(self) -> DaemonState:
@@ -411,7 +497,7 @@ class VoiceDaemon:
 
     # --- Requests ------------------------------------------------------------
 
-    def dispatch(self, message: Mapping[str, Any]) -> str:
+    def dispatch(self, message: Mapping[str, Any]) -> str | dict[str, bool]:
         try:
             op = message.get("op")
             if op == "start_if_idle":
@@ -419,6 +505,8 @@ class VoiceDaemon:
             if op == "stop":
                 self.stop()
                 return "ok"
+            if op == "diagnostics":
+                return self.diagnostics()
             logger.warning("ignoring unknown op: %r", op)
             return "error"
         except Exception as exc:
@@ -426,6 +514,26 @@ class VoiceDaemon:
             logger.error("dispatch failed: %s", type(exc).__name__)
             self._notify(NOTIFY_RECOGNITION_FAILED.format(category="internal"))
             return "error"
+
+    def diagnostics(self) -> dict[str, bool]:
+        """Return non-sensitive, process-lifetime X11 hotkey evidence."""
+        return {
+            "hotkey_registered": self._hotkey_registered,
+            "hotkey_press_seen": self._hotkey_press_seen,
+        }
+
+    def mark_hotkey_registered(self) -> None:
+        """Record a successfully installed X11 grab without retaining event data."""
+        self._hotkey_registered = True
+
+    def handle_hotkey_press(self) -> str:
+        """Handle a real matching X11 KeyPress and start recording if idle."""
+        self._hotkey_press_seen = True
+        return self.start_if_idle()
+
+    def handle_hotkey_release(self) -> None:
+        """Handle a matching KeyRelease without blocking the X11 event loop."""
+        threading.Thread(target=self.stop, daemon=True, name="hotkey-stop").start()
 
     def start_if_idle(self) -> str:
         """Start recording if idle; ``"started"`` / ``"busy"`` / ``"error"`` /
@@ -437,14 +545,6 @@ class VoiceDaemon:
             if self._state is not DaemonState.IDLE:
                 logger.info("start_if_idle ignored: state=%s", self._state.value)
                 return "busy"
-
-            # Hold-phase POC diagnostic: record the live C-key state at trigger
-            # time (no transcription or audio content is ever logged).
-            try:
-                c_down = self._guard.c_is_down()
-            except X11Error:
-                c_down = False
-            logger.info("c_pressed_at_trigger=%s", "true" if c_down else "false")
 
             try:
                 snapshot = self._guard.capture()
@@ -512,7 +612,7 @@ class VoiceDaemon:
             self._sleep(C_CONFIRM_POLL_SECONDS)
 
     def stop(self) -> None:
-        """Handle a bridge ``stop`` (key released); only acts while RECORDING.
+        """Handle a hotkey release; only acts while ``RECORDING``.
 
         Uses a bounded blocking acquire so a ``stop`` arriving while ``start``
         still holds the lock (e.g. during ``fcitx.start_focus``) waits for it
@@ -533,44 +633,6 @@ class VoiceDaemon:
         """Notify and transcribe; caller holds the lock and observed RECORDING."""
         self._notify(NOTIFY_TRANSCRIBING)
         self._transcribe_and_commit()
-
-    def poll_c_release(self) -> None:
-        """Sample the physical C key once and stop on a sustained release.
-
-        Runs on the server's release-poller thread every ~10 ms while RECORDING.
-        Acquires the state-machine lock non-blocking so it never races a
-        concurrent stop/start on the shared X11 display (skipping the sample
-        while the lock is busy). A confirmed release — ``C_RELEASE_CONFIRM_SECONDS``
-        of continuous "up", measured from the first up read — stops recording
-        exactly like the bridge. An X11 query failure aborts back to IDLE with a
-        notification and never injects.
-        """
-        if not self._lock.acquire(blocking=False):
-            return
-        try:
-            if self._state is not DaemonState.RECORDING:
-                return
-            try:
-                down = self._guard.c_is_down()
-            except X11Error:
-                self._c_up_since = None
-                logger.warning("recording aborted: X11 key state unavailable")
-                self._cleanup()
-                self._notify(NOTIFY_RECOGNITION_FAILED.format(category="x11"))
-                return
-            if down:
-                self._c_up_since = None
-                return
-            now = self._monotonic()
-            if self._c_up_since is None:
-                self._c_up_since = now
-                return
-            if now - self._c_up_since >= C_RELEASE_CONFIRM_SECONDS:
-                self._c_up_since = None
-                logger.info("C released (poll-confirmed); stopping recording")
-                self._stop_locked()
-        finally:
-            self._lock.release()
 
     def handle_auto_stop(self) -> None:
         """Handle the recorder's 30-minute auto-stop (limit reached)."""
@@ -599,6 +661,9 @@ class VoiceDaemon:
             self._cleanup()
             with contextlib.suppress(Exception):
                 self._worker.close()
+            if self._corrector is not None:
+                with contextlib.suppress(Exception):
+                    self._corrector.close()
         finally:
             self._lock.release()
 
@@ -631,6 +696,20 @@ class VoiceDaemon:
             if not text:
                 self._notify(NOTIFY_EMPTY_SPEECH)
                 return
+
+            corrector = self._corrector
+            if corrector is not None:
+                try:
+                    candidate = corrector.correct(text)
+                    if candidate:
+                        text = candidate
+                except CorrectionError as exc:
+                    # The raw ASR result remains the safe final output.  Keep
+                    # the code-only log and avoid an extra desktop notification
+                    # for every transient model failure.
+                    logger.warning("correction unavailable: %s", exc.code)
+                except Exception as exc:  # noqa: BLE001 - raw text is resilient
+                    logger.warning("correction unavailable: %s", type(exc).__name__)
 
             self._state = DaemonState.COMMITTING
             logger.info("state -> committing")
@@ -736,7 +815,6 @@ class VoiceDaemon:
         if session is not None:
             with contextlib.suppress(Exception):
                 session.fcitx.close()
-        self._c_up_since = None
         self._state = DaemonState.IDLE
 
     def _notify(self, message: str) -> None:
@@ -803,9 +881,14 @@ class DaemonRequestHandler(socketserver.StreamRequestHandler):
             message = decode_message(line)
         except ProtocolError:
             return
-        status = server.daemon.dispatch(message)
+        result = server.daemon.dispatch(message)
+        response: dict[str, Any]
+        if isinstance(result, Mapping):
+            response = {"status": "ok", **result}
+        else:
+            response = {"status": result}
         with contextlib.suppress(OSError):
-            conn.sendall(encode_message({"status": status}) + b"\n")
+            conn.sendall(encode_message(response) + b"\n")
 
 
 class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -835,7 +918,6 @@ class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.uid = os.getuid() if uid is None else uid
         self.socket_path = socket_path
         self._auto_stop_event = auto_stop_event
-        self._release_poller: threading.Thread | None = None
         self.allow_reuse_address = True
         self.request_queue_size = SOCKET_BACKLOG
         super().__init__(str(socket_path), DaemonRequestHandler)
@@ -847,10 +929,9 @@ class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     def service_actions(self) -> None:
         """Run the main-loop side effects every ``poll_interval`` tick.
 
-        Polls the recorder's 30-minute auto-stop signal and keeps a single
-        release-poller thread alive while RECORDING. Both pipeline actions run
-        off the accept loop so it never blocks on transcription; the state
-        machine lock serializes them against any concurrent request.
+        Polls the recorder's 30-minute auto-stop signal. The pipeline action
+        runs off the accept loop so it never blocks on transcription; the state
+        machine lock serializes it against concurrent local requests.
         """
         event = self._auto_stop_event
         if event is not None and event.is_set():
@@ -859,24 +940,6 @@ class DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                 target=self.daemon.handle_auto_stop, daemon=True
             )
             thread.start()
-        self._ensure_release_poller()
-
-    def _ensure_release_poller(self) -> None:
-        """Start the C-release poller when recording and not already running."""
-        if self.daemon.state is not DaemonState.RECORDING:
-            return
-        poller = self._release_poller
-        if poller is not None and poller.is_alive():
-            return
-        self._release_poller = threading.Thread(
-            target=self._poll_c_release_loop, daemon=True, name="c-release-poller"
-        )
-        self._release_poller.start()
-
-    def _poll_c_release_loop(self) -> None:
-        while self.daemon.state is DaemonState.RECORDING:
-            self.daemon.poll_c_release()
-            time.sleep(C_RELEASE_POLL_SECONDS)
 
 
 def _unlink_socket(path: Path) -> None:
@@ -900,27 +963,47 @@ def serve(
     *,
     uid: int | None = None,
     auto_stop_event: threading.Event | None = None,
+    hotkey_listener: HotkeyLifecycle | None = None,
 ) -> int:
-    """Run the daemon socket server until SIGTERM/SIGINT, cleaning up on exit."""
+    """Run the daemon socket server until SIGTERM/SIGINT, cleaning up on exit.
+
+    The X11 hotkey is acquired before binding the control socket. A failed
+    exclusive grab means no push-to-talk input exists, so the daemon exits
+    rather than silently falling back to a competing registration mechanism.
+    """
     _unlink_socket(socket_path)
-    server = DaemonServer(
-        socket_path, daemon, uid=uid, auto_stop_event=auto_stop_event
-    )
+    server: DaemonServer | None = None
+    listener_started = False
 
     def _stop(signum: int, frame: object) -> None:
         raise _ShutdownRequested(signum)
 
     previous: dict[int, Any] = {}
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        with contextlib.suppress(ValueError, OSError):
-            previous[signum] = signal.signal(signum, _stop)
     try:
+        if hotkey_listener is not None:
+            try:
+                hotkey_listener.start()
+            except X11HotkeyUnavailable as exc:
+                logger.error("X11 hotkey unavailable: %s", exc)
+                return HOTKEY_UNAVAILABLE_EXIT
+            listener_started = True
+            daemon.mark_hotkey_registered()
+
+        server = DaemonServer(
+            socket_path, daemon, uid=uid, auto_stop_event=auto_stop_event
+        )
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(ValueError, OSError):
+                previous[signum] = signal.signal(signum, _stop)
         logger.info("daemon listening on %s", socket_path)
         server.serve_forever(poll_interval=0.1)
     except _ShutdownRequested:
         logger.info("shutdown requested")
     finally:
-        server.server_close()
+        if listener_started and hotkey_listener is not None:
+            hotkey_listener.close()
+        if server is not None:
+            server.server_close()
         daemon.shutdown()
         _unlink_socket(socket_path)
         for saved, handler in previous.items():
@@ -930,7 +1013,7 @@ def serve(
 
 def build_fcitx_factory(cfg: config.Config) -> Callable[[], FcitxClient]:
     """Return the Fcitx client factory implied by the configuration."""
-    return functools.partial(FcitxClient, timeout=cfg.fcitx_commit_timeout_ms)
+    return functools.partial(FcitxClient, timeout=cfg.fcitx_commit_timeout_ms / 1000)
 
 
 def build_injector(cfg: config.Config, guard: X11FocusGuard) -> InjectorLike:
@@ -985,6 +1068,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_dir=paths.runtime_dir,
     )
     guard = X11FocusGuard()
+    nano_worker = SocketWorkerClient(
+        paths.worker_socket,
+        start_service=functools.partial(default_start_worker_service, "nano"),
+    )
+    worker: WorkerClient = nano_worker
+    if cfg.inference.allow_sensevoice_fallback:
+        sensevoice_worker = SocketWorkerClient(
+            paths.runtime_dir / "worker-sensevoice.sock",
+            start_service=functools.partial(
+                default_start_worker_service, "sensevoice"
+            ),
+        )
+        worker = FallbackWorkerClient(
+            nano_worker,
+            sensevoice_worker,
+            stop_primary=functools.partial(default_stop_worker_service, "nano"),
+        )
+    corrector: TextCorrector | None = None
+    if cfg.enhanced.enabled:
+        corrector = OnDemandQwenCorrector()
     daemon = VoiceDaemon(
         guard=guard,
         recorder=recorder,
@@ -992,11 +1095,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         clipboard=ClipboardMirror(),
         injector=build_injector(cfg, guard),
         notifier=notifier,
-        worker=SocketWorkerClient(paths.worker_socket),
+        worker=worker,
+        corrector=corrector,
         auto_stop_event=auto_stop_event,
         capture_config=CaptureConfig(source=cfg.audio_source),
     )
-    return serve(paths.daemon_socket, daemon, auto_stop_event=auto_stop_event)
+    hotkey_listener = X11HotkeyListener(
+        daemon.handle_hotkey_press,
+        daemon.handle_hotkey_release,
+    )
+    return serve(
+        paths.daemon_socket,
+        daemon,
+        auto_stop_event=auto_stop_event,
+        hotkey_listener=hotkey_listener,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -23,11 +23,23 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from fun_voice.nano_runtime import (
+    VAD_MAX_SINGLE_SEGMENT_TIME_MS,
+    FsmnVadSegmenter,
+    ModelOutputError,
+    _load_audio_samples,
+    _slice_windows,
+)
+
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
 
 EXPECTED_DEVICE_TYPE = "xpu"
 DEVICE = "xpu:0"
+SAMPLE_RATE = 16000
+
 
 # The nine hard gates, in canonical order.
 CHECK_NAMES: tuple[str, ...] = (
@@ -48,6 +60,10 @@ DECODE_TOKENS_10S = 128
 DECODE_TOKENS_60S = 256
 RECOVERY_TOKENS = 64
 PROBE_BYTES = 1 << 20  # 1 MiB allocator probe
+
+# Hard gate 5: a 60 s sample must VAD-segment into multiple speech segments
+# (the POC sample inserts >=0.3 s silence between fragments to guarantee this).
+MIN_SEGMENTS_60S = 2
 
 # Worker health probe (only exercised with --require-live-worker).
 WORKER_SOCKET_RELATIVE = "fun-voice-ryan/worker.sock"
@@ -213,22 +229,74 @@ def check_module_on_device(
     )
 
 
+def _transcribe_segmented(
+    engine: Any,
+    vad: Any,
+    samples: np.ndarray,
+    *,
+    max_new_tokens: int,
+    sample_rate: int = SAMPLE_RATE,
+) -> tuple[str, list[tuple[int, int]]]:
+    """VAD-segment → time-sort → overlap-slice → per-segment ASR → concat.
+
+    Mirrors ``nano_runtime.NanoRuntime._transcribe_impl``: segments are sorted
+    by onset, each is sliced with the same fixed overlap (``VAD_OVERLAP_MS``),
+    fed to the Nano engine as one batch, and the per-segment texts are joined
+    verbatim in segment order. Returns ``(text, sorted_regions)``; the regions
+    keep the raw VAD ``(start_ms, end_ms)`` boundaries (overlap is applied to
+    audio only, never to the reported times).
+    """
+    regions: list[tuple[int, int]] = vad.detect(samples, sample_rate)
+    regions = sorted(regions, key=lambda region: region[0])
+    if not regions:
+        return "", regions
+    windows = _slice_windows(regions, len(samples), sample_rate)
+    slices = [samples[start:end] for start, end in windows]
+    results = engine.generate(slices, max_new_tokens=max_new_tokens)
+    if not isinstance(results, list) or len(results) != len(slices):
+        raise ModelOutputError("model result count does not match VAD segments")
+    texts: list[str] = []
+    for result in results:
+        if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+            raise ModelOutputError("malformed model result")
+        texts.append(result["text"])
+    return "".join(texts), regions
+
+
 def check_decode(
-    name: str, engine: Any, sample_path: str | Path, *, max_new_tokens: int
+    name: str,
+    engine: Any,
+    vad: Any,
+    sample_path: str | Path,
+    *,
+    max_new_tokens: int,
+    min_segments: int = 1,
+    sample_rate: int = SAMPLE_RATE,
 ) -> CheckResult:
+    """Decode one sample through the real VAD-segmented path (hard gates 6/7).
+
+    Privacy: only ``segment_count`` and ``text_length`` are reported, never the
+    transcription text or the audio path.
+    """
     try:
-        results = engine.generate([str(sample_path)], max_new_tokens=max_new_tokens)
+        samples = _load_audio_samples(str(sample_path), sample_rate)
+        text, regions = _transcribe_segmented(
+            engine,
+            vad,
+            samples,
+            max_new_tokens=max_new_tokens,
+            sample_rate=sample_rate,
+        )
     except Exception as exc:
         return CheckResult(name, STATUS_FAIL, {"error_class": type(exc).__name__})
-    if not results:
-        return CheckResult(name, STATUS_FAIL, {"reason": "no results returned"})
-    first = results[0]
-    text = first.get("text", "") if isinstance(first, dict) else ""
-    return CheckResult(
-        name,
-        STATUS_PASS if text else STATUS_FAIL,
-        {"result_count": len(results), "text_length": len(text)},
-    )
+    detail: dict[str, Any] = {
+        "segment_count": len(regions),
+        "text_length": len(text),
+    }
+    ok = bool(text) and len(regions) >= min_segments
+    if not ok and len(regions) < min_segments:
+        detail["min_segments"] = min_segments
+    return CheckResult(name, STATUS_PASS if ok else STATUS_FAIL, detail)
 
 
 def check_no_cpu_fallback(engine: Any) -> CheckResult:
@@ -376,6 +444,7 @@ def run_preflight(
     *,
     torch: Any,
     engine: Any,
+    vad: Any,
     short_sample: str | Path,
     long_sample: str | Path,
     device: str = DEVICE,
@@ -394,10 +463,15 @@ def run_preflight(
         check_module_on_device("nano_adaptor_xpu", engine.audio_adaptor),
         check_module_on_device("prompt_embeddings_xpu", engine.embed_tokens),
         check_decode(
-            "decode_10s", engine, short_sample, max_new_tokens=DECODE_TOKENS_10S
+            "decode_10s", engine, vad, short_sample, max_new_tokens=DECODE_TOKENS_10S
         ),
         check_decode(
-            "decode_60s", engine, long_sample, max_new_tokens=DECODE_TOKENS_60S
+            "decode_60s",
+            engine,
+            vad,
+            long_sample,
+            max_new_tokens=DECODE_TOKENS_60S,
+            min_segments=MIN_SEGMENTS_60S,
         ),
         check_no_cpu_fallback(engine),
         check_oom_survives(engine, torch, short_sample, device=device),
@@ -419,8 +493,8 @@ def load_nano_engine(
     device: str = DEVICE,
     dtype: str = "bf16",
     tensor_parallel_size: int = 1,
-    gpu_memory_utilization: float = 0.35,
-    max_model_len: int = 4096,
+    gpu_memory_utilization: float = 0.15,
+    max_model_len: int = 1536,
     enforce_eager: bool = True,
     attention_backend: str = "TRITON_ATTN",
 ) -> Any:
@@ -446,6 +520,31 @@ def load_nano_engine(
     )
 
 
+def load_vad(device: str = DEVICE) -> FsmnVadSegmenter:
+    """Load the local FSMN-VAD once on the requested XPU device.
+
+    Points ModelScope at the same local model cache that
+    ``scripts/run-nano-xpu-poc.sh`` populates, then wraps the model in the
+    runtime's :class:`~fun_voice.nano_runtime.FsmnVadSegmenter` adapter.
+    """
+    from fun_voice.nano_runtime import models_root
+
+    os.environ.setdefault("MODELSCOPE_CACHE", str(models_root()))
+    from funasr import AutoModel
+
+    vad_snapshot = (
+        models_root()
+        / "models/iic--speech_fsmn_vad_zh-cn-16k-common-pytorch/snapshots/master"
+    )
+    model = AutoModel(
+        model=str(vad_snapshot),
+        device=device,
+        disable_update=True,
+        max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
+    )
+    return FsmnVadSegmenter(model)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fun-voice-preflight",
@@ -459,14 +558,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", required=True, help="JSON report output path")
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--dtype", default="bf16")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.35)
-    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.15)
+    parser.add_argument("--max-model-len", type=int, default=1536)
     parser.add_argument(
         "--require-live-worker",
         action="store_true",
         help="also probe the live worker socket and require a healthy response",
     )
     return parser
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
@@ -483,9 +583,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
         )
+        vad = load_vad(device=args.device)
         report = run_preflight(
             torch=torch,
             engine=engine,
+            vad=vad,
             short_sample=args.short,
             long_sample=args.long,
             device=args.device,

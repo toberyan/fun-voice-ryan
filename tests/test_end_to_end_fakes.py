@@ -1,10 +1,9 @@
-"""End-to-end fake tests: daemon pipeline, bridge, socket server, worker client.
+"""End-to-end fake tests: daemon pipeline, socket server, worker client.
 
 Every external boundary is a fake, but the tests exercise the real wiring: the
 ``VoiceDaemon`` state machine driven through its public surface, the real
-``DaemonServer`` over an actual AF_UNIX socket, the real ``SocketWorkerClient``
-against an in-process worker socket, and the bridge's ``send_request`` against
-an in-process daemon socket.
+``DaemonServer`` over an actual AF_UNIX socket, and the real
+``SocketWorkerClient`` against an in-process worker socket.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from typing import Any
 import pytest
 
 from fun_voice import daemon as daemon_mod
-from fun_voice.bridge import send_request
 from fun_voice.capture import CaptureError
 from fun_voice.contracts import (
     FCITX_CHUNK_MAX_BYTES,
@@ -41,12 +39,17 @@ from fun_voice.daemon import (
     NOTIFY_RESULT_LOST,
     DaemonServer,
     EmptySpeechError,
+    FallbackWorkerClient,
     SocketWorkerClient,
     VoiceDaemon,
     WorkerError,
     peer_uid,
 )
-from fun_voice.desktop import ClipboardError, X11Error, XTestError
+from fun_voice.desktop import (
+    ClipboardError,
+    X11Error,
+    XTestError,
+)
 from fun_voice.fcitx import FcitxCommitError
 
 ARTIFACT = CaptureArtifact(
@@ -430,94 +433,6 @@ def test_no_token_records_and_uses_xtest_only() -> None:
     assert h.clipboard.writes == ["你好"]
 
 
-# --- Bridge ------------------------------------------------------------------
-
-
-class _BridgeGuard:
-    def __init__(self, c_down: bool, error: X11Error | None = None) -> None:
-        self.c_down = c_down
-        self.error = error
-
-    def c_is_down(self) -> bool:
-        if self.error is not None:
-            raise self.error
-        return self.c_down
-
-
-class _LineServer:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.lines: list[bytes] = []
-        self._received = threading.Event()
-        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._server.bind(str(path))
-        self._server.listen(1)
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                conn, _ = self._server.accept()
-            except OSError:
-                return
-            with conn:
-                conn.settimeout(2.0)
-                data = bytearray()
-                while b"\n" not in data:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data.extend(chunk)
-                if data:
-                    self.lines.append(bytes(data).rstrip(b"\n"))
-                    self._received.set()
-
-    def wait_for_line(self, timeout: float = 2.0) -> None:
-        self._received.wait(timeout)
-
-    def close(self) -> None:
-        self._server.close()
-        self._thread.join(timeout=2.0)
-
-
-def test_bridge_c_down_sends_start_if_idle(tmp_path: Path) -> None:
-    server = _LineServer(tmp_path / "daemon.sock")
-    try:
-        assert send_request(_BridgeGuard(c_down=True), server.path) == 0
-        server.wait_for_line()
-        assert server.lines == [b'{"op":"start_if_idle"}']
-    finally:
-        server.close()
-
-
-def test_bridge_c_up_sends_stop(tmp_path: Path) -> None:
-    server = _LineServer(tmp_path / "daemon.sock")
-    try:
-        assert send_request(_BridgeGuard(c_down=False), server.path) == 0
-        server.wait_for_line()
-        assert server.lines == [b'{"op":"stop"}']
-    finally:
-        server.close()
-
-
-def test_bridge_connection_failure_exits_nonzero(tmp_path: Path) -> None:
-    missing = tmp_path / "no-such.sock"
-    assert send_request(_BridgeGuard(c_down=True), missing) == 1
-
-
-def test_bridge_x11_failure_exits_nonzero(tmp_path: Path) -> None:
-    server = _LineServer(tmp_path / "daemon.sock")
-    try:
-        assert (
-            send_request(_BridgeGuard(c_down=True, error=X11Error("no X")), server.path)
-            == 1
-        )
-        assert server.lines == []
-    finally:
-        server.close()
-
-
 # --- Daemon socket server ----------------------------------------------------
 
 
@@ -591,6 +506,22 @@ def _request(path: Path, message: dict[str, str], timeout: float = 2.0) -> dict:
                 break
             data.extend(chunk)
     return json.loads(bytes(data).decode("utf-8"))
+
+
+def test_daemon_diagnostics_over_socket(running_server) -> None:
+    _server, h, path = running_server
+    assert _request(path, {"op": "diagnostics"}) == {
+        "status": "ok",
+        "hotkey_registered": False,
+        "hotkey_press_seen": False,
+    }
+    h.daemon.mark_hotkey_registered()
+    assert h.daemon.handle_hotkey_press() == "started"
+    assert _request(path, {"op": "diagnostics"}) == {
+        "status": "ok",
+        "hotkey_registered": True,
+        "hotkey_press_seen": True,
+    }
 
 
 class BlockingWorker:
@@ -785,12 +716,79 @@ def test_worker_client_unavailable_after_retry(tmp_path: Path) -> None:
     path = tmp_path / "worker.sock"
     starts: list[None] = []
     client = SocketWorkerClient(
-        path, timeout=0.2, start_service=lambda: starts.append(None)
+        path,
+        timeout=0.2,
+        start_service=lambda: starts.append(None),
+        startup_timeout=0.1,
     )
     with pytest.raises(WorkerError) as excinfo:
         client.transcribe(ARTIFACT)
     assert excinfo.value.code == ErrorCode("worker", "unavailable")
     assert starts == [None]
+
+
+def test_worker_client_waits_for_socket_after_start(tmp_path: Path) -> None:
+    path = tmp_path / "worker.sock"
+    holder: dict[str, _WorkerSocket] = {}
+
+    def start_service() -> None:
+        timer = threading.Timer(
+            0.03,
+            lambda: holder.setdefault("server", _WorkerSocket(path, _ok_responder)),
+        )
+        timer.daemon = True
+        timer.start()
+
+    client = SocketWorkerClient(
+        path, timeout=1.0, start_service=start_service, startup_timeout=0.5
+    )
+    try:
+        assert client.transcribe(ARTIFACT).text == "你好"
+    finally:
+        if "server" in holder:
+            holder["server"].close()
+
+
+@pytest.mark.parametrize("code", ("worker.model_load", "worker.oom"))
+def test_fallback_worker_stops_nano_before_using_sensevoice(
+    tmp_path: Path, code: str
+) -> None:
+    nano_path = tmp_path / "nano.sock"
+    sensevoice_path = tmp_path / "sensevoice.sock"
+    nano = _WorkerSocket(nano_path, _error_responder(code))
+    sensevoice = _WorkerSocket(sensevoice_path, _ok_responder)
+    stops: list[str] = []
+    client = FallbackWorkerClient(
+        SocketWorkerClient(nano_path, timeout=1.0),
+        SocketWorkerClient(sensevoice_path, timeout=1.0),
+        stop_primary=lambda: stops.append("nano"),
+    )
+    try:
+        assert client.transcribe(ARTIFACT).text == "你好"
+        assert stops == ["nano"]
+    finally:
+        nano.close()
+        sensevoice.close()
+
+
+def test_fallback_worker_does_not_switch_on_timeout(tmp_path: Path) -> None:
+    nano_path = tmp_path / "nano.sock"
+    sensevoice_path = tmp_path / "sensevoice.sock"
+    nano = _WorkerSocket(nano_path, _error_responder("worker.timeout"))
+    sensevoice = _WorkerSocket(sensevoice_path, _ok_responder)
+    stops: list[str] = []
+    client = FallbackWorkerClient(
+        SocketWorkerClient(nano_path, timeout=1.0),
+        SocketWorkerClient(sensevoice_path, timeout=1.0),
+        stop_primary=lambda: stops.append("nano"),
+    )
+    try:
+        with pytest.raises(WorkerError, match="boom"):
+            client.transcribe(ARTIFACT)
+        assert stops == []
+    finally:
+        nano.close()
+        sensevoice.close()
 
 
 def test_peer_uid_matches_current_user() -> None:

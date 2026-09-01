@@ -15,6 +15,9 @@
 # 退出码:0=全部硬门通过;非 0=任一失败或环境/样本缺失(绝不静默退回 CPU)。
 
 set -euo pipefail
+# The report and short-lived public sample copies still belong to this user
+# only. This also protects an already existing runtime directory on re-runs.
+umask 077
 MODELS_ROOT="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/models"
 # modelscope 1.39.x 缓存布局:${MODELSCOPE_CACHE}/models/<owner>--<name>/snapshots/<revision>
 NANO_MODEL_DIR="${MODELS_ROOT}/models/FunAudioLLM--Fun-ASR-Nano-2512/snapshots/master"
@@ -60,7 +63,8 @@ RUNTIME_BASE="${XDG_RUNTIME_DIR}/fun-voice-ryan"
 REPORT_DIR="${RUNTIME_BASE}"
 REPORT="${REPORT_DIR}/poc-report.json"
 SAMPLES_DIR="${RUNTIME_BASE}/poc-samples"
-mkdir -p "${REPORT_DIR}" "${SAMPLES_DIR}" || die "无法创建 ${REPORT_DIR}"
+mkdir -p -m 700 "${REPORT_DIR}" "${SAMPLES_DIR}" || die "无法创建 ${REPORT_DIR}"
+chmod 700 "${REPORT_DIR}" "${SAMPLES_DIR}" || die "无法保护运行时目录"
 
 cleanup() {
     rm -rf "${SAMPLES_DIR}" 2>/dev/null || true
@@ -114,15 +118,24 @@ else
         dur="$(ffprobe -v error -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 "${norm}")"
         [[ "${dur}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "样本时长探测失败: ${url}"
-        comp+=("{\"source\":\"${url}\",\"language\":\"${lang}\",\"duration_s\":${dur}}")
         norm_files+=("${norm}")
+        printf -v source_json '{"source":"%s","language":"%s","duration_s":%s}' \
+            "${url}" "${lang}" "${dur}"
+        comp+=("${source_json}")
         idx=$((idx + 1))
     done
 
-    # 中英交替拼接列表,循环足够多次覆盖 60s
+    # >=0.3s 静音,插在相邻片段之间,保证 60s 样本在 VAD 下产生多个段
+    # (无缝拼接样本会被 FSMN-VAD 判成单段,无法满足硬门 5)。
+    silence="${SRC_DIR}/silence.wav"
+    ffmpeg -y -v error -f lavfi -i "anullsrc=r=16000:cl=mono" -t 0.4 \
+        -c:a pcm_s16le "${silence}" || die "静音片段生成失败"
+
+    # 中英交替拼接列表,片段之间插入静音,循环足够多次覆盖 60s
     for _ in 0 1 2 3 4 5; do
         for f in "${norm_files[@]}"; do
             printf 'file %s\n' "${f}" >> "${concat_list}"
+            printf 'file %s\n' "${silence}" >> "${concat_list}"
         done
     done
 
@@ -139,7 +152,8 @@ else
         -of default=noprint_wrappers=1:nokey=1 "${SHORT_SAMPLE}")"
     long_dur="$(ffprobe -v error -show_entries format=duration \
         -of default=noprint_wrappers=1:nokey=1 "${LONG_SAMPLE}")"
-    sources_json="[$(IFS=,; echo "${comp[*]}")]"
+    sources_json="$(IFS=,; echo "${comp[*]}")"
+    sources_json="[${sources_json}]"
     printf '{"short":{"duration_s":%s,"sources":%s},"long":{"duration_s":%s,"sources":%s}}\n' \
         "${short_dur}" "${sources_json}" "${long_dur}" "${sources_json}" \
         > "${SAMPLES_DIR}/sample-composition.json"
@@ -157,6 +171,10 @@ PYTHONPATH="${ROOT_DIR}/src" "${PYTHON}" -m fun_voice.preflight \
     --report "${REPORT}"
 preflight_rc=$?
 set -e
+
+if [[ -f "${REPORT}" ]]; then
+    chmod 600 "${REPORT}" || die "无法保护 POC 报告"
+fi
 
 # --- 5. 并入样本构成(仅来源与时长)------------------------------------------
 if [[ -f "${SAMPLES_DIR}/sample-composition.json" ]]; then

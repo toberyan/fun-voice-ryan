@@ -1,40 +1,36 @@
-"""Desktop adapters for DDE Keybinding1, X11 focus/key state, clipboard and XTEST.
+"""Desktop adapters for X11 hotkeys/focus, clipboard and XTEST.
 
 Every external boundary is a replaceable adapter so the daemon state machine can
 depend on small interfaces and be tested with fakes:
 
-- :class:`DdeKeybindingClient` wraps ``busctl --user call`` against the DDE
-  ``org.deepin.dde.Keybinding1`` service (LookupConflictShortcut,
-  AddCustomShortcut, DeleteCustomShortcut). DDE is only ever told to run the
-  bridge command; the model is never invoked by a shortcut action.
+- :class:`X11HotkeyListener` exclusively grabs ``Super+C`` and emits an ordered
+  press/release lifecycle to the daemon.
 - :class:`X11FocusGuard` captures :class:`~fun_voice.contracts.FocusSnapshot`
   (active window, window process, input focus, monotonic timestamp) and reads
   the live ``C`` key state.
-- :class:`HotkeyBridge` turns a DDE action into a ``start_if_idle``/``stop``
-  daemon request based on the live ``C`` key state.
 - :class:`ClipboardMirror` writes UTF-8 text to the CLIPBOARD selection.
 - :class:`XTestInjector` sends a Ctrl+V XTEST sequence, only as a post-Fcitx
   fallback.
 
 No ``/dev/input`` is read anywhere; the push-to-talk hold semantics come from
-DDE triggering plus X11 key state, never from raw keyboard devices.
+X11 keyboard events, never from raw keyboard devices.
 """
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import os
+import logging
+import select
 import shutil
 import subprocess
-import sys
+import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol, cast
 
-from fun_voice.contracts import FocusSnapshot, StartRequest, StopRequest, encode_message
+from fun_voice.contracts import FocusSnapshot
+
+logger = logging.getLogger(__name__)
 
 # --- X11 constants (stable protocol values, no Xlib import needed) -----------
 
@@ -42,8 +38,14 @@ X_ANY_PROPERTY_TYPE = 0  # X.AnyPropertyType
 XK_C = 0x63  # XK_c
 XK_CONTROL_L = 0xFFE3
 XK_V = 0x76  # XK_v
+XK_NUM_LOCK = 0xFF7F
+XK_SCROLL_LOCK = 0xFF14
+XK_SUPER_L = 0xFFEB
+XK_SUPER_R = 0xFFEC
 X_KEY_PRESS = 2
 X_KEY_RELEASE = 3
+X_LOCK_MASK = 1 << 1
+HOTKEY_EVENT_WAIT_SECONDS = 0.1
 
 # --- Errors ------------------------------------------------------------------
 
@@ -52,25 +54,16 @@ class DesktopError(RuntimeError):
     """Base class for desktop adapter errors."""
 
 
-class DdeShortcutConflict(DesktopError):
-    """Raised when the configured hotkey is already owned by another shortcut."""
-
-    def __init__(self, hotkey: str, owner: str) -> None:
-        self.hotkey = hotkey
-        self.owner = owner
-        super().__init__(f"hotkey {hotkey} is already owned by {owner!r}")
-
-
-class DdeKeybindingError(DesktopError):
-    """Raised when a DDE Keybinding1 D-Bus call fails."""
-
-
 class ClipboardError(DesktopError):
     """Raised when the CLIPBOARD selection cannot be written."""
 
 
 class X11Error(DesktopError):
     """Raised when the X11 server cannot answer a focus or key-state query."""
+
+
+class X11HotkeyUnavailable(X11Error):
+    """Raised when the X server cannot exclusively grab ``Super+C``."""
 
 
 class XTestError(DesktopError):
@@ -101,222 +94,23 @@ def default_runner(
     timeout: float | None = None,
 ) -> RunResult:
     """Run a command via subprocess, capturing UTF-8 text output."""
-    proc = subprocess.run(
-        argv, input=input_text, capture_output=True, text=True, timeout=timeout
-    )
-    return proc.returncode, proc.stdout or "", proc.stderr or ""
-
-
-# --- DDE Keybinding1 client --------------------------------------------------
-
-DEFAULT_HOTKEY = "<Super>C"
-DEFAULT_SHORTCUT_NAME = "Fun Voice Ryan — 按住说话"
-
-
-@dataclass(frozen=True)
-class ShortcutInfo:
-    """The subset of a DDE shortcut struct that the client needs."""
-
-    id: str
-    name: str
-    accels: tuple[str, ...]
-
-
-class DdeKeybindingClient:
-    """Client for ``org.deepin.dde.Keybinding1`` over ``busctl --user call``."""
-
-    SERVICE = "org.deepin.dde.Keybinding1"
-    PATH = "/org/deepin/dde/Keybinding1"
-    INTERFACE = "org.deepin.dde.Keybinding1"
-
-    def __init__(self, runner: Runner | None = None) -> None:
-        self._runner: Runner = runner if runner is not None else default_runner
-
-    def _call(self, method: str, signature: str, *args: str) -> str:
-        argv: list[str] = [
-            "busctl",
-            "--user",
-            "call",
-            self.SERVICE,
-            self.PATH,
-            self.INTERFACE,
-            method,
-            signature,
-            *args,
-        ]
-        code, stdout, stderr = self._runner(argv)
-        if code != 0:
-            raise DdeKeybindingError(
-                f"{method} failed (exit {code}): {stderr.strip()}"
-            )
-        return stdout.strip()
-
-    def lookup_conflict(self, hotkey: str) -> str | None:
-        """Return the display name owning ``hotkey``, or ``None`` when free."""
-        out = self._call("LookupConflictShortcut", "s", hotkey)
-        info = parse_shortcut_struct(out)
-        if info is None or not info.accels:
-            return None
-        return info.name or info.id
-
-    def add_custom_shortcut(self, name: str, action: str, hotkey: str) -> str:
-        """Register a custom shortcut and return its DDE shortcut id."""
-        return parse_busctl_string(
-            self._call("AddCustomShortcut", "sss", name, action, hotkey)
+    if argv and argv[0] == "xclip":
+        # xclip forks a background selection owner.  Capturing stderr would
+        # keep ``communicate()`` waiting on that child's inherited pipe until
+        # the clipboard changes, despite the parent having succeeded.
+        proc = subprocess.run(
+            argv,
+            input=input_text,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
         )
-
-    def delete_custom_shortcut(self, shortcut_id: str) -> None:
-        """Remove a custom shortcut by id."""
-        self._call("DeleteCustomShortcut", "s", shortcut_id)
-
-
-# --- busctl output parsing ---------------------------------------------------
-
-
-def parse_busctl_string(out: str) -> str:
-    """Parse a busctl single-string reply such as ``s "value"``."""
-    body = out.strip()
-    if body.startswith("s "):
-        body = body[2:].lstrip()
-    tokens = _split_busctl_args(body)
-    return tokens[0] if tokens else ""
-
-
-def parse_shortcut_struct(out: str) -> ShortcutInfo | None:
-    """Parse a busctl ``(sssasssbb)`` shortcut struct reply."""
-    body = out.strip()
-    if body.startswith("("):
-        end = body.find(") ")
-        if end == -1:
-            return None
-        body = body[end + 2 :]
-    tokens = _split_busctl_args(body)
-    if len(tokens) < 4:
-        return None
-    try:
-        count = int(tokens[3])
-    except ValueError:
-        count = 0
-    accels = tuple(tokens[4 : 4 + count])
-    return ShortcutInfo(id=tokens[0], name=tokens[1], accels=accels)
-
-
-def _split_busctl_args(text: str) -> list[str]:
-    """Tokenize busctl-style output, decoding quoted strings and octal escapes."""
-    tokens: list[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        while i < n and text[i].isspace():
-            i += 1
-        if i >= n:
-            break
-        if text[i] == '"':
-            i += 1
-            data = bytearray()
-            while i < n:
-                ch = text[i]
-                if ch == '"':
-                    i += 1
-                    break
-                if ch == "\\":
-                    i += 1
-                    if i >= n:
-                        break
-                    esc = text[i]
-                    if esc == "n":
-                        data.append(0x0A)
-                    elif esc == "r":
-                        data.append(0x0D)
-                    elif esc == "t":
-                        data.append(0x09)
-                    elif esc in "01234567":
-                        j = i
-                        while j < n and j < i + 3 and text[j] in "01234567":
-                            j += 1
-                        data.append(int(text[i:j], 8))
-                        i = j - 1
-                    else:
-                        data.extend(esc.encode("utf-8"))
-                else:
-                    data.extend(ch.encode("utf-8"))
-                i += 1
-            tokens.append(data.decode("utf-8"))
-        else:
-            j = i
-            while j < n and not text[j].isspace():
-                j += 1
-            tokens.append(text[i:j])
-            i = j
-    return tokens
-
-
-# --- Shortcut registration lifecycle -----------------------------------------
-
-
-def shortcut_state_path(env: Mapping[str, str] | None = None) -> Path:
-    """Return the file that persists the registered custom shortcut id.
-
-    This must survive logout (unlike XDG_RUNTIME_DIR), so it lives under
-    ``$XDG_CONFIG_HOME``.
-    """
-    if env is None:
-        env = os.environ
-    base = env.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return Path(base) / "fun-voice-ryan" / "dde-shortcut-id"
-
-
-def register_shortcut(
-    client: DdeKeybindingClient,
-    *,
-    name: str,
-    action: str,
-    hotkey: str = DEFAULT_HOTKEY,
-    state_file: Path,
-) -> str:
-    """Register ``hotkey`` via DDE and persist the returned shortcut id.
-
-    Re-checks for a conflict immediately before registering; on conflict the
-    DDE configuration is left untouched and the owner is reported. ``action``
-    must be the bridge command — DDE runs it on trigger and never runs the
-    model directly.
-    """
-    owner = client.lookup_conflict(hotkey)
-    if owner is not None:
-        raise DdeShortcutConflict(hotkey, owner)
-    shortcut_id = client.add_custom_shortcut(name, action, hotkey)
-    _write_shortcut_id(state_file, shortcut_id)
-    return shortcut_id
-
-
-def unregister_shortcut(
-    client: DdeKeybindingClient, *, state_file: Path
-) -> str | None:
-    """Delete the previously registered shortcut and clear its persisted id."""
-    shortcut_id = _read_shortcut_id(state_file)
-    if shortcut_id is None:
-        return None
-    client.delete_custom_shortcut(shortcut_id)
-    _clear_shortcut_id(state_file)
-    return shortcut_id
-
-
-def _write_shortcut_id(path: Path, shortcut_id: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(shortcut_id + "\n", encoding="utf-8")
-
-
-def _read_shortcut_id(path: Path) -> str | None:
-    try:
-        text = path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
-        return None
-    return text or None
-
-
-def _clear_shortcut_id(path: Path) -> None:
-    with contextlib.suppress(FileNotFoundError):
-        path.unlink()
+    else:
+        proc = subprocess.run(
+            argv, input=input_text, capture_output=True, text=True, timeout=timeout
+        )
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
 # --- X11 display interface ---------------------------------------------------
@@ -331,6 +125,18 @@ class XWindow(Protocol):
 
     def get_full_property(self, atom: int, prop_type: int) -> XProperty | None: ...
 
+    def grab_key(
+        self,
+        key: int,
+        modifiers: int,
+        owner_events: bool,
+        pointer_mode: int,
+        keyboard_mode: int,
+        onerror: Callable[[object, object], None] | None = None,
+    ) -> None: ...
+
+    def ungrab_key(self, key: int, modifiers: int) -> None: ...
+
 
 class XScreen(Protocol):
     root: XWindow
@@ -343,13 +149,21 @@ class XDisplay(Protocol):
 
     def intern_atom(self, name: str) -> int: ...
 
-    def get_input_focus(self) -> tuple[object, int]: ...
+    def get_input_focus(self) -> object: ...
 
     def create_resource_object(self, kind: str, window_id: int) -> XWindow: ...
 
     def query_keymap(self) -> list[int]: ...
 
     def keysym_to_keycode(self, keysym: int) -> int: ...
+
+    def get_modifier_mapping(self) -> list[list[int]]: ...
+
+    def fileno(self) -> int: ...
+
+    def next_event(self) -> object: ...
+
+    def pending_events(self) -> int: ...
 
     def sync(self) -> None: ...
 
@@ -361,6 +175,251 @@ def default_make_display() -> XDisplay:
     from Xlib import display as xdisplay
 
     return cast(XDisplay, xdisplay.Display())
+
+
+def _select_ready(fd: int, timeout: float) -> bool:
+    """Return whether an X11 Display file descriptor is readable."""
+    readable, _writable, _exceptional = select.select([fd], [], [], timeout)
+    return bool(readable)
+
+
+class X11HotkeyListener:
+    """Exclusively grab ``Super+C`` and expose its press/release lifecycle.
+
+    The listener owns a dedicated X11 Display because its event-loop thread must
+    not share a connection with focus queries or XTEST injection. It never
+    persists input data: only the current in-memory held flag is tracked.
+    """
+
+    def __init__(
+        self,
+        on_press: Callable[[], object],
+        on_release: Callable[[], None],
+        *,
+        make_display: Callable[[], XDisplay] = default_make_display,
+        select_ready: Callable[[int, float], bool] = _select_ready,
+    ) -> None:
+        self._on_press = on_press
+        self._on_release = on_release
+        self._make_display = make_display
+        self._select_ready = select_ready
+        self._display: XDisplay | None = None
+        self._root: XWindow | None = None
+        self._keycode = 0
+        self._super_mask = 0
+        self._ignored_mask = X_LOCK_MASK
+        self._ignored_masks: tuple[int, ...] = (X_LOCK_MASK,)
+        self._grabs: list[tuple[int, int]] = []
+        self._held = False
+        self._release_pending = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        """Atomically register all ``Super+C`` lock variants and start polling."""
+        with self._lock:
+            if self._thread is not None:
+                return
+            if self._closed:
+                raise X11HotkeyUnavailable("X11 hotkey listener is closed")
+            try:
+                display = self._make_display()
+                root = display.screen().root
+                self._display = display
+                self._root = root
+                keycode = display.keysym_to_keycode(XK_C)
+                if keycode == 0:
+                    raise X11HotkeyUnavailable("C keycode is unavailable")
+                super_mask = self._modifier_mask(
+                    display, (XK_SUPER_L, XK_SUPER_R)
+                )
+                if super_mask == 0:
+                    raise X11HotkeyUnavailable("Super modifier is unavailable")
+                num_mask = self._modifier_mask(display, (XK_NUM_LOCK,))
+                scroll_mask = self._modifier_mask(display, (XK_SCROLL_LOCK,))
+                self._keycode = keycode
+                self._super_mask = super_mask
+                self._ignored_mask = X_LOCK_MASK | num_mask | scroll_mask
+                self._ignored_masks = tuple(
+                    mask for mask in (X_LOCK_MASK, num_mask, scroll_mask) if mask
+                )
+                self._grab_all()
+            except X11HotkeyUnavailable:
+                self._abort_start()
+                raise
+            except Exception as exc:
+                self._abort_start()
+                raise X11HotkeyUnavailable(
+                    f"cannot register Super+C: {type(exc).__name__}"
+                ) from exc
+            self._thread = threading.Thread(
+                target=self._run,
+                daemon=True,
+                name="x11-hotkey-listener",
+            )
+            self._thread.start()
+
+    def close(self) -> None:
+        """Stop polling, release every grab and close the dedicated Display."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._stop.set()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=HOTKEY_EVENT_WAIT_SECONDS * 3)
+        with self._lock:
+            self._release_grabs()
+            display = self._display
+            self._display = None
+            self._root = None
+        if display is not None:
+            try:
+                display.close()
+            except Exception:
+                logger.warning("X11 hotkey display close failed")
+
+    def handle_event(self, event: object) -> None:
+        """Route a single matching key event; exposed for deterministic tests."""
+        if getattr(event, "detail", None) != self._keycode:
+            return
+        event_type = getattr(event, "type", None)
+        if event_type == X_KEY_PRESS and self._press_matches_super(event):
+            # Core X11 keyboard auto-repeat emits KeyRelease + KeyPress pairs.
+            # Keep the session held when this press immediately follows such a
+            # release; only an idle event wait confirms a real key release.
+            self._release_pending = False
+            if not self._held:
+                self._held = True
+                self._on_press()
+        elif event_type == X_KEY_RELEASE and self._held:
+            # Do not inspect modifier state here: Super may already be released.
+            self._release_pending = True
+
+    def flush_pending_release(self) -> None:
+        """Stop after an idle event wait confirms a real C key release."""
+        if not self._release_pending or not self._held:
+            return
+        self._release_pending = False
+        self._held = False
+        self._on_release()
+
+    def _modifier_mask(self, display: XDisplay, keysyms: tuple[int, ...]) -> int:
+        keycodes = {display.keysym_to_keycode(keysym) for keysym in keysyms}
+        keycodes.discard(0)
+        if not keycodes:
+            return 0
+        for index, mapping in enumerate(display.get_modifier_mapping()):
+            if keycodes.intersection(mapping):
+                return 1 << index
+        return 0
+
+    def _grab_all(self) -> None:
+        display = self._require_display()
+        root = self._require_root()
+        errors: list[object] = []
+
+        def record_error(error: object, _request: object) -> None:
+            errors.append(error)
+
+        from Xlib import X
+
+        masks = self._grab_masks()
+        for modifiers in masks:
+            root.grab_key(
+                self._keycode,
+                modifiers,
+                False,
+                X.GrabModeAsync,
+                X.GrabModeAsync,
+                onerror=record_error,
+            )
+            if errors:
+                break
+            self._grabs.append((self._keycode, modifiers))
+        try:
+            display.sync()
+        except Exception as exc:
+            raise X11HotkeyUnavailable(
+                f"cannot register Super+C: {type(exc).__name__}"
+            ) from exc
+        if errors:
+            raise X11HotkeyUnavailable(
+                "Super+C is already grabbed by another X11 client"
+            )
+        if len(self._grabs) != len(masks):
+            raise X11HotkeyUnavailable("Super+C grab did not complete")
+
+    def _grab_masks(self) -> tuple[int, ...]:
+        variants = {0}
+        for ignored in self._ignored_masks:
+            variants |= {variant | ignored for variant in tuple(variants)}
+        return tuple(sorted(self._super_mask | variant for variant in variants))
+
+    def _press_matches_super(self, event: object) -> bool:
+        state = getattr(event, "state", None)
+        if not isinstance(state, int):
+            return False
+        return (state & ~self._ignored_mask) == self._super_mask
+
+    def _run(self) -> None:
+        display = self._require_display()
+        while not self._stop.is_set():
+            try:
+                if not self._select_ready(display.fileno(), HOTKEY_EVENT_WAIT_SECONDS):
+                    self.flush_pending_release()
+                    continue
+                self.handle_event(display.next_event())
+                while display.pending_events():
+                    self.handle_event(display.next_event())
+            except Exception as exc:
+                if not self._stop.is_set():
+                    logger.warning(
+                        "X11 hotkey event loop stopped: %s", type(exc).__name__
+                    )
+                return
+
+    def _abort_start(self) -> None:
+        self._release_grabs()
+        display = self._display
+        self._display = None
+        self._root = None
+        self._closed = True
+        if display is not None:
+            try:
+                display.close()
+            except Exception:
+                logger.warning("X11 hotkey rollback display close failed")
+
+    def _release_grabs(self) -> None:
+        root = self._root
+        display = self._display
+        if root is None:
+            return
+        for keycode, modifiers in self._grabs:
+            try:
+                root.ungrab_key(keycode, modifiers)
+            except Exception:
+                logger.warning("X11 hotkey ungrab failed")
+        self._grabs.clear()
+        if display is not None:
+            try:
+                display.sync()
+            except Exception:
+                logger.warning("X11 hotkey ungrab sync failed")
+
+    def _require_display(self) -> XDisplay:
+        if self._display is None:
+            raise X11HotkeyUnavailable("X11 display is unavailable")
+        return self._display
+
+    def _require_root(self) -> XWindow:
+        if self._root is None:
+            raise X11HotkeyUnavailable("X11 root window is unavailable")
+        return self._root
 
 
 def _first_int(value: object) -> int | None:
@@ -474,7 +533,16 @@ class X11FocusGuard:
         return _window_id(_first_int(prop.value))
 
     def _read_input_focus(self, display: XDisplay) -> int | None:
-        focus, _revert = display.get_input_focus()
+        reply = display.get_input_focus()
+        if isinstance(reply, tuple):
+            if not reply:
+                return None
+            focus = reply[0]
+        else:
+            # python-xlib returns a GetInputFocus reply object with a Window
+            # resource in ``focus``; lightweight test adapters often return
+            # the historical ``(focus, revert_to)`` tuple instead.
+            focus = getattr(reply, "focus", None)
         return _window_id(focus)
 
     def _read_window_pid(self, display: XDisplay, active: int) -> int | None:
@@ -492,31 +560,6 @@ class X11FocusGuard:
             ).strip()
         except OSError:
             return None
-
-
-# --- Hotkey bridge -----------------------------------------------------------
-
-
-class HotkeyBridge:
-    """Translates a DDE custom-shortcut action into a daemon request.
-
-    Stateless by design: DDE invokes the action once per trigger, and this
-    bridge reads the live X11 ``C`` key state to choose ``start_if_idle`` (key
-    held) or ``stop`` (key released). Repeated triggers are idempotent because
-    ``start_if_idle`` is a no-op while the daemon is already recording.
-    """
-
-    def __init__(self, guard: X11FocusGuard, send: Callable[[bytes], None]) -> None:
-        self._guard = guard
-        self._send = send
-
-    def handle(self) -> str:
-        """Forward the daemon request implied by the current ``C`` key state."""
-        if self._guard.c_is_down():
-            self._send(encode_message(asdict(StartRequest())))
-            return "start"
-        self._send(encode_message(asdict(StopRequest())))
-        return "stop"
 
 
 # --- Clipboard mirror --------------------------------------------------------
@@ -614,54 +657,3 @@ class XTestInjector:
             raise
         except Exception as exc:
             raise XTestError(f"XTEST injection failed: {exc}") from exc
-
-
-# --- CLI (used by the register/unregister scripts) ----------------------------
-
-
-def _state_file_or_default(state_file: Path | None) -> Path:
-    return state_file if state_file is not None else shortcut_state_path()
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """Register or unregister the DDE push-to-talk shortcut."""
-    parser = argparse.ArgumentParser(
-        prog="fun-voice-desktop",
-        description="Register/unregister the Fun Voice Ryan DDE shortcut.",
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    register = subparsers.add_parser("register", help="register the Super+C shortcut")
-    register.add_argument("--action", required=True, help="bridge command DDE runs")
-    register.add_argument("--name", default=DEFAULT_SHORTCUT_NAME)
-    register.add_argument("--hotkey", default=DEFAULT_HOTKEY)
-    register.add_argument("--state-file", type=Path, default=None)
-
-    unregister = subparsers.add_parser("unregister", help="remove the shortcut")
-    unregister.add_argument("--state-file", type=Path, default=None)
-
-    ns = parser.parse_args(argv)
-    client = DdeKeybindingClient()
-    try:
-        if ns.command == "register":
-            state_file = _state_file_or_default(ns.state_file)
-            shortcut_id = register_shortcut(
-                client,
-                name=ns.name,
-                action=ns.action,
-                hotkey=ns.hotkey,
-                state_file=state_file,
-            )
-            print(shortcut_id)
-            return 0
-        state_file = _state_file_or_default(ns.state_file)
-        unregister_shortcut(client, state_file=state_file)
-        return 0
-    except DesktopError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

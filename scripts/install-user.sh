@@ -14,8 +14,8 @@
 #   2. systemd units              -> ~/.config/systemd/user  (replaces symlinks)
 #   3. Fcitx addon .so + .conf    -> ~/.local/lib/fcitx5 and ~/.local/share/fcitx5/addon
 #   4. Autostart desktop entry    -> ~/.config/autostart
-#   5. systemd daemon-reload + enable --now worker + daemon
-#   6. Register the Super+C DDE shortcut
+#   5. Safely retire a verified legacy DDE bridge shortcut (upgrade only)
+#   6. Retire the warm worker unit, then enable/restart only the lightweight daemon
 
 set -euo pipefail
 
@@ -28,12 +28,15 @@ SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 FCITX_LIB_DIR="${HOME}/.local/lib/fcitx5"
 FCITX_ADDON_DIR="${HOME}/.local/share/fcitx5/addon"
 AUTOSTART_DIR="${HOME}/.config/autostart"
-SHORTCUT_ID_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/fun-voice-ryan/dde-shortcut-id"
-CONSOLE_SCRIPTS=(fun-voice-daemon fun-voice-worker fun-voice-bridge fun-voice-preflight fun-voice-selftest)
-SYSTEMD_UNITS=(fun-voice-worker.service fun-voice-daemon.service)
-SYSTEMD_SERVICES=(fun-voice-worker.service fun-voice-daemon.service)
+LEGACY_SHORTCUT_ID_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/fun-voice-ryan/dde-shortcut-id"
+CONSOLE_SCRIPTS=(
+    fun-voice-daemon fun-voice-worker fun-voice-preflight fun-voice-selftest
+    fun-voice-corrector
+)
+SYSTEMD_UNITS=(fun-voice-worker@.service fun-voice-daemon.service)
 
 POC_REPORT="${XDG_RUNTIME_DIR:-}/fun-voice-ryan/poc-report.json"
+RUNTIME_MODULES=(torch vllm funasr modelscope)
 
 # Source artifacts (validated up front so a missing file fails before any write).
 FCITX_SO="${ROOT}/build/fcitx/fcitx5-fun-voice.so"
@@ -42,6 +45,53 @@ DESKTOP_SRC="${ROOT}/systemd/fun-voice-session.desktop"
 FCITX_LIB_ABS="${FCITX_LIB_DIR}/fcitx5-fun-voice"  # no ".so"; fcitx5 appends it
 log() { printf '[install-user] %s\n' "$*"; }
 die() { printf '[install-user] ERROR(%s): %s\n' "$1" "$2" >&2; exit 1; }
+
+# Retire only the DDE shortcut created by an older Fun Voice Ryan release.
+# A persisted id alone is not authority to remove a global shortcut: verify
+# that DDE still maps it to the old bridge wrapper before deleting it.
+retire_legacy_dde_shortcut() {
+    if [[ ! -e "${LEGACY_SHORTCUT_ID_FILE}" ]]; then
+        return
+    fi
+    if [[ ! -f "${LEGACY_SHORTCUT_ID_FILE}" ]]; then
+        die "legacy-dde" "legacy shortcut id is not a regular file; remove it manually"
+    fi
+
+    local -a legacy_ids
+    mapfile -t legacy_ids < "${LEGACY_SHORTCUT_ID_FILE}"
+    if [[ "${#legacy_ids[@]}" -ne 1 || -z "${legacy_ids[0]}" ]]; then
+        die "legacy-dde" "legacy shortcut id file is malformed; remove its shortcut manually"
+    fi
+    local shortcut_id="${legacy_ids[0]}"
+    if ! command -v busctl >/dev/null 2>&1; then
+        die "legacy-dde" "busctl is required to verify the legacy shortcut"
+    fi
+
+    local legacy_reply legacy_action
+    if ! legacy_reply="$(busctl --user call \
+        org.deepin.dde.Keybinding1 /org/deepin/dde/Keybinding1 \
+        org.deepin.dde.Keybinding1 GetShortcutCommand s "${shortcut_id}")"; then
+        die "legacy-dde" "cannot read the legacy shortcut command; remove it manually"
+    fi
+    if [[ ! "${legacy_reply}" =~ ^s[[:space:]]+\".*\"$ ]]; then
+        die "legacy-dde" "legacy shortcut command is not recognizable; remove it manually"
+    fi
+    legacy_action="${legacy_reply#s }"
+    legacy_action="${legacy_action#\"}"
+    legacy_action="${legacy_action%\"}"
+    if [[ -z "${legacy_action}" || "${legacy_action}" == *\"* || "${legacy_action}" == *\\* \
+        || ( "${legacy_action}" != "fun-voice-bridge" \
+            && "${legacy_action}" != */fun-voice-bridge ) ]]; then
+        die "legacy-dde" "legacy shortcut is not owned by Fun Voice Ryan; remove it manually"
+    fi
+
+    busctl --user call org.deepin.dde.Keybinding1 /org/deepin/dde/Keybinding1 \
+        org.deepin.dde.Keybinding1 DeleteCustomShortcut s "${shortcut_id}" >/dev/null \
+        || die "legacy-dde" "cannot delete verified legacy shortcut"
+    rm -f "${LEGACY_SHORTCUT_ID_FILE}" \
+        || die "legacy-dde" "cannot clear verified legacy shortcut id"
+    log "retired verified legacy DDE shortcut"
+}
 
 # install_file SRC DEST MODE — copy with an explicit mode, creating the parent
 # dir and replacing a pre-existing symlink with a real file (Task 6 may have
@@ -65,12 +115,40 @@ if [[ ! -f "${POC_REPORT}" ]]; then
     die "precondition" \
         "XPU POC report missing: ${POC_REPORT}. Run scripts/run-nano-xpu-poc.sh first."
 fi
-POC_READY="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ready"))' "${POC_REPORT}" 2>/dev/null || true)"
-if [[ "${POC_READY}" != "True" ]]; then
+POC_CHECK="$(python3 - "${POC_REPORT}" <<'PYEOF' || true
+import json, sys
+report = json.load(open(sys.argv[1]))
+required = {
+    "xpu_visible", "vllm_xpu_decoder", "nano_encoder_xpu",
+    "nano_adaptor_xpu", "prompt_embeddings_xpu", "decode_10s",
+    "decode_60s", "no_cpu_decoder_fallback", "oom_survives",
+}
+checks = {c["name"]: c.get("status") for c in report.get("checks", [])}
+if report.get("ready") is not True:
+    print("report ready is not True")
+elif set(checks) != required:
+    print(f"gate set mismatch: missing={sorted(required - set(checks))} extra={sorted(set(checks) - required)}")
+elif any(s != "pass" for s in checks.values()):
+    print("not all gates pass: " + ", ".join(f"{n}={s}" for n, s in checks.items() if s != "pass"))
+else:
+    print("OK")
+PYEOF
+)"
+if [[ "${POC_CHECK}" != "OK" ]]; then
     die "precondition" \
-        "XPU POC report not ready (ready=${POC_READY:-missing}); refusing to install."
+        "XPU POC hard gates not satisfied: ${POC_CHECK}. Run scripts/run-nano-xpu-poc.sh first."
 fi
-log "XPU POC report ready=true — proceeding"
+log "XPU POC hard gates verified (9/9 pass)"
+
+# A POC report proves a previous run, not that the current virtual environment
+# still contains its XPU runtime. In particular, plain `uv sync` can prune
+# manually installed XPU packages. Refuse deployment before writing user files
+# when the runtime imports are absent.
+for module in "${RUNTIME_MODULES[@]}"; do
+    "${ROOT}/.venv/bin/python" -c "import ${module}" 2>/dev/null \
+        || die "runtime" "missing ${module}; run scripts/create-xpu-env.sh, then uv sync --inexact"
+done
+log "XPU runtime imports verified"
 
 # --- 0b. Source validation (fail fast, before any write) -------------------
 for script in "${CONSOLE_SCRIPTS[@]}"; do
@@ -117,25 +195,28 @@ install_file "${DESKTOP_TMP}" "${AUTOSTART_DIR}/fun-voice-session.desktop" 644
 rm -f "${DESKTOP_TMP}"
 log "installed autostart desktop entry into ${AUTOSTART_DIR}"
 
-# --- 5. systemd daemon-reload + enable --now -------------------------------
+# --- 5. Safely retire the old DDE bridge shortcut (upgrade only) -----------
+retire_legacy_dde_shortcut
+if [[ -f "${BIN_DIR}/fun-voice-bridge" || -L "${BIN_DIR}/fun-voice-bridge" ]]; then
+    rm -f "${BIN_DIR}/fun-voice-bridge" \
+        || die "legacy-bridge" "cannot remove obsolete bridge wrapper"
+    log "removed obsolete bridge wrapper"
+fi
+
+# --- 6. Retire warm worker + defer daemon startup to the X11 session -------
 if ! command -v systemctl >/dev/null 2>&1; then
     die "systemd" "systemctl not found on PATH"
 fi
+# ``fun-voice-worker.service`` belongs to the old warm architecture. It is an
+# exact application-owned path, not a glob or user-selected target.
+systemctl --user disable --now fun-voice-worker.service 2>/dev/null || true
+rm -f "${SYSTEMD_USER_DIR}/fun-voice-worker.service" \
+    || die "systemd" "cannot remove retired warm worker unit"
 systemctl --user daemon-reload || die "systemd" "daemon-reload failed"
-for service in "${SYSTEMD_SERVICES[@]}"; do
-    systemctl --user enable --now "${service}" \
-        || die "systemd" "enable --now ${service} failed"
-done
-log "enabled and started ${SYSTEMD_SERVICES[*]}"
-
-# --- 6. Register the Super+C DDE shortcut ----------------------------------
-if [[ -f "${SHORTCUT_ID_FILE}" ]]; then
-    log "DDE Super+C shortcut already registered; skipping"
-else
-    FUN_VOICE_BRIDGE_ACTION="${BIN_DIR}/fun-voice-bridge" \
-        bash "${ROOT}/scripts/register-dde-shortcut.sh" \
-        || die "dde" "register-dde-shortcut.sh failed (Super+C registration)"
-    log "registered DDE Super+C shortcut"
-fi
+# Starting here is too early: the user manager can run before the graphical
+# session has supplied DISPLAY/XAUTHORITY.  The autostart session importer
+# performs the explicit start only after it has imported those values.
+systemctl --user disable --now fun-voice-daemon.service 2>/dev/null || true
+log "retired warm worker; daemon startup is deferred to the X11 session importer"
 
 log "installation complete. Verify with: fun-voice-selftest --format json"

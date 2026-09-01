@@ -67,6 +67,12 @@ fi
 log "安装 FunASR @ ${FUNASR_COMMIT} + modelscope..."
 install_xpu "${FUNASR_SRC}" modelscope
 
+# The enhanced identity store depends on an authenticated Secret Service key
+# and AES-GCM. They are ordinary host-side dependencies, but installing them
+# here keeps the XPU environment setup reproducible.
+log "安装 enhanced identity dependencies (cryptography + secretstorage)..."
+install_xpu cryptography secretstorage
+
 # --- 3.4 triton XPU shim 修复 ------------------------------------------------
 # xgrammar 0.2.3 的 Requires-Dist: triton 会把 PyPI 的 NVIDIA-only triton 3.8.0
 # 拉进环境,其 libtriton.so 不含 intel 后端,覆盖 triton-xpu 3.7.2 的实现,导致

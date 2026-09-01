@@ -31,13 +31,17 @@ Fun Voice Ryan 的安装、运行与故障排查。安装脚本为 `scripts/inst
 
 之后 worker 直接复用该缓存，不会重复下载。卸载时该目录默认保留（见第 8 节）。
 
-## 3. 配置来源（source）
+## 3. 配置来源
 
-当前版本没有独立配置文件，运行参数来自代码内安全默认值
-（`fun_voice.config.Config`）：热键 `<Super>C`、音频源 `default`（PipeWire）、
-输入法 `fcitx5`、提交超时 500ms、模型 `FunAudioLLM/Fun-ASR-Nano-2512`、
-设备 `xpu:0`、dtype `bf16`、`gpu_memory_utilization=0.35`。未来若引入配置文件，
-将落在 `~/.config/fun-voice-ryan/`，卸载默认保留。
+配置文件为 `${XDG_CONFIG_HOME:-~/.config}/fun-voice-ryan/config.toml`；不存在时使用
+安全默认值。可从 `scripts/config.example.toml` 复制后修改，daemon 与 worker 都在启动时
+读取它。当前生效的键为 PipeWire `audio.source`、Fcitx
+`input_method.commit_timeout_ms`（毫秒）及 `input_method.allow_x11_paste_fallback`，以及
+`inference.device`、`dtype`、`gpu_memory_utilization`、`enforce_eager`。
+
+`inference.device` 只能是 `xpu:0`，任何 CPU/CUDA 设置都会拒绝启动，绝不静默回退。
+热键固定为 `<Super>C`，模型固定为 `FunAudioLLM/Fun-ASR-Nano-2512`，Fcitx 主通道固定为
+fcitx5；录音上限、内存阈值和不保留历史均为不可配置的安全约束。卸载默认保留用户配置。
 
 > 另请注意：安装后的 console script（shebang）与 autostart `Exec` 都指向
 > **仓库与 `.venv` 的绝对路径**（当前 `~/workspace/fun-voice-ryan`）。**移动或
@@ -73,17 +77,27 @@ journalctl --user -u fun-voice-daemon -f
 fun-voice-selftest --format json
 ```
 
+`x11_hotkey` 会在 daemon 成功独占抓取 `Super+C`、且本次启动已经观测到一次真实按下后
+才返回 `pass`。这是预期的验收门：先在 X11 会话中按住并松开一次 `Super+C`，再运行
+自检；它只读取 daemon 内存中的 `registered`、`press_seen` 两个布尔值，不保存按键时间、
+音频或转写文本。该项通过后仍须完成 `docs/acceptance-checklist.md` 的目标应用人工验收。
+
 worker 首次启动需要几分钟加载模型（状态会先处于 `activating`）；daemon 依赖
 图形会话环境（DISPLAY/XAUTHORITY），由登录时的 autostart 入口导入（见第 7 节）。
 
-## 7. DDE / Fcitx 故障处理
+## 7. X11 热键 / Fcitx 故障处理
 
 - **Fcitx addon 未加载**：确认 fcitx5 正在运行，且
   `~/.local/lib/fcitx5/fcitx5-fun-voice.so` 与
   `~/.local/share/fcitx5/addon/fcitx5-fun-voice.conf` 已就位；重启 fcitx5 后
   观察 `$XDG_RUNTIME_DIR/fun-voice-ryan-fcitx.sock` 是否出现。
-- **Super+C 失效**：确认 DDE 快捷键已注册（`~/.config/fun-voice-ryan/dde-shortcut-id`
-  存在），且没有被其他程序占用（`fun-voice-selftest` 的 `super_c_conflict` 项）。
+- **Super+C 失效或 daemon 启动失败**：查看
+  `journalctl --user -u fun-voice-daemon.service -b --no-pager`。若出现
+  `X11 hotkey unavailable`，说明另一个 X11 客户端已抢占该组合；停止或改配冲突客户端后
+  执行 `systemctl --user restart fun-voice-daemon.service`。退出码 `2` 是确定的冲突失败，
+  systemd 不会对它循环重启。
+- **自检的 `x11_hotkey` 未通过**：先确认 `registered=true`；若 `press_seen=false`，在
+  任意输入框按住并松开一次 `Super+C` 后重新执行自检。不要将它改成切换式录音。
 - **上屏失败回退**：Fcitx 提交失败时会回退到剪贴板（需要 `xclip`/`xsel`），
   再失败会尝试 XTEST（Ctrl+V，需要 python-xlib 且 X 可连接）。
 - **daemon 反复失败**：`journalctl --user -u fun-voice-daemon` 查看退出原因；
@@ -91,11 +105,11 @@ worker 首次启动需要几分钟加载模型（状态会先处于 `activating`
 
 ## 8. 如何保持 Super+C 可用
 
-- 不要把 `Super+C` 分配给其他 DDE 快捷键或第三方工具。
-- 卸载前先运行 `scripts/uninstall-user.sh`，它会注销快捷键并删除 id 文件。
-- 若手动在 DDE「快捷键」里删除了本助手，残留的
-  `~/.config/fun-voice-ryan/dde-shortcut-id` 会让安装脚本误以为已注册而**跳过**注册，
-  导致 `Super+C` 未注册；删除该文件后重跑 `scripts/install-user.sh` 即可复位。
+- 不要让其他 X11 全局热键工具抢占 `Super+C`。
+- daemon 在启动时会原子抓取含 Caps Lock、Num Lock、Scroll Lock 变体的 `Super+C`；任何
+  一个变体冲突都会使整个服务以退出码 `2` 失败，而不会退回到轮询、切换录音或 raw input。
+- 重启 daemon 后应重新执行一次按住/松开，再以 `fun-voice-selftest --format json` 确认
+  `x11_hotkey` 为 `pass`。
 
 ## 9. 卸载
 
@@ -104,8 +118,8 @@ scripts/uninstall-user.sh            # 保留模型缓存与用户配置
 scripts/uninstall-user.sh --purge    # 二次确认后连模型缓存与配置一并删除
 ```
 
-卸载会停止并 disable 两个 systemd 服务、注销 Super+C、移除 unit/desktop/addon
-文件、`~/.local/bin` 下的 5 个 console script，以及
+卸载会停止并 disable 两个 systemd 服务、移除 unit/desktop/addon 文件、
+`~/.local/bin` 下的 4 个 console script，以及
 `$XDG_RUNTIME_DIR/fun-voice-ryan/` 下的 daemon/worker socket、fcitx socket 与
 capture 分片。
 
@@ -113,5 +127,5 @@ capture 分片。
 
 首版**不支持 Wayland**。本项目依赖 X11 焦点查询（`_NET_ACTIVE_WINDOW`）、
 C 键物理状态查询与 XTEST 注入，这些能力在 Wayland 会话下不可用。请在
-Deepin DDE **X11** 会话下使用；Wayland 会话下安装脚本可执行，但 daemon /
-bridge / Fcitx 上屏链路无法正常工作。
+Deepin DDE **X11** 会话下使用；Wayland 会话下安装脚本可执行，但 daemon 的 X11
+热键、焦点校验与 Fcitx 上屏链路无法正常工作。

@@ -2,10 +2,10 @@
 
 This module contains no business logic. It defines the immutable data types,
 the daemon state machine, structured error codes, and the byte-level framing
-used between the bridge, daemon, worker, and the Fcitx addon.
+used between local control clients, the daemon, worker, and the Fcitx addon.
 
 Protocol summary:
-- Bridge/daemon/worker messages are single-line UTF-8 JSON, at most 64 KiB.
+- Control-client/daemon/worker messages are single-line UTF-8 JSON, at most 64 KiB.
 - Fcitx uses a header line followed by a UTF-8 body, at most 64 KiB per frame.
 - Fcitx COMMIT text is limited to 64 KiB per line; longer text is split on
   Unicode codepoint boundaries into ordered chunks of at most 8 KiB.
@@ -74,14 +74,14 @@ class ErrorCode:
 
 @dataclass(frozen=True)
 class StartRequest:
-    """Bridge -> daemon request to start recording if idle."""
+    """Local control-client -> daemon request to start recording if idle."""
 
     op: str = "start_if_idle"
 
 
 @dataclass(frozen=True)
 class StopRequest:
-    """Bridge -> daemon request to stop recording."""
+    """Local control-client -> daemon request to stop recording."""
 
     op: str = "stop"
 
@@ -164,7 +164,7 @@ class WorkerHealth:
 def encode_message(
     message: Mapping[str, Any], max_bytes: int = MAX_MESSAGE_BYTES
 ) -> bytes:
-    """Encode a bridge/daemon/worker message as single-line UTF-8 JSON.
+    """Encode a control-client/daemon/worker message as single-line UTF-8 JSON.
 
     ``max_bytes`` bounds the encoded byte size; worker responses pass the
     larger ``WORKER_RESPONSE_MAX_BYTES``.

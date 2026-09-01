@@ -9,12 +9,15 @@ on every path.
 
 from __future__ import annotations
 
+import signal
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
+from fun_voice import daemon as daemon_mod
 from fun_voice.capture import CaptureConfig, CaptureError
 from fun_voice.config import Config
 from fun_voice.contracts import (
@@ -25,7 +28,9 @@ from fun_voice.contracts import (
     FocusSnapshot,
     Transcription,
 )
+from fun_voice.corrector import CorrectionError
 from fun_voice.daemon import (
+    HOTKEY_UNAVAILABLE_EXIT,
     NOTIFY_EMPTY_SPEECH,
     NOTIFY_LIMIT_REACHED,
     NOTIFY_RECOGNITION_FAILED,
@@ -37,8 +42,16 @@ from fun_voice.daemon import (
     _DisabledInjector,
     build_fcitx_factory,
     build_injector,
+    serve,
 )
-from fun_voice.desktop import ClipboardError, X11Error, X11FocusGuard, XTestError, XTestInjector
+from fun_voice.desktop import (
+    ClipboardError,
+    X11Error,
+    X11FocusGuard,
+    X11HotkeyUnavailable,
+    XTestError,
+    XTestInjector,
+)
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
 
 ARTIFACT = CaptureArtifact(
@@ -212,6 +225,25 @@ class FakeWorker:
         self.closed = True
 
 
+class FakeCorrector:
+    def __init__(
+        self, *, text: str | None = None, error: Exception | None = None
+    ) -> None:
+        self.text = text
+        self.error = error
+        self.calls: list[str] = []
+
+    def correct(self, raw_text: str) -> str:
+        self.calls.append(raw_text)
+        if self.error is not None:
+            raise self.error
+        assert self.text is not None
+        return self.text
+
+    def close(self) -> None:
+        pass
+
+
 class Harness:
     def __init__(
         self,
@@ -222,6 +254,7 @@ class Harness:
         clipboard: FakeClipboard | None = None,
         injector: FakeInjector | None = None,
         worker: FakeWorker | None = None,
+        corrector: FakeCorrector | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         capture_config: CaptureConfig | None = None,
@@ -232,6 +265,7 @@ class Harness:
         self.injector = injector if injector is not None else FakeInjector()
         self.notifier = FakeNotifier()
         self.worker = worker if worker is not None else FakeWorker()
+        self.corrector = corrector
         self.fcitx_instances: list[FakeFcitx] = []
         self._fcitx_template = fcitx if fcitx is not None else FakeFcitx()
 
@@ -253,6 +287,7 @@ class Harness:
             injector=self.injector,
             notifier=self.notifier,
             worker=self.worker,
+            corrector=self.corrector,
             monotonic=monotonic if monotonic is not None else time.monotonic,
             sleep=sleep if sleep is not None else time.sleep,
             capture_config=(
@@ -309,6 +344,30 @@ def test_start_confirms_c_is_still_pressed() -> None:
     h = Harness(guard=FakeGuard(c_down=True))
     assert h.daemon.start_if_idle() == "started"
     assert h.daemon.state is DaemonState.RECORDING
+
+
+def test_hotkey_press_starts_recording_and_keeps_private_boolean() -> None:
+    h = Harness(guard=FakeGuard(c_down=True))
+    assert h.daemon.diagnostics() == {
+        "hotkey_registered": False,
+        "hotkey_press_seen": False,
+    }
+
+    assert h.daemon.handle_hotkey_press() == "started"
+
+    assert h.daemon.diagnostics() == {
+        "hotkey_registered": False,
+        "hotkey_press_seen": True,
+    }
+
+
+def test_mark_hotkey_registered_changes_only_registration_boolean() -> None:
+    h = Harness()
+    h.daemon.mark_hotkey_registered()
+    assert h.daemon.diagnostics() == {
+        "hotkey_registered": True,
+        "hotkey_press_seen": False,
+    }
 
 
 def test_start_cancels_when_c_not_pressed() -> None:
@@ -467,6 +526,47 @@ def test_stop_transitions_through_pipeline_to_idle() -> None:
     assert NOTIFY_TRANSCRIBING in h.notifier.messages
 
 
+def test_corrected_text_is_committed_and_copied_instead_of_raw_text() -> None:
+    corrector = FakeCorrector(text="今天执行 git commit，然后运行 pytest。")
+    h = Harness(
+        worker=FakeWorker(text="今天执行 get commit，然后运行 py test。"),
+        corrector=corrector,
+    )
+
+    _started(h)
+    h.daemon.stop()
+
+    assert corrector.calls == ["今天执行 get commit，然后运行 py test。"]
+    assert h.clipboard.writes == ["今天执行 git commit，然后运行 pytest。"]
+    assert h.fcitx.commits == [("tok-123", "今天执行 git commit，然后运行 pytest。")]
+
+
+def test_correction_error_keeps_raw_text_usable() -> None:
+    h = Harness(
+        worker=FakeWorker(text="get commit"),
+        corrector=FakeCorrector(error=CorrectionError("correction.oom")),
+    )
+
+    _started(h)
+    h.daemon.stop()
+
+    assert h.clipboard.writes == ["get commit"]
+    assert h.fcitx.commits == [("tok-123", "get commit")]
+
+
+def test_unexpected_correction_error_also_keeps_raw_text_usable() -> None:
+    h = Harness(
+        worker=FakeWorker(text="get commit"),
+        corrector=FakeCorrector(error=RuntimeError("unavailable")),
+    )
+
+    _started(h)
+    h.daemon.stop()
+
+    assert h.clipboard.writes == ["get commit"]
+    assert h.fcitx.commits == [("tok-123", "get commit")]
+
+
 # --- Every path returns to IDLE and cleans up --------------------------------
 
 
@@ -565,49 +665,82 @@ def test_auto_stop_outside_recording_is_noop() -> None:
     assert h.notifier.messages == []
 
 
-# --- C-release polling (fix 1: reliable Super+C release) ---------------------
+# --- X11 hotkey release ------------------------------------------------------
 
 
-def test_c_release_poll_stops_after_sustained_up() -> None:
-    clock = [0.0]
-    h = Harness(monotonic=lambda: clock[0])
-    _started(h)
-    h.guard.c_down = False  # C released
-    h.daemon.poll_c_release()  # first up read
-    clock[0] += 0.010
-    h.daemon.poll_c_release()  # up for 10 ms
-    clock[0] += 0.010
-    h.daemon.poll_c_release()  # up for 20 ms
-    clock[0] += 0.010
-    h.daemon.poll_c_release()  # up for 30 ms >= 25 ms -> stop
+def test_hotkey_release_stops_in_a_background_thread() -> None:
+    h = Harness(guard=FakeGuard(c_down=True))
+    assert h.daemon.handle_hotkey_press() == "started"
+
+    h.daemon.handle_hotkey_release()
+
+    deadline = time.monotonic() + 1.0
+    while h.recorder.stop_calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert h.recorder.stop_calls == 1
     assert h.daemon.state is DaemonState.IDLE
     assert NOTIFY_TRANSCRIBING in h.notifier.messages
 
 
-def test_c_release_poll_ignores_brief_release() -> None:
-    clock = [0.0]
-    h = Harness(monotonic=lambda: clock[0])
-    _started(h)
-    h.guard.c_down = False
-    h.daemon.poll_c_release()  # first up read
-    clock[0] += 0.015
-    h.daemon.poll_c_release()  # up for 15 ms (< 25 ms)
-    h.guard.c_down = True  # back down
-    h.daemon.poll_c_release()  # resets the release timer
-    assert h.recorder.stop_calls == 0
-    assert h.daemon.state is DaemonState.RECORDING
+class _FakeHotkeyListener:
+    def __init__(self, *, unavailable: bool = False) -> None:
+        self.unavailable = unavailable
+        self.started = False
+        self.closed = False
+
+    def start(self) -> None:
+        if self.unavailable:
+            raise X11HotkeyUnavailable("Super+C is already grabbed")
+        self.started = True
+
+    def close(self) -> None:
+        self.closed = True
 
 
-def test_c_release_poll_x11_error_aborts_to_idle() -> None:
+class _StoppingDaemonServer:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.closed = False
+
+    def serve_forever(self, *, poll_interval: float) -> None:
+        raise daemon_mod._ShutdownRequested(signal.SIGTERM)  # noqa: SLF001
+
+    def server_close(self) -> None:
+        self.closed = True
+
+
+def test_serve_starts_x11_hotkey_before_server_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     h = Harness()
-    _started(h)
-    h.guard.c_error = X11Error("X down")
-    h.daemon.poll_c_release()
-    assert h.daemon.state is DaemonState.IDLE
-    assert h.recorder.cleanup_calls == 1
-    assert NOTIFY_RECOGNITION_FAILED.format(category="x11") in h.notifier.messages
-    assert h.worker.transcriptions == []  # never injects / never transcribes
+    listener = _FakeHotkeyListener()
+    monkeypatch.setattr(daemon_mod, "DaemonServer", _StoppingDaemonServer)
+
+    assert serve(tmp_path / "daemon.sock", h.daemon, hotkey_listener=listener) == 0
+    assert listener.started is True
+    assert listener.closed is True
+    assert h.daemon.diagnostics() == {
+        "hotkey_registered": True,
+        "hotkey_press_seen": False,
+    }
+
+
+def test_serve_exits_without_binding_when_x11_hotkey_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    h = Harness()
+    listener = _FakeHotkeyListener(unavailable=True)
+
+    def unexpected_server(*args: object, **kwargs: object) -> None:
+        pytest.fail("server must not bind when the X11 hotkey grab fails")
+
+    monkeypatch.setattr(daemon_mod, "DaemonServer", unexpected_server)
+
+    assert (
+        serve(tmp_path / "daemon.sock", h.daemon, hotkey_listener=listener)
+        == HOTKEY_UNAVAILABLE_EXIT
+    )
+    assert listener.closed is False
+    assert h.worker.closed is True
 
 
 # --- Configuration wiring (fix 4: config.toml lands) -------------------------
@@ -620,7 +753,7 @@ def test_start_passes_configured_source_to_recorder() -> None:
 
 
 def test_build_fcitx_factory_wires_timeout() -> None:
-    factory = build_fcitx_factory(Config(fcitx_commit_timeout_ms=2.5))
+    factory = build_fcitx_factory(Config(fcitx_commit_timeout_ms=2500))
     assert factory.func is FcitxClient  # type: ignore[attr-defined]
     assert factory.keywords == {"timeout": 2.5}  # type: ignore[attr-defined]
 

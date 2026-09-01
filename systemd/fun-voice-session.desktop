@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Fun Voice Ryan Session Bridge
-Comment=Import the graphical session into the voice daemon and trigger the bridge
-Exec=@REPO_ROOT@/scripts/start-session-bridge.sh
+Name=Fun Voice Ryan Session Environment
+Comment=Import the graphical session into the voice daemon
+Exec=@REPO_ROOT@/scripts/import-session-environment.sh
 OnlyShowIn=Deepin;
 X-GNOME-Autostart-Phase=Applications
 NoDisplay=true

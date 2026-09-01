@@ -16,20 +16,13 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import socket
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from fun_voice.config import get_xdg_runtime_dir
-from fun_voice.desktop import (
-    DEFAULT_HOTKEY,
-    DEFAULT_SHORTCUT_NAME,
-    DdeKeybindingClient,
-    DdeKeybindingError,
-    HotkeyBridge,
-    X11FocusGuard,
-)
 from fun_voice.fcitx import FcitxClient, FcitxCommitError, default_socket_path
 from fun_voice.preflight import (
     CHECK_NAMES,
@@ -42,12 +35,11 @@ from fun_voice.preflight import (
 
 # The persisted POC report produced by a real ``run_preflight`` run.
 REPORT_RELATIVE_PATH = "fun-voice-ryan/poc-report.json"
+DAEMON_DIAGNOSTICS_TIMEOUT_SECONDS = 1.0
 
 # Check names in report order (stable, used by tests and the human view).
 CHECK_NAMES_SELFTEST: tuple[str, ...] = (
-    "dde_service",
-    "super_c_conflict",
-    "bridge_hold_timing",
+    "x11_hotkey",
     "pipewire",
     "fcitx_ping",
     "clipboard",
@@ -86,81 +78,76 @@ class SelfTestReport:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
 
 
-# --- Desktop / DDE checks ----------------------------------------------------
+# --- X11 hotkey check --------------------------------------------------------
 
 
-def check_dde_service(client: DdeKeybindingClient) -> SelfTestResult:
-    """Verify the DDE Keybinding1 service answers on the session bus."""
-    try:
-        client.lookup_conflict(DEFAULT_HOTKEY)
-    except DdeKeybindingError as exc:
-        return SelfTestResult(
-            "dde_service", STATUS_FAIL, {"error_class": type(exc).__name__}
-        )
-    return SelfTestResult("dde_service", STATUS_PASS, {"service": client.SERVICE})
+def probe_hotkey_state(
+    socket_path: str | Path | None = None,
+    *,
+    timeout: float = DAEMON_DIAGNOSTICS_TIMEOUT_SECONDS,
+) -> dict[str, bool] | None:
+    """Read the daemon's privacy-preserving X11 hotkey diagnostics.
 
-
-def check_super_c_conflict(client: DdeKeybindingClient) -> SelfTestResult:
-    """Verify ``Super+C`` is not owned by a *foreign* shortcut.
-
-    Our own registration (from install) is not a conflict: after install the
-    ``LookupConflictShortcut`` answer names our shortcut, which must still pass.
+    The response schema is deliberately closed: any extra, missing, or
+    non-boolean fields are treated as unavailable rather than echoed in the
+    self-test report.
     """
-    try:
-        owner = client.lookup_conflict(DEFAULT_HOTKEY)
-    except DdeKeybindingError as exc:
-        return SelfTestResult(
-            "super_c_conflict", STATUS_FAIL, {"error_class": type(exc).__name__}
-        )
-    foreign = owner is not None and owner != DEFAULT_SHORTCUT_NAME
-    return SelfTestResult(
-        "super_c_conflict",
-        STATUS_FAIL if foreign else STATUS_PASS,
-        {"hotkey": DEFAULT_HOTKEY, "owner": owner},
-    )
-
-
-# --- Bridge hold-timing POC --------------------------------------------------
-
-
-def check_bridge_timing() -> SelfTestResult:
-    """POC: the bridge maps C-held -> start_if_idle and C-released -> stop.
-
-    The automated half covers the bridge's key-state mapping and the daemon's
-    key-state read plus its 500 ms press confirmation. The real DDE hold-phase
-    trigger (whether DDE actually invokes the action while the key is held) can
-    only be confirmed by a human against the daemon journal.
-    """
-
-    class _FakeGuard:
-        def __init__(self, down: bool) -> None:
-            self._down = down
-
-        def c_is_down(self) -> bool:
-            return self._down
-
-    def _op(down: bool) -> str | None:
-        sent: list[bytes] = []
-        bridge = HotkeyBridge(cast(X11FocusGuard, _FakeGuard(down)), sent.append)
-        bridge.handle()
-        if not sent:
+    if socket_path is None:
+        xdg = get_xdg_runtime_dir()
+        if not xdg:
             return None
-        payload = json.loads(sent[0].decode("utf-8"))
-        return str(payload.get("op")) if isinstance(payload, dict) else None
+        socket_path = Path(xdg) / "fun-voice-ryan" / "daemon.sock"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(str(socket_path))
+            conn.sendall(b'{"op":"diagnostics"}\n')
+            data = bytearray()
+            while b"\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+        response = json.loads(bytes(data).decode("utf-8"))
+    except Exception:  # noqa: BLE001 - IPC failures map to an actionable check
+        return None
+    expected_keys = {"status", "hotkey_registered", "hotkey_press_seen"}
+    if not isinstance(response, dict) or set(response) != expected_keys:
+        return None
+    registered = response.get("hotkey_registered")
+    press_seen = response.get("hotkey_press_seen")
+    if (
+        response.get("status") != "ok"
+        or not isinstance(registered, bool)
+        or not isinstance(press_seen, bool)
+    ):
+        return None
+    return {"hotkey_registered": registered, "hotkey_press_seen": press_seen}
 
-    detail: dict[str, Any] = {
-        "held": _op(True),
-        "released": _op(False),
-        "automated": "bridge key-state mapping + 500 ms C-key confirmation",
-        "manual_verify": (
-            "hold Super+C and confirm `journalctl --user -u fun-voice-daemon` "
-            "shows `c_pressed_at_trigger=true`"
-        ),
-        "docs": "docs/operations.md",
+
+def check_x11_hotkey(
+    probe: Callable[[], dict[str, bool] | None] = probe_hotkey_state,
+) -> SelfTestResult:
+    """Verify that the daemon owns X11 ``Super+C`` and has seen one press."""
+    try:
+        state = probe()
+    except Exception:  # noqa: BLE001 - injectable self-test probe must not crash
+        state = None
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("hotkey_registered"), bool)
+        or not isinstance(state.get("hotkey_press_seen"), bool)
+        or set(state) != {"hotkey_registered", "hotkey_press_seen"}
+    ):
+        return SelfTestResult(
+            "x11_hotkey", STATUS_FAIL, {"reason": "daemon diagnostics unavailable"}
+        )
+    detail = {
+        "registered": state["hotkey_registered"],
+        "press_seen": state["hotkey_press_seen"],
     }
-    ok = detail["held"] == "start_if_idle" and detail["released"] == "stop"
     return SelfTestResult(
-        "bridge_hold_timing", STATUS_PASS if ok else STATUS_FAIL, detail
+        "x11_hotkey", STATUS_PASS if all(detail.values()) else STATUS_FAIL, detail
     )
 
 
@@ -345,18 +332,16 @@ def load_preflight_report(path: str | Path | None = None) -> PreflightReport | N
 def run_selftest(
     *,
     report: PreflightReport | None = None,
-    dde_client_factory: Callable[[], DdeKeybindingClient] = DdeKeybindingClient,
     fcitx_client: FcitxClient | None = None,
     worker_probe: Callable[[], CheckResult] = probe_worker_health,
     which: Callable[[str], str | None] = shutil.which,
     runtime_dir: str | None = None,
     make_display: Callable[[], Any] | None = None,
+    hotkey_probe: Callable[[], dict[str, bool] | None] = probe_hotkey_state,
 ) -> SelfTestReport:
     """Run every self-test check and aggregate the results."""
     checks: list[SelfTestResult] = [
-        check_dde_service(dde_client_factory()),
-        check_super_c_conflict(dde_client_factory()),
-        check_bridge_timing(),
+        check_x11_hotkey(hotkey_probe),
         check_pipewire(which=which, runtime_dir=runtime_dir),
         check_fcitx_ping(fcitx_client),
         check_clipboard(which=which),

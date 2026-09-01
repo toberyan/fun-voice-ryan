@@ -4,35 +4,44 @@
 # daemon 启动时通过 tomllib 读取。缺失该文件时使用代码内安全默认值；
 # 未知节与未知键会被忽略（向前兼容）。
 #
-# 注意：录音上限（max_recording_minutes）与内存阈值（memory_threshold_minutes）
-# 是捕获侧的安全上界，不在此处暴露、不可配置。
-
-[shortcut]
-# DDE 自定义快捷键（按住说话）。
-hotkey = "<Super>C"
+# 注意：热键固定为 <Super>C；模型固定为 Fun-ASR-Nano-2512；Fcitx 主通道固定为
+# fcitx5；录音上限、内存阈值和“不保留历史”是安全上界，不在此处暴露、不可配置。
 
 [audio]
 # PipeWire 输入源；原样传给 `pw-record --target`。
 source = "default"
 
 [input_method]
-# 首选输入法通道（当前固定为 fcitx5，未接线）。
-primary = "fcitx5"
-# Fcitx 提交超时，单位：秒（0.5 即 500 毫秒）。
-fcitx_commit_timeout_ms = 0.5
+# Fcitx 提交超时，单位：毫秒；500 即 0.5 秒。
+commit_timeout_ms = 500
 # fcitx 上屏失败时是否允许 XTEST Ctrl+V 回退；false 时只通知失败，不注入。
 allow_x11_paste_fallback = true
 
 [inference]
-# Worker 推理配置；默认值与 preflight 硬门检查常量一致。
-model = "FunAudioLLM/Fun-ASR-Nano-2512"
+# Worker 推理配置；device 只接受 xpu:0，禁止 CPU 回退。
 device = "xpu:0"
 dtype = "bf16"
-gpu_memory_utilization = 0.35
+# Nano 的 vLLM KV Cache 上限；范围固定为 0.10..0.20，默认 0.15。
+gpu_memory_utilization = 0.15
+# Nano 单次解码的最大上下文；范围固定为 1024..1536。
+max_model_len = 1536
+# 模型 worker 在最后一次请求完成后空闲多久退出并释放 XPU 内存；30..300 秒。
+idle_unload_seconds = 120
+# 仅 Nano 无法加载或 XPU OOM 时才改用 SenseVoiceSmall；普通结果不降级。
+allow_sensevoice_fallback = true
 enforce_eager = true
-# Worker 预热策略（当前未接线，保留为文档占位）。
-keep_warm_until_logout = true
 
-[privacy]
-# 是否保留历史（当前未接线，恒为 false；不持久化录音或转写文本）。
-retain_history = false
+[enhanced]
+# 启用后，ASR 完成才会启动一次 Qwen3.5-0.8B 修正子进程；进程返回即退出。
+enabled = true
+
+[correction]
+# 模型、设备和精度固定；禁止切换其他 Qwen 或 CPU 后端。
+model = "Qwen/Qwen3.5-0.8B"
+device = "xpu:0"
+dtype = "bf16"
+# Qwen 使用 Transformers 的 XPU 直推：只为当前请求分配动态 KV，不预留 vLLM KV pool。
+# 下列两个上界保留为短请求安全契约（0.10..0.20、1024..1536）。
+gpu_memory_utilization = 0.15
+max_model_len = 1536
+enable_thinking = false

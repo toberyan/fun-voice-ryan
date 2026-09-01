@@ -77,7 +77,10 @@ Corrector 作为独立用户级服务而不是嵌入 ASR Worker：Qwen3.5 的模
 
 同一用户只允许一个增强转写任务。Worker 内的 VAD、Nano、对齐和 CAM++ 按顺序执行；Corrector 仅在原始结构化结果完成后执行。Daemon 对 Corrector 设置请求超时，Corrector 内部串行化 `generate()`。
 
-Nano 的已验证启动预算保持不变。Qwen3.5 使用独立、保守的 XPU 内存预算和 `max_model_len=4096`；最终预算以本机 POC 的实测峰值为准，不写死为未经验证的数值。Qwen3.5 必须使用 `language_model_only`/text-only 配置，避免加载对文本修正无用的视觉分支。
+Nano 与 Qwen3.5 均使用独立、保守的 XPU 内存预算：
+`gpu_memory_utilization=0.15`、`max_model_len=1536`。它们绝不常驻重叠；Qwen
+只在一次修正请求的独立子进程中加载，响应后退出。Qwen3.5 必须使用
+`language_model_only`/text-only 配置，避免加载对文本修正无用的视觉分支。
 
 ## 4. 原始结构化结果契约
 
@@ -236,7 +239,8 @@ result_max_entries = 8
 model = "Qwen/Qwen3.5-0.8B"
 device = "xpu:0"
 dtype = "bf16"
-max_model_len = 4096
+gpu_memory_utilization = 0.15
+max_model_len = 1536
 enable_thinking = false
 
 [speaker_identity]

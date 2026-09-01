@@ -99,6 +99,12 @@ allow_sensevoice_fallback = true
 允许的范围为 `0.10..0.20`、`1024..1536` 与 `30..300` 秒。设置超出范围会在服务启动
 前拒绝，防止配置再次创建大 KV Cache。Qwen 的模型标识仍固定为
 `Qwen/Qwen3.5-0.8B`；它的 on-demand 生命周期不开放为其他模型选择。
+本机 vLLM 0.28 的 Qwen3.5 混合注意力 XPU 路径会生成乱码，因而 Qwen 专用子进程改用
+Transformers 原生 `xpu:0` 推理。它只创建本次生成的动态 KV，而不预留 vLLM KV pool；
+模型 id、BF16、无思考与“一次请求后退出”边界均不变，也没有 CPU 或其他模型回退。
+为适配 0.8B 模型稳定输出开起始 sentinel 但偶尔在 EOS 前遗漏结束 sentinel 的行为，
+校验器只接受无嵌套 marker 的干净起始包裹，并额外要求输出长度和字符级相似度满足
+保守阈值；其余结果均使用 raw ASR 文本。
 
 健康接口只返回 profile、`model_ready`、`active_requests` 和距空闲卸载的秒数。日志只记录
 模型 profile、状态、耗时和错误码，不记录音频路径或文本。验收需实测：登录后没有

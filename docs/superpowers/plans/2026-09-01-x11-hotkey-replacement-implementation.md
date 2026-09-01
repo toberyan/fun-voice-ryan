@@ -453,8 +453,8 @@
   PYTHONPATH=src .venv/bin/pytest -q
   .venv/bin/ruff check src tests
   .venv/bin/mypy src
-  cmake --build build
-  ctest --test-dir build --output-on-failure
+  cmake --build build/fcitx
+  ctest --test-dir build/fcitx --output-on-failure
   git diff --check
   ```
 
@@ -465,7 +465,7 @@
   按顺序执行（这会注销已验证归属的旧 DDE shortcut）：
 
   ```bash
-  uv sync
+  uv sync --inexact
   scripts/install-user.sh
   systemctl --user status fun-voice-daemon.service --no-pager
   fun-voice-selftest --format json

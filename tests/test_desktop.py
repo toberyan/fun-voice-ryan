@@ -1,44 +1,37 @@
-"""Tests for the DDE, X11 focus, clipboard and XTEST desktop adapters.
+"""Tests for X11 hotkey/focus, clipboard and XTEST desktop adapters.
 
 Every external boundary is a replaceable adapter, so these tests use fakes for
-the D-Bus command runner, the X11 display and the monotonic clock. No real X
-server or DDE session is required.
+the command runner, the X11 display and the monotonic clock. No real X server
+is required.
 """
 
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from fun_voice.contracts import FocusSnapshot, encode_message
+from fun_voice.contracts import FocusSnapshot
 from fun_voice.desktop import (
+    X_KEY_PRESS,
+    X_KEY_RELEASE,
     XK_C,
     XK_CONTROL_L,
     XK_V,
     ClipboardError,
     ClipboardMirror,
-    DdeKeybindingClient,
-    DdeKeybindingError,
-    DdeShortcutConflict,
-    HotkeyBridge,
     X11Error,
     X11FocusGuard,
+    X11HotkeyListener,
+    X11HotkeyUnavailable,
     XTestError,
     XTestInjector,
-    parse_busctl_string,
-    parse_shortcut_struct,
-    register_shortcut,
-    unregister_shortcut,
+    default_runner,
 )
 
 # --- Fakes -------------------------------------------------------------------
-
-_SERVICE = "org.deepin.dde.Keybinding1"
-_PATH = "/org/deepin/dde/Keybinding1"
-_INTERFACE = "org.deepin.dde.Keybinding1"
-
 
 class FakeRunner:
     """Records invocations and returns canned (returncode, stdout, stderr)."""
@@ -91,6 +84,14 @@ class _FakeScreen:
         self.root = root
 
 
+class _InputFocusReply:
+    """Matches python-xlib's attribute-based GetInputFocus reply."""
+
+    def __init__(self, focus: int | None, revert_to: int = 0) -> None:
+        self.focus = focus
+        self.revert_to = revert_to
+
+
 class FakeDisplay:
     """Minimal X display double shared by the focus guard and XTEST injector."""
 
@@ -103,6 +104,7 @@ class FakeDisplay:
         keymap: list[int] | None = None,
         c_keycode: int = 54,
         explode: bool = False,
+        input_focus_reply: bool = False,
     ) -> None:
         self.root = _FakeRootWindow(active_window)
         self._focus = input_focus
@@ -110,6 +112,7 @@ class FakeDisplay:
         self._keymap = keymap if keymap is not None else [0] * 32
         self._c_keycode = c_keycode
         self._explode = explode
+        self._input_focus_reply = input_focus_reply
         self.keysym_calls: list[int] = []
         self.sync_calls = 0
         self.fake_input_events: list[tuple[int, int]] = []
@@ -120,9 +123,11 @@ class FakeDisplay:
     def intern_atom(self, name: str) -> str:
         return name
 
-    def get_input_focus(self) -> tuple[int | None, int]:
+    def get_input_focus(self) -> tuple[int | None, int] | _InputFocusReply:
         if self._explode:
             raise RuntimeError("X server connection lost")
+        if self._input_focus_reply:
+            return _InputFocusReply(self._focus)
         return (self._focus, 0)
 
     def create_resource_object(self, kind: str, wid: int) -> _FakeWindow:
@@ -145,248 +150,228 @@ class FakeDisplay:
         self.sync_calls += 1
 
 
-def _conflict_output(
-    *,
-    shortcut_id: str = "org.deepin.dde.keybinding.shortcut.app.uos-ai-talk",
-    name: str = "UOS AI Talk",
-) -> str:
-    return (
-        f'(sssasssbb) "{shortcut_id}" "{name}" "UOS AI" 1 '
-        '"<Control><Super>space" "" "" false true'
+class _FakeHotkeyRoot(_FakeRootWindow):
+    """X11 root double that records passive keyboard grabs."""
+
+    def __init__(self, display: FakeHotkeyDisplay) -> None:
+        super().__init__(active_window=None)
+        self._display = display
+
+    def grab_key(
+        self,
+        key: int,
+        modifiers: int,
+        owner_events: bool,
+        pointer_mode: int,
+        keyboard_mode: int,
+        onerror: object | None = None,
+    ) -> None:
+        self._display.grabs.append((key, modifiers))
+        if modifiers == self._display.fail_modifier and callable(onerror):
+            self._display.grabs_before_failure = list(self._display.grabs[:-1])
+            onerror(RuntimeError("BadAccess"), object())
+
+    def ungrab_key(self, key: int, modifiers: int) -> None:
+        self._display.ungrabs.append((key, modifiers))
+
+
+class FakeHotkeyDisplay:
+    """Minimal X11 display double for global grab registration and events."""
+
+    c_keycode = 54
+    super_keycode = 133
+    num_lock_keycode = 77
+    scroll_lock_keycode = 78
+
+    def __init__(
+        self,
+        *,
+        super_index: int = 6,
+        num_index: int = 4,
+        scroll_index: int = 7,
+        fail_modifier: int | None = None,
+        c_keycode: int | None = None,
+    ) -> None:
+        self.c_keycode = self.c_keycode if c_keycode is None else c_keycode
+        self._root = _FakeHotkeyRoot(self)
+        self._mapping = [[] for _ in range(8)]
+        self._mapping[super_index].append(self.super_keycode)
+        self._mapping[num_index].append(self.num_lock_keycode)
+        self._mapping[scroll_index].append(self.scroll_lock_keycode)
+        self.fail_modifier = fail_modifier
+        self.grabs: list[tuple[int, int]] = []
+        self.grabs_before_failure: list[tuple[int, int]] = []
+        self.ungrabs: list[tuple[int, int]] = []
+        self.sync_calls = 0
+        self.closed = False
+
+    def screen(self) -> _FakeScreen:
+        return _FakeScreen(self._root)
+
+    def keysym_to_keycode(self, keysym: int) -> int:
+        mapping = {
+            XK_C: self.c_keycode,
+            0xFFEB: self.super_keycode,  # XK_Super_L
+            0xFFEC: 134,  # XK_Super_R
+            0xFF7F: self.num_lock_keycode,  # XK_Num_Lock
+            0xFF14: self.scroll_lock_keycode,  # XK_Scroll_Lock
+        }
+        return mapping.get(keysym, 0)
+
+    def get_modifier_mapping(self) -> list[list[int]]:
+        return self._mapping
+
+    def fileno(self) -> int:
+        return 0
+
+    def next_event(self) -> object:
+        raise AssertionError("select_ready=False must avoid next_event")
+
+    def pending_events(self) -> int:
+        return 0
+
+    def sync(self) -> None:
+        self.sync_calls += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeKeyEvent:
+    def __init__(self, event_type: int, detail: int, state: int) -> None:
+        self.type = event_type
+        self.detail = detail
+        self.state = state
+
+
+def _make_hotkey_listener(
+    display: FakeHotkeyDisplay,
+    on_press: Callable[[], None],
+    on_release: Callable[[], None],
+) -> X11HotkeyListener:
+    return X11HotkeyListener(
+        on_press,
+        on_release,
+        make_display=lambda: display,
+        select_ready=lambda _fd, _timeout: False,
     )
 
 
-# --- DdeKeybindingClient -----------------------------------------------------
+# --- X11 global hotkey -------------------------------------------------------
 
 
-def test_lookup_conflict_returns_none_when_free() -> None:
-    runner = FakeRunner((0, '(sssasssbb) "" "" "" 0 "" "" false false', ""))
-    client = DdeKeybindingClient(runner)
-    assert client.lookup_conflict("<Super>C") is None
-    assert runner.calls[0][0] == (
-        "busctl",
-        "--user",
-        "call",
-        _SERVICE,
-        _PATH,
-        _INTERFACE,
-        "LookupConflictShortcut",
-        "s",
-        "<Super>C",
+def test_x11_hotkey_grabs_super_c_with_every_lock_combination() -> None:
+    display = FakeHotkeyDisplay(super_index=6, num_index=4, scroll_index=7)
+    listener = _make_hotkey_listener(display, lambda: None, lambda: None)
+
+    listener.start()
+
+    super_mask = 1 << 6
+    lock_mask = 1 << 1
+    num_mask = 1 << 4
+    scroll_mask = 1 << 7
+    assert {modifiers for _key, modifiers in display.grabs} == {
+        super_mask,
+        super_mask | lock_mask,
+        super_mask | num_mask,
+        super_mask | scroll_mask,
+        super_mask | lock_mask | num_mask,
+        super_mask | lock_mask | scroll_mask,
+        super_mask | num_mask | scroll_mask,
+        super_mask | lock_mask | num_mask | scroll_mask,
+    }
+    listener.close()
+
+
+def test_x11_hotkey_rolls_back_every_successful_grab_on_bad_access() -> None:
+    super_mask = 1 << 6
+    lock_mask = 1 << 1
+    display = FakeHotkeyDisplay(fail_modifier=super_mask | lock_mask)
+    listener = _make_hotkey_listener(display, lambda: None, lambda: None)
+    with pytest.raises(X11HotkeyUnavailable, match="already grabbed"):
+        listener.start()
+
+    assert display.ungrabs == display.grabs_before_failure
+    assert display.closed is True
+
+
+def test_x11_hotkey_press_repeat_and_release_call_each_callback_once() -> None:
+    calls: list[str] = []
+    display = FakeHotkeyDisplay()
+    listener = _make_hotkey_listener(
+        display,
+        lambda: calls.append("start"),
+        lambda: calls.append("stop"),
     )
+    listener.start()
 
-
-def test_lookup_conflict_reports_owner() -> None:
-    runner = FakeRunner((0, _conflict_output(), ""))
-    client = DdeKeybindingClient(runner)
-    assert client.lookup_conflict("<Super>C") == "UOS AI Talk"
-
-
-def test_lookup_conflict_decodes_octal_escaped_owner() -> None:
-    # "语音对话" escaped by busctl as octal UTF-8 byte sequences.
-    runner = FakeRunner(
-        (
-            0,
-            _conflict_output(name="\\350\\257\\255\\351\\237\\263\\345\\257\\271\\350\\257\\235"),
-            "",
-        )
+    super_mask = 1 << 6
+    listener.handle_event(
+        FakeKeyEvent(X_KEY_PRESS, display.c_keycode, super_mask)
     )
-    client = DdeKeybindingClient(runner)
-    assert client.lookup_conflict("<Super>C") == "语音对话"
-
-
-def test_lookup_conflict_falls_back_to_id_when_name_empty() -> None:
-    runner = FakeRunner((0, _conflict_output(name=""), ""))
-    client = DdeKeybindingClient(runner)
-    assert (
-        client.lookup_conflict("<Super>C")
-        == "org.deepin.dde.keybinding.shortcut.app.uos-ai-talk"
+    listener.handle_event(
+        FakeKeyEvent(X_KEY_PRESS, display.c_keycode, super_mask)
     )
-
-
-def test_add_custom_shortcut_returns_id() -> None:
-    runner = FakeRunner((0, 's "org.deepin.dde.keybinding.shortcut.custom.42"', ""))
-    client = DdeKeybindingClient(runner)
-    got = client.add_custom_shortcut(
-        "Fun Voice Ryan", "/usr/bin/fun-voice-bridge", "<Super>C"
+    # Super may be released before C. The matching C release still stops once.
+    listener.handle_event(
+        FakeKeyEvent(X_KEY_RELEASE, display.c_keycode, 0)
     )
-    assert got == "org.deepin.dde.keybinding.shortcut.custom.42"
-    assert runner.calls[0][0] == (
-        "busctl",
-        "--user",
-        "call",
-        _SERVICE,
-        _PATH,
-        _INTERFACE,
-        "AddCustomShortcut",
-        "sss",
-        "Fun Voice Ryan",
-        "/usr/bin/fun-voice-bridge",
-        "<Super>C",
+    listener.flush_pending_release()
+    listener.handle_event(
+        FakeKeyEvent(X_KEY_RELEASE, display.c_keycode, 0)
     )
+    listener.flush_pending_release()
+
+    assert calls == ["start", "stop"]
+    listener.close()
 
 
-def test_delete_custom_shortcut_is_a_noop_return() -> None:
-    runner = FakeRunner((0, "b true", ""))
-    client = DdeKeybindingClient(runner)
-    assert client.delete_custom_shortcut("custom.42") is None
-    assert runner.calls[0][0] == (
-        "busctl",
-        "--user",
-        "call",
-        _SERVICE,
-        _PATH,
-        _INTERFACE,
-        "DeleteCustomShortcut",
-        "s",
-        "custom.42",
+def test_x11_hotkey_ignores_core_auto_repeat_release_press_pairs() -> None:
+    calls: list[str] = []
+    display = FakeHotkeyDisplay()
+    listener = _make_hotkey_listener(
+        display,
+        lambda: calls.append("start"),
+        lambda: calls.append("stop"),
     )
+    listener.start()
+
+    super_mask = 1 << 6
+    listener.handle_event(FakeKeyEvent(X_KEY_PRESS, display.c_keycode, super_mask))
+    listener.handle_event(FakeKeyEvent(X_KEY_RELEASE, display.c_keycode, super_mask))
+    listener.handle_event(FakeKeyEvent(X_KEY_PRESS, display.c_keycode, super_mask))
+    listener.flush_pending_release()
+
+    assert calls == ["start"]
+
+    listener.handle_event(FakeKeyEvent(X_KEY_RELEASE, display.c_keycode, 0))
+    listener.flush_pending_release()
+    assert calls == ["start", "stop"]
+    listener.close()
 
 
-def test_dde_call_failure_raises() -> None:
-    runner = FakeRunner((1, "", "No such method"))
-    client = DdeKeybindingClient(runner)
-    with pytest.raises(DdeKeybindingError, match="No such method"):
-        client.lookup_conflict("<Super>C>")
+def test_x11_hotkey_rejects_missing_super_mapping_and_releases_nothing() -> None:
+    display = FakeHotkeyDisplay()
+    display.get_modifier_mapping()[6].clear()
+    listener = _make_hotkey_listener(display, lambda: None, lambda: None)
+    with pytest.raises(X11HotkeyUnavailable, match="Super"):
+        listener.start()
+
+    assert display.grabs == []
+    assert display.ungrabs == []
+    assert display.closed is True
 
 
-def test_parse_busctl_string() -> None:
-    assert parse_busctl_string('s "hello"') == "hello"
+def test_x11_hotkey_close_is_idempotent_and_releases_every_grab() -> None:
+    display = FakeHotkeyDisplay()
+    listener = _make_hotkey_listener(display, lambda: None, lambda: None)
+    listener.start()
 
+    listener.close()
+    listener.close()
 
-def test_parse_shortcut_struct_empty() -> None:
-    info = parse_shortcut_struct('(sssasssbb) "" "" "" 0 "" "" false false')
-    assert info is not None
-    assert info.id == ""
-    assert info.name == ""
-    assert info.accels == ()
-
-
-# --- Registration ------------------------------------------------------------
-
-
-def test_register_shortcut_persists_id(tmp_path: Path) -> None:
-    state_file = tmp_path / "shortcut-id"
-    runner = FakeRunner(
-        (0, '(sssasssbb) "" "" "" 0 "" "" false false', ""),  # lookup: free
-        (0, 's "custom.7"', ""),  # add
-    )
-    client = DdeKeybindingClient(runner)
-    got = register_shortcut(
-        client,
-        name="Fun Voice Ryan",
-        action="/usr/bin/fun-voice-bridge",
-        hotkey="<Super>C",
-        state_file=state_file,
-    )
-    assert got == "custom.7"
-    assert state_file.read_text(encoding="utf-8") == "custom.7\n"
-    methods = [call[0][6] for call in runner.calls]
-    assert methods == ["LookupConflictShortcut", "AddCustomShortcut"]
-
-
-def test_register_shortcut_conflict_does_not_modify_dde(tmp_path: Path) -> None:
-    state_file = tmp_path / "shortcut-id"
-    runner = FakeRunner((0, _conflict_output(), ""))
-    client = DdeKeybindingClient(runner)
-    with pytest.raises(DdeShortcutConflict, match="UOS AI Talk"):
-        register_shortcut(
-            client,
-            name="Fun Voice Ryan",
-            action="/usr/bin/fun-voice-bridge",
-            hotkey="<Super>C",
-            state_file=state_file,
-        )
-    assert len(runner.calls) == 1
-    assert runner.calls[0][0][6] == "LookupConflictShortcut"
-    assert not state_file.exists()
-
-
-def test_unregister_shortcut_deletes_and_clears(tmp_path: Path) -> None:
-    state_file = tmp_path / "shortcut-id"
-    state_file.write_text("custom.9\n", encoding="utf-8")
-    runner = FakeRunner((0, "b true", ""))
-    client = DdeKeybindingClient(runner)
-    assert unregister_shortcut(client, state_file=state_file) == "custom.9"
-    assert runner.calls[0][0][6] == "DeleteCustomShortcut"
-    assert runner.calls[0][0][-1] == "custom.9"
-    assert not state_file.exists()
-
-
-def test_unregister_shortcut_without_state_is_noop(tmp_path: Path) -> None:
-    runner = FakeRunner()
-    client = DdeKeybindingClient(runner)
-    assert unregister_shortcut(client, state_file=tmp_path / "missing") is None
-    assert runner.calls == []
-
-
-def test_unregister_corrupted_state_file_is_noop(tmp_path: Path) -> None:
-    state_file = tmp_path / "shortcut-id"
-    state_file.write_bytes(b"\xff\xfe\x00garbage")
-    runner = FakeRunner()
-    client = DdeKeybindingClient(runner)
-    assert unregister_shortcut(client, state_file=state_file) is None
-    assert runner.calls == []
-
-
-# --- Hotkey bridge -----------------------------------------------------------
-
-
-def _make_bridge(
-    keymap: list[int] | None = None,
-    *,
-    c_keycode: int = 54,
-    c_down: bool = False,
-) -> tuple[HotkeyBridge, FakeDisplay, list[bytes]]:
-    sent: list[bytes] = []
-    display = FakeDisplay(keymap=keymap, c_keycode=c_keycode)
-    if c_down:
-        byte = c_keycode // 8
-        bit = c_keycode % 8
-        display._keymap[byte] |= 1 << bit
-    guard = X11FocusGuard(display=display, monotonic=lambda: 0)
-    bridge = HotkeyBridge(guard, sent.append)
-    return bridge, display, sent
-
-
-def test_bridge_c_down_sends_start_if_idle() -> None:
-    bridge, _, sent = _make_bridge(c_down=True)
-    assert bridge.handle() == "start"
-    assert sent == [encode_message({"op": "start_if_idle"})]
-
-
-def test_bridge_c_up_sends_stop() -> None:
-    bridge, _, sent = _make_bridge(c_down=False)
-    assert bridge.handle() == "stop"
-    assert sent == [encode_message({"op": "stop"})]
-
-
-def test_bridge_repeated_actions_are_idempotent_requests() -> None:
-    bridge, _, sent = _make_bridge(c_down=True)
-    bridge.handle()
-    bridge.handle()
-    bridge.handle()
-    # Every hold trigger is a start_if_idle; the daemon makes it a no-op while
-    # already recording, so repeats never toggle or stack.
-    assert sent == [encode_message({"op": "start_if_idle"})] * 3
-
-
-def test_bridge_uses_live_c_key_state() -> None:
-    # Same keycode, but the keymap flips between down and up across calls.
-    keymap = [0] * 32
-    display = FakeDisplay(keymap=keymap, c_keycode=54)
-    guard = X11FocusGuard(display=display, monotonic=lambda: 0)
-    sent: list[bytes] = []
-    bridge = HotkeyBridge(guard, sent.append)
-
-    keymap[6] = 1 << 6  # C down
-    assert bridge.handle() == "start"
-    keymap[6] = 0  # C up
-    assert bridge.handle() == "stop"
-    assert sent == [
-        encode_message({"op": "start_if_idle"}),
-        encode_message({"op": "stop"}),
-    ]
+    assert display.ungrabs == display.grabs
+    assert display.closed is True
 
 
 # --- X11 focus guard ---------------------------------------------------------
@@ -417,6 +402,17 @@ def test_focus_guard_missing_properties_are_none() -> None:
     assert snap.input_focus is None
     assert snap.window_pid is None
     assert snap.process_name is None
+
+
+def test_focus_guard_accepts_python_xlib_input_focus_reply() -> None:
+    display = FakeDisplay(
+        active_window=0x123,
+        input_focus=0x456,
+        input_focus_reply=True,
+    )
+    guard = X11FocusGuard(display=display, monotonic=lambda: 0)
+
+    assert guard.capture().input_focus == 0x456
 
 
 def test_focus_guard_x_server_error_raises() -> None:
@@ -488,6 +484,34 @@ def test_c_is_down_invalid_keycode_returns_false() -> None:
 
 
 # --- Clipboard mirror --------------------------------------------------------
+
+
+def test_default_runner_does_not_capture_xclip_background_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """xclip forks its selection owner, which inherits captured stderr."""
+
+    seen: dict[str, object] = {}
+
+    class Result:
+        returncode = 0
+        stdout = None
+        stderr = None
+
+    def fake_run(*args: object, **kwargs: object) -> Result:
+        seen.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr("fun_voice.desktop.subprocess.run", fake_run)
+
+    assert default_runner(["xclip", "-selection", "clipboard", "-in"], "text") == (
+        0,
+        "",
+        "",
+    )
+    assert seen["stdout"] is subprocess.DEVNULL
+    assert seen["stderr"] is subprocess.DEVNULL
+    assert "capture_output" not in seen
 
 
 def test_clipboard_writes_via_xclip() -> None:

@@ -1,4 +1,4 @@
-"""Unit tests for the post-install self-test (fake DDE / X11 / sockets)."""
+"""Unit tests for the post-install self-test (fake X11/runtime sockets)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from typing import Any
 import pytest
 
 from fun_voice import selftest
-from fun_voice.desktop import DdeKeybindingClient, DdeKeybindingError
 from fun_voice.fcitx import FcitxCommitError
 from fun_voice.preflight import (
     CHECK_NAMES,
@@ -20,33 +19,17 @@ from fun_voice.preflight import (
 from fun_voice.selftest import (
     SelfTestReport,
     SelfTestResult,
-    check_bridge_timing,
     check_clipboard,
     check_fcitx_ping,
     check_pipewire,
-    check_super_c_conflict,
     check_worker_health,
+    check_x11_hotkey,
     check_xpu_hard_gate,
     check_xtest_eligibility,
     load_preflight_report,
+    probe_hotkey_state,
     run_selftest,
 )
-
-# --- Fakes -------------------------------------------------------------------
-
-
-class _FakeDdeClient(DdeKeybindingClient):
-    """DDE client stub: answers lookup_conflict without touching busctl."""
-
-    def __init__(self, owner: str | None = None, *, error: bool = False) -> None:
-        super().__init__(runner=None)
-        self._owner = owner
-        self._error = error
-
-    def lookup_conflict(self, hotkey: str) -> str | None:
-        if self._error:
-            raise DdeKeybindingError("org.deepin.dde.Keybinding1 not found")
-        return self._owner
 
 
 class _FakeFcitx:
@@ -87,47 +70,92 @@ def _pass_report() -> PreflightReport:
     return PreflightReport(device="xpu:0", checks=checks, ready=True)
 
 
-# --- Individual checks -------------------------------------------------------
+def _probe_reply(
+    monkeypatch: pytest.MonkeyPatch, response: object
+) -> tuple[dict[str, bytes], dict[str, bool] | None]:
+    sent: dict[str, bytes] = {}
+    payload = json.dumps(response).encode("utf-8") + b"\n"
+
+    class _FakeSocket:
+        def __enter__(self) -> _FakeSocket:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def settimeout(self, timeout: float) -> None:
+            return None
+
+        def connect(self, path: str) -> None:
+            return None
+
+        def sendall(self, data: bytes) -> None:
+            sent["request"] = data
+
+        def recv(self, size: int) -> bytes:
+            return payload
+
+    monkeypatch.setattr(selftest.socket, "socket", lambda *_args: _FakeSocket())
+    return sent, probe_hotkey_state("/tmp/fun-voice-daemon.sock")
 
 
-def test_dde_service_pass() -> None:
-    result = selftest.check_dde_service(_FakeDdeClient())
-    assert result.name == "dde_service"
+# --- X11 hotkey --------------------------------------------------------------
+
+
+def test_x11_hotkey_passes_after_real_press() -> None:
+    result = check_x11_hotkey(
+        lambda: {"hotkey_registered": True, "hotkey_press_seen": True}
+    )
     assert result.status == STATUS_PASS
-    assert result.detail["service"] == "org.deepin.dde.Keybinding1"
+    assert result.detail == {"registered": True, "press_seen": True}
 
 
-def test_dde_service_fail_when_service_missing() -> None:
-    result = selftest.check_dde_service(_FakeDdeClient(error=True))
+def test_x11_hotkey_fails_before_any_press_without_sensitive_data() -> None:
+    result = check_x11_hotkey(
+        lambda: {"hotkey_registered": True, "hotkey_press_seen": False}
+    )
     assert result.status == STATUS_FAIL
-    assert result.detail["error_class"] == "DdeKeybindingError"
+    assert result.detail == {"registered": True, "press_seen": False}
 
 
-def test_super_c_conflict_pass_when_owned_by_self() -> None:
-    from fun_voice.desktop import DEFAULT_SHORTCUT_NAME
-
-    result = check_super_c_conflict(_FakeDdeClient(owner=DEFAULT_SHORTCUT_NAME))
-    assert result.status == STATUS_PASS
-    assert result.detail["owner"] == DEFAULT_SHORTCUT_NAME
-
-
-def test_super_c_conflict_pass_when_free() -> None:
-    result = check_super_c_conflict(_FakeDdeClient(owner=None))
-    assert result.status == STATUS_PASS
-    assert result.detail["hotkey"] == "<Super>C"
-
-
-def test_super_c_conflict_fail_when_owned() -> None:
-    result = check_super_c_conflict(_FakeDdeClient(owner="Other App"))
+def test_x11_hotkey_fails_when_daemon_cannot_be_reached() -> None:
+    result = check_x11_hotkey(lambda: None)
     assert result.status == STATUS_FAIL
-    assert result.detail["owner"] == "Other App"
+    assert result.detail["reason"] == "daemon diagnostics unavailable"
 
 
-def test_bridge_hold_timing_maps_key_state() -> None:
-    result = check_bridge_timing()
-    assert result.status == STATUS_PASS
-    assert result.detail["held"] == "start_if_idle"
-    assert result.detail["released"] == "stop"
+def test_hotkey_probe_reads_only_expected_boolean_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent, result = _probe_reply(
+        monkeypatch,
+        {"status": "ok", "hotkey_registered": True, "hotkey_press_seen": False},
+    )
+    assert sent["request"] == b'{"op":"diagnostics"}\n'
+    assert result == {"hotkey_registered": True, "hotkey_press_seen": False}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"status": "ok", "hotkey_registered": 1, "hotkey_press_seen": True},
+        {
+            "status": "ok",
+            "hotkey_registered": True,
+            "hotkey_press_seen": False,
+            "extra": 1,
+        },
+        {"status": "error", "hotkey_registered": True, "hotkey_press_seen": True},
+    ],
+)
+def test_hotkey_probe_rejects_malformed_or_extra_payload(
+    monkeypatch: pytest.MonkeyPatch, response: object
+) -> None:
+    _sent, result = _probe_reply(monkeypatch, response)
+    assert result is None
+
+
+# --- Remaining runtime checks -----------------------------------------------
 
 
 def test_pipewire_pass_via_socket(tmp_path: Any) -> None:
@@ -143,6 +171,7 @@ def test_pipewire_pass_via_cli() -> None:
     result = check_pipewire(which=lambda name: "/usr/bin/" + name, runtime_dir=None)
     assert result.status == STATUS_PASS
     assert result.detail["cli"] is True
+
 
 def test_pipewire_fail_when_neither(tmp_path: Any) -> None:
     result = check_pipewire(
@@ -227,9 +256,7 @@ def test_xpu_hard_gate_fail_when_report_missing() -> None:
 
 
 def test_xpu_hard_gate_fail_when_gate_missing() -> None:
-    checks = tuple(
-        CheckResult(name, STATUS_PASS, {}) for name in CHECK_NAMES[:-1]
-    )
+    checks = tuple(CheckResult(name, STATUS_PASS, {}) for name in CHECK_NAMES[:-1])
     report = PreflightReport(device="xpu:0", checks=checks, ready=True)
     result = check_xpu_hard_gate(report)
     assert result.status == STATUS_FAIL
@@ -250,12 +277,12 @@ def test_xpu_hard_gate_fail_when_not_ready() -> None:
 def _all_pass_report() -> SelfTestReport:
     return run_selftest(
         report=_pass_report(),
-        dde_client_factory=lambda: _FakeDdeClient(),
         fcitx_client=_FakeFcitx(pong=True),  # type: ignore[arg-type]
         worker_probe=lambda: CheckResult("worker_health", STATUS_PASS, {}),
         which=lambda name: "/usr/bin/" + name,
         runtime_dir=None,
         make_display=lambda: _FakeDisplay(present=1),
+        hotkey_probe=lambda: {"hotkey_registered": True, "hotkey_press_seen": True},
     )
 
 
@@ -263,19 +290,26 @@ def test_report_ok_when_all_pass() -> None:
     assert _all_pass_report().ok is True
 
 
-def test_report_not_ok_when_one_check_fails() -> None:
+def test_report_not_ok_when_x11_hotkey_not_seen() -> None:
     report = run_selftest(
         report=_pass_report(),
-        dde_client_factory=lambda: _FakeDdeClient(owner="Other App"),
         fcitx_client=_FakeFcitx(pong=True),  # type: ignore[arg-type]
         worker_probe=lambda: CheckResult("worker_health", STATUS_PASS, {}),
         which=lambda name: "/usr/bin/" + name,
         runtime_dir=None,
         make_display=lambda: _FakeDisplay(present=1),
+        hotkey_probe=lambda: {"hotkey_registered": True, "hotkey_press_seen": False},
     )
     assert report.ok is False
     by_name = {check.name: check.status for check in report.checks}
-    assert by_name["super_c_conflict"] == STATUS_FAIL
+    assert by_name["x11_hotkey"] == STATUS_FAIL
+
+
+def test_run_selftest_has_one_x11_hotkey_check_and_no_dde_checks() -> None:
+    names = [check.name for check in _all_pass_report().checks]
+    assert names == list(selftest.CHECK_NAMES_SELFTEST)
+    assert names.count("x11_hotkey") == 1
+    assert {"dde_service", "super_c_conflict", "bridge_hold_timing"}.isdisjoint(names)
 
 
 def test_every_result_has_name_status_detail() -> None:
@@ -294,11 +328,8 @@ def test_report_json_omits_sensitive_data() -> None:
     assert "model.pt" not in payload
     assert "/run/user" not in payload
     assert "SECRET" not in payload
-    # The payload still contains all nine check names and their statuses.
     data = json.loads(payload)
     assert data["ok"] is True
-    names = [check["name"] for check in data["checks"]]
-    assert names == list(selftest.CHECK_NAMES_SELFTEST)
     for check in data["checks"]:
         assert set(check) == {"name", "status", "detail"}
 
@@ -331,24 +362,19 @@ def test_load_preflight_report_malformed(tmp_path: Any) -> None:
 def test_main_exits_nonzero_on_failure(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    failing = SelfTestReport(
-        (SelfTestResult("dde_service", STATUS_FAIL, {"error_class": "X"}),)
-    )
+    failing = SelfTestReport((SelfTestResult("x11_hotkey", STATUS_FAIL, {}),))
     monkeypatch.setattr(selftest, "load_preflight_report", lambda _p=None: None)
     monkeypatch.setattr(selftest, "run_selftest", lambda **_kw: failing)
     rc = selftest.main(["--format", "json"])
     assert rc == 1
-    out = capsys.readouterr().out
-    data = json.loads(out)
+    data = json.loads(capsys.readouterr().out)
     assert data["ok"] is False
 
 
 def test_main_exits_zero_when_all_pass(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    passing = SelfTestReport(
-        (SelfTestResult("dde_service", STATUS_PASS, {}),)
-    )
+    passing = SelfTestReport((SelfTestResult("x11_hotkey", STATUS_PASS, {}),))
     monkeypatch.setattr(selftest, "load_preflight_report", lambda _p=None: None)
     monkeypatch.setattr(selftest, "run_selftest", lambda **_kw: passing)
     rc = selftest.main(["--format", "json"])

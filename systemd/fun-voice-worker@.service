@@ -1,0 +1,12 @@
+[Unit]
+Description=Fun Voice Ryan on-demand %i ASR worker
+
+[Service]
+Type=simple
+# This template is started only by the daemon after recording completes. It has
+# no [Install] section, so it cannot become a login-time model service.
+ExecStart=%h/.local/bin/fun-voice-worker --profile %i
+Restart=no
+TimeoutStopSec=30
+Environment=MODELSCOPE_CACHE=%h/.local/share/fun-voice-ryan/models
+Environment=FUN_VOICE_MODELS_ROOT=%h/.local/share/fun-voice-ryan/models

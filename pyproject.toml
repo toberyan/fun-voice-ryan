@@ -4,14 +4,18 @@ version = "0.1.0"
 description = "Fun Voice Ryan 本地语音输入助手"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["python-xlib"]
+dependencies = [
+    "cryptography",
+    "python-xlib",
+    "secretstorage",
+]
 
 [project.scripts]
 fun-voice-daemon = "fun_voice.daemon:main"
 fun-voice-worker = "fun_voice.worker:main"
-fun-voice-bridge = "fun_voice.bridge:main"
 fun-voice-preflight = "fun_voice.preflight:main"
 fun-voice-selftest = "fun_voice.selftest:main"
+fun-voice-corrector = "fun_voice.corrector:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -41,6 +45,7 @@ strict = true
 [[tool.mypy.overrides]]
 module = [
     "torch",
+    "transformers",
     "vllm",
     "vllm.*",
     "funasr",
