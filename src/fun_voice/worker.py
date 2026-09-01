@@ -36,6 +36,7 @@ from typing import Any, Protocol, cast
 from fun_voice import config
 from fun_voice.contracts import (
     MAX_MESSAGE_BYTES,
+    WORKER_RESPONSE_MAX_BYTES,
     ErrorCode,
     MessageTooLarge,
     ProtocolError,
@@ -270,7 +271,7 @@ def _read_line(conn: socket.socket, max_bytes: int = MAX_MESSAGE_BYTES) -> bytes
 
 def _send(conn: socket.socket, response: dict[str, Any]) -> None:
     try:
-        payload = encode_message(response) + b"\n"
+        payload = encode_message(response, max_bytes=WORKER_RESPONSE_MAX_BYTES) + b"\n"
     except (ProtocolError, ValueError):
         payload = encode_message(
             _error_response(None, ERR_PROTOCOL, "response too large")

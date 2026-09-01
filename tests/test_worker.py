@@ -16,6 +16,7 @@ import pytest
 
 from fun_voice.contracts import ErrorCode, Segment, Transcription, WorkerHealth
 from fun_voice.nano_runtime import (
+    VAD_MAX_SINGLE_SEGMENT_TIME_MS,
     VAD_OVERLAP_MS,
     AudioFormatError,
     DeviceMismatchError,
@@ -77,8 +78,17 @@ class FakeFsmnVadModel:
 
     def __init__(self, result: list[dict[str, Any]]) -> None:
         self.result = result
+        self.generate_kwargs: dict[str, Any] | None = None
 
-    def generate(self, input: Any, cache: Any, is_final: Any) -> list[dict[str, Any]]:
+    def generate(
+        self, input: Any, cache: Any, is_final: Any, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        self.generate_kwargs = {
+            "input": input,
+            "cache": cache,
+            "is_final": is_final,
+            **kwargs,
+        }
         return self.result
 
 
@@ -221,6 +231,17 @@ def test_fsmn_vad_detect_malformed_segment_raises() -> None:
     model = FakeFsmnVadModel([{"key": "k", "value": [[100]]}])  # 1-element segment
     with pytest.raises(ModelOutputError):
         FsmnVadSegmenter(model).detect(_silence(), 16000)
+
+
+def test_fsmn_vad_detect_passes_max_single_segment_time() -> None:
+    model = FakeFsmnVadModel([{"key": "k", "value": [[100, 200]]}])
+    FsmnVadSegmenter(model).detect(_silence(), 16000)
+    assert model.generate_kwargs is not None
+    assert (
+        model.generate_kwargs["max_single_segment_time"]
+        == VAD_MAX_SINGLE_SEGMENT_TIME_MS
+    )
+    assert VAD_MAX_SINGLE_SEGMENT_TIME_MS == 30000  # 30 s, in milliseconds
 
 
 # --- ASR error taxonomy -----------------------------------------------------

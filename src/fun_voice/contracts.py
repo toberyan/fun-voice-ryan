@@ -24,6 +24,12 @@ from typing import Any, Literal, cast
 MAX_MESSAGE_BYTES = 64 * 1024
 # Maximum wire size (bytes) of a JSON message or a Fcitx frame.
 
+WORKER_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
+# Maximum wire size (bytes) of a worker response. A 30-minute recording can
+# yield ~100 KB+ of transcribed text (full text plus time-ranged segments),
+# which exceeds the 64 KiB request cap, so responses use a dedicated larger
+# limit while requests stay bounded by MAX_MESSAGE_BYTES.
+
 FCITX_TEXT_LINE_MAX_BYTES = 64 * 1024
 # Maximum UTF-8 byte length of a single Fcitx COMMIT text line.
 
@@ -155,27 +161,34 @@ class WorkerHealth:
 
 
 # --- JSON message codec -----------------------------------------------------
+def encode_message(
+    message: Mapping[str, Any], max_bytes: int = MAX_MESSAGE_BYTES
+) -> bytes:
+    """Encode a bridge/daemon/worker message as single-line UTF-8 JSON.
 
-def encode_message(message: Mapping[str, Any]) -> bytes:
-    """Encode a bridge/daemon/worker message as single-line UTF-8 JSON."""
+    ``max_bytes`` bounds the encoded byte size; worker responses pass the
+    larger ``WORKER_RESPONSE_MAX_BYTES``.
+    """
     data = json.dumps(dict(message), ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8"
     )
     if b"\n" in data or b"\r" in data:
         raise ProtocolError("JSON message must be a single line")
-    if len(data) > MAX_MESSAGE_BYTES:
-        raise MessageTooLarge(f"message exceeds {MAX_MESSAGE_BYTES} bytes")
+    if len(data) > max_bytes:
+        raise MessageTooLarge(f"message exceeds {max_bytes} bytes")
     return data
 
 
-def decode_message(data: bytes) -> dict[str, Any]:
+def decode_message(data: bytes, max_bytes: int = MAX_MESSAGE_BYTES) -> dict[str, Any]:
     """Decode a single-line UTF-8 JSON message into a dict.
 
     Callers are responsible for stripping any line terminator added by the
-    transport; embedded newlines are rejected here.
+    transport; embedded newlines are rejected here. ``max_bytes`` bounds the
+    accepted byte size; worker responses are decoded with
+    ``WORKER_RESPONSE_MAX_BYTES``.
     """
-    if len(data) > MAX_MESSAGE_BYTES:
-        raise MessageTooLarge(f"message exceeds {MAX_MESSAGE_BYTES} bytes")
+    if len(data) > max_bytes:
+        raise MessageTooLarge(f"message exceeds {max_bytes} bytes")
     if b"\n" in data or b"\r" in data:
         raise ProtocolError("JSON message must be a single line")
     try:

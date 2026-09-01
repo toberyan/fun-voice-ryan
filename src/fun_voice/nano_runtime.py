@@ -38,6 +38,8 @@ VERSION = "0.1.0"
 DEVICE = "xpu:0"
 EXPECTED_DEVICE_TYPE = "xpu"
 VAD_OVERLAP_MS = 250  # fixed small overlap applied to VAD region boundaries
+VAD_MAX_SINGLE_SEGMENT_TIME_MS = 30000  # FSMN-VAD hard cap per speech segment (30 s)
+
 DEFAULT_TIMEOUT_SECONDS = 120.0
 MAX_NEW_TOKENS = 512
 
@@ -195,7 +197,12 @@ class FsmnVadSegmenter:
     def detect(
         self, samples: np.ndarray, sample_rate: int
     ) -> list[tuple[int, int]]:
-        result = self._model.generate(input=samples, cache={}, is_final=True)
+        result = self._model.generate(
+            input=samples,
+            cache={},
+            is_final=True,
+            max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
+        )
         if not result:
             raise ModelOutputError("VAD returned no result")
         first = result[0]
@@ -460,5 +467,10 @@ def load_nano_runtime(
 def _load_vad() -> FsmnVadSegmenter:
     from funasr import AutoModel
 
-    model = AutoModel(model="fsmn-vad", device="cpu", disable_update=True)
+    model = AutoModel(
+        model="fsmn-vad",
+        device="cpu",
+        disable_update=True,
+        max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
+    )
     return FsmnVadSegmenter(model)

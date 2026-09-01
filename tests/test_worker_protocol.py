@@ -18,6 +18,7 @@ import pytest
 from fun_voice import worker as worker_mod
 from fun_voice.contracts import (
     MAX_MESSAGE_BYTES,
+    WORKER_RESPONSE_MAX_BYTES,
     Segment,
     Transcription,
     WorkerHealth,
@@ -175,6 +176,33 @@ def test_transcribe_round_trip(server) -> None:
     assert response["id"] == "u1"
     assert response["text"] == "你好"
     assert response["segments"] == [{"start_ms": 0, "end_ms": 100, "text": "你好"}]
+
+
+def test_long_response_over_socket(server) -> None:
+    """A worker response above 64 KiB must survive the wire intact (high-3)."""
+    _, runtime, socket_path = server
+    long_text = "长" * 40_000  # 120,000 UTF-8 bytes > 64 KiB, < 4 MiB
+    runtime.transcription = Transcription(
+        text=long_text, segments=(Segment(0, 100, long_text),)
+    )
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(socket_path)
+        client.sendall(
+            encode_message(
+                {
+                    "id": "u1",
+                    "op": "transcribe",
+                    "audio": "/tmp/a.wav",
+                    "sample_rate": 16000,
+                }
+            )
+            + b"\n"
+        )
+        data = _read_response(client)
+    response = decode_message(data.rstrip(b"\n"), max_bytes=WORKER_RESPONSE_MAX_BYTES)
+    assert response["status"] == "ok"
+    assert response["text"] == long_text
+    assert response["segments"] == [{"start_ms": 0, "end_ms": 100, "text": long_text}]
     assert response["error_code"] is None
 
 

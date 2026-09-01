@@ -11,6 +11,7 @@ from fun_voice.contracts import (
     FCITX_CHUNK_MAX_BYTES,
     FCITX_TEXT_LINE_MAX_BYTES,
     MAX_MESSAGE_BYTES,
+    WORKER_RESPONSE_MAX_BYTES,
     CaptureArtifact,
     CommitResult,
     DaemonState,
@@ -144,6 +145,29 @@ def test_message_size_limit() -> None:
         encode_message(too_big)
     with pytest.raises(MessageTooLarge):
         decode_message(b" " * (MAX_MESSAGE_BYTES + 1))
+
+
+def test_worker_response_size_constant() -> None:
+    assert WORKER_RESPONSE_MAX_BYTES == 4 * 1024 * 1024
+
+
+def test_large_message_round_trip_with_worker_response_limit() -> None:
+    text = "长" * 100_000  # 300,000 UTF-8 bytes, far above the 64 KiB default
+    msg = {"id": "u1", "status": "ok", "text": text, "segments": []}
+    data = encode_message(msg, max_bytes=WORKER_RESPONSE_MAX_BYTES)
+    assert len(data) > MAX_MESSAGE_BYTES
+    assert decode_message(data, max_bytes=WORKER_RESPONSE_MAX_BYTES) == msg
+
+
+def test_worker_response_over_limit_rejected() -> None:
+    text = "x" * (WORKER_RESPONSE_MAX_BYTES + 16)
+    with pytest.raises(MessageTooLarge):
+        encode_message({"text": text}, max_bytes=WORKER_RESPONSE_MAX_BYTES)
+
+
+def test_custom_decode_limit_rejects_oversized() -> None:
+    with pytest.raises(MessageTooLarge):
+        decode_message(b'{"op":"start_if_idle"}', max_bytes=4)
 
 
 # --- Fcitx frame protocol ---------------------------------------------------
