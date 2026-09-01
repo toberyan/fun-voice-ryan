@@ -61,10 +61,16 @@ addon  -> daemon:  OK
 `<utf8-text>` may contain newlines and is preserved verbatim (the length prefix
 makes framing unambiguous). A `COMMIT` is at most 64 KiB; longer text is split
 by the daemon into ordered chunks of at most 8 KiB on Unicode boundaries, each
-carrying its `sequence`/`total` and the same focus token. The addon enforces
-strict ordering: any out-of-order, duplicated, oversized, or malformed frame is
-rejected without committing, and any reject stops the daemon from sending the
-remaining chunks. Unknown commands return `ERROR unsupported`.
+carrying its `sequence`/`total` and the same focus token. Multi-chunk commits
+are **atomic**: the addon buffers the ordered chunks in memory (bounded by the
+64 KiB protocol limit) and calls `commitString` exactly once, on the final
+chunk of a complete in-order sequence. A single-chunk commit (`total=1`) is
+committed immediately. Any out-of-order, duplicated, oversized, or malformed
+frame is rejected without committing, and any reject stops the daemon from
+sending the remaining chunks. If the focused context changes, is destroyed, or
+the daemon disconnects mid-sequence, the buffered text is discarded and the
+next chunk is answered with `REJECT stale-focus`; nothing is ever partially
+injected. Unknown commands return `ERROR unsupported`.
 
 ## Privacy
 

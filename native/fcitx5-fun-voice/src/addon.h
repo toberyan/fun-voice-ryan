@@ -42,8 +42,11 @@ public:
 /// Stateful implementation of the daemon <-> addon protocol.
 ///
 /// Handles ``PING``, ``START_FOCUS`` and ``COMMIT`` frames and returns the
-/// single-line reply to send back. The token -> input-context mapping is kept
-/// short-lived: a token is dropped when its context loses focus
+/// single-line reply to send back. A multi-chunk ``COMMIT`` is buffered in
+/// memory and committed atomically only once the final chunk of a complete,
+/// in-order sequence arrives, so a partial transcription never reaches
+/// ``commitString``. The token -> input-context mapping is kept short-lived:
+/// a token (and any buffered text) is dropped when its context loses focus
 /// (``dropContext``), when the daemon disconnects (``clear``), as soon as its
 /// final chunk is committed, or when a new token supersedes it.
 class ProtocolEngine {
@@ -95,6 +98,7 @@ private:
         std::string uuid;
         int nextSeq = 1;
         int total = 0;
+        std::string buffer; // ordered text accumulated until the final chunk
     };
 
     std::string handleStartFocus() {
@@ -141,16 +145,41 @@ private:
             tokens_.erase(it);
             return "REJECT stale-focus";
         }
-        if (!bridge_->commit(session.uuid, text)) {
-            tokens_.erase(it);
-            return "REJECT stale-focus";
-        }
         if (session.total == 0) {
             session.total = total;
         }
+
+        if (total == 1) {
+            // Single-chunk commit keeps its immediate behavior.
+            if (!bridge_->commit(session.uuid, text)) {
+                tokens_.erase(it);
+                return "REJECT stale-focus";
+            }
+            tokens_.erase(it); // token is spent
+            return "OK";
+        }
+
+        // Multi-chunk commit: buffer ordered chunks and commit only once the
+        // final chunk arrives. A mid-stream failure (focus change, disconnect,
+        // malformed frame) drops the buffer without committing, so a partial
+        // transcription is never injected. The accumulated buffer is bounded
+        // by the 64 KiB protocol limit to keep memory use predictable.
+        if (session.buffer.size() + text.size() > kMaxFrameBytes) {
+            tokens_.erase(it);
+            return "ERROR too-large";
+        }
+        session.buffer.append(text);
         session.nextSeq = sequence + 1;
+
         if (sequence == total) {
-            tokens_.erase(it); // final chunk: token is spent
+            // Final chunk with every chunk 1..total present in order: commit
+            // the concatenated text atomically.
+            if (!bridge_->commit(session.uuid, session.buffer)) {
+                tokens_.erase(it);
+                return "REJECT stale-focus";
+            }
+            tokens_.erase(it); // final chunk: token is spent, buffer released
+            return "OK";
         }
         return "OK";
     }

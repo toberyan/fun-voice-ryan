@@ -5,7 +5,9 @@
 // The daemon obtains an unpredictable focus token (bound to the currently
 // focused input context) and may then commit text only while that same
 // context still holds focus. Commits go through InputContext::commitString;
-// keyboard events are never simulated.
+// keyboard events are never simulated. Multi-chunk commits are buffered and
+// committed atomically on the final chunk, so a partial transcription is
+// never injected.
 //
 // Privacy: diagnostic logs never include commit payloads, transcription text,
 // or focus tokens.

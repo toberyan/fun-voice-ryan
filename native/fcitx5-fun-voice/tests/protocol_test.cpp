@@ -147,17 +147,16 @@ int main() {
         check(bridge.commits.empty(), "out-of-order chunk commits nothing");
     }
 
-    // Duplicate chunk (sequence replayed) is rejected.
+    // Duplicate chunk (sequence replayed) is rejected and commits nothing.
     {
         MockBridge bridge;
         fun_voice::ProtocolEngine engine(&bridge);
         const std::string token = engine.handle("START_FOCUS").substr(6);
         checkEqual(engine.handle(commitFrame(token, 1, 2, "one")), "OK",
-                   "first chunk accepted");
+                   "first chunk buffered");
         checkEqual(engine.handle(commitFrame(token, 1, 2, "one")),
                    "ERROR bad-sequence", "replayed chunk rejected");
-        check(bridge.commits == std::vector<std::string>{"one"},
-              "replayed chunk not committed twice");
+        check(bridge.commits.empty(), "buffered chunk not committed yet");
     }
 
     // A frame larger than 64 KiB is rejected and commits nothing.
@@ -171,20 +170,79 @@ int main() {
         check(bridge.commits.empty(), "oversized frame commits nothing");
     }
 
-    // Ordered multi-chunk commit is committed chunk by chunk, in order.
+    // Ordered multi-chunk commit is buffered and committed exactly once.
+    {
+        MockBridge bridge;
+        fun_voice::ProtocolEngine engine(&bridge);
+        const std::string token = engine.handle("START_FOCUS").substr(6);
+        checkEqual(engine.handle(commitFrame(token, 1, 3, "abc")), "OK",
+                   "chunk 1 buffered");
+        check(bridge.commits.empty(), "nothing committed before final chunk");
+        checkEqual(engine.handle(commitFrame(token, 2, 3, "def")), "OK",
+                   "chunk 2 buffered");
+        check(bridge.commits.empty(), "still nothing committed before final");
+        checkEqual(engine.handle(commitFrame(token, 3, 3, "ghi")), "OK",
+                   "final chunk accepted");
+        check(bridge.commits == std::vector<std::string>{"abcdefghi"},
+              "all chunks committed atomically, exactly once");
+        // Token is spent after the final chunk.
+        checkEqual(engine.handle(commitFrame(token, 1, 1, "again")),
+                   "REJECT stale-focus", "spent token rejected");
+    }
+
+    // Focus change mid-sequence clears the buffer and rejects remaining chunks.
     {
         MockBridge bridge;
         fun_voice::ProtocolEngine engine(&bridge);
         const std::string token = engine.handle("START_FOCUS").substr(6);
         checkEqual(engine.handle(commitFrame(token, 1, 2, "abc")), "OK",
-                   "chunk 1 accepted");
-        checkEqual(engine.handle(commitFrame(token, 2, 2, "def")), "OK",
-                   "chunk 2 accepted");
-        check(bridge.commits == std::vector<std::string>{"abc", "def"},
-              "chunks committed in order");
-        // Token is spent after the final chunk.
-        checkEqual(engine.handle(commitFrame(token, 1, 1, "again")),
-                   "REJECT stale-focus", "spent token rejected");
+                   "chunk 1 buffered");
+        engine.dropContext(bridge.focusedUuid); // InputContextFocusOut
+        checkEqual(engine.handle(commitFrame(token, 2, 2, "def")),
+                   "REJECT stale-focus", "focus change rejects remaining chunk");
+        check(bridge.commits.empty(), "buffered text discarded on focus change");
+    }
+
+    // Daemon disconnect mid-sequence clears the buffer and rejects chunks.
+    {
+        MockBridge bridge;
+        fun_voice::ProtocolEngine engine(&bridge);
+        const std::string token = engine.handle("START_FOCUS").substr(6);
+        checkEqual(engine.handle(commitFrame(token, 1, 2, "abc")), "OK",
+                   "chunk 1 buffered");
+        engine.clear(); // daemon disconnect
+        checkEqual(engine.handle(commitFrame(token, 2, 2, "def")),
+                   "REJECT stale-focus", "disconnect rejects remaining chunk");
+        check(bridge.commits.empty(), "buffered text discarded on disconnect");
+    }
+
+    // An incomplete sequence (final chunk never arrives) commits nothing.
+    {
+        MockBridge bridge;
+        fun_voice::ProtocolEngine engine(&bridge);
+        const std::string token = engine.handle("START_FOCUS").substr(6);
+        checkEqual(engine.handle(commitFrame(token, 1, 3, "abc")), "OK",
+                   "chunk 1 buffered");
+        checkEqual(engine.handle(commitFrame(token, 2, 3, "def")), "OK",
+                   "chunk 2 buffered");
+        check(bridge.commits.empty(),
+              "incomplete sequence commits nothing before final");
+    }
+
+    // A multi-chunk sequence exceeding the 64 KiB buffer bound is rejected.
+    {
+        MockBridge bridge;
+        fun_voice::ProtocolEngine engine(&bridge);
+        const std::string token = engine.handle("START_FOCUS").substr(6);
+        const std::string big(8 * 1024, 'a'); // 8 KiB per chunk
+        for (int seq = 1; seq <= 8; ++seq) {
+            checkEqual(engine.handle(commitFrame(token, seq, 9, big)), "OK",
+                       "buffered chunk accepted");
+        }
+        check(bridge.commits.empty(), "buffered chunks not committed");
+        checkEqual(engine.handle(commitFrame(token, 9, 9, big)),
+                   "ERROR too-large", "overflowing buffer rejected");
+        check(bridge.commits.empty(), "overflow commits nothing");
     }
 
     // START_FOCUS supersedes an earlier token for the same context.
