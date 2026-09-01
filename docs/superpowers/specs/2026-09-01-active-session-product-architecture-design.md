@@ -1,6 +1,6 @@
 ---
 title: Fun Voice Ryan 活跃会话端侧语音助手产品架构
-status: review
+status: approved
 date: 2026-09-01
 scope: 热会话 Nano、悬浮临时转写、条件 Qwen、结构化结果、说话人身份与质量闭环
 supersedes: []
