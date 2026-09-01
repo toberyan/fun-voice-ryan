@@ -51,7 +51,7 @@ class MetricsLedger:
     def summary(self) -> dict[str, object]: ...
 ```
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```python
 def test_metrics_summary_has_percentiles_but_no_sensitive_values() -> None:
@@ -65,23 +65,23 @@ def test_daemon_metrics_operation_returns_aggregate_only() -> None:
     assert Harness().daemon.dispatch({"op": "metrics"}) == {"count": 0}
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_metrics.py tests/test_daemon.py -q`
 
 Expected: FAIL because `MetricsLedger` and `metrics` dispatch are absent.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Use a deque of 128 `SessionMetric` objects and nearest-rank integer percentiles. Record only fixed enums and stage durations. Add `{"op":"metrics"}` to `VoiceDaemon.dispatch`; its reply is the aggregate summary, never rows. Instrument capture completion, preload completion, worker request, corrector request, and commit with `time.monotonic()`.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_metrics.py tests/test_daemon.py tests/test_end_to_end_fakes.py -q && .venv/bin/ruff check src/fun_voice/metrics.py src/fun_voice/daemon.py tests/test_metrics.py && .venv/bin/mypy src`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/fun_voice/metrics.py src/fun_voice/daemon.py tests/test_metrics.py tests/test_daemon.py

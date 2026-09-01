@@ -69,6 +69,7 @@ from fun_voice.desktop import (
     default_runner,
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
+from fun_voice.metrics import MetricsLedger
 
 logger = logging.getLogger(__name__)
 
@@ -464,6 +465,7 @@ class VoiceDaemon:
         notifier: Notifier,
         worker: WorkerClient,
         corrector: TextCorrector | None = None,
+        metrics: MetricsLedger | None = None,
         auto_stop_event: threading.Event | None = None,
         capture_config: CaptureConfig | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -477,6 +479,8 @@ class VoiceDaemon:
         self._notifier = notifier
         self._worker = worker
         self._corrector = corrector
+        self._metrics = metrics if metrics is not None else MetricsLedger()
+        self._metric_sequence: int | None = None
         self._auto_stop_event = auto_stop_event
         self._capture_config = (
             capture_config if capture_config is not None else CaptureConfig()
@@ -497,7 +501,7 @@ class VoiceDaemon:
 
     # --- Requests ------------------------------------------------------------
 
-    def dispatch(self, message: Mapping[str, Any]) -> str | dict[str, bool]:
+    def dispatch(self, message: Mapping[str, Any]) -> str | Mapping[str, object]:
         try:
             op = message.get("op")
             if op == "start_if_idle":
@@ -507,6 +511,8 @@ class VoiceDaemon:
                 return "ok"
             if op == "diagnostics":
                 return self.diagnostics()
+            if op == "metrics":
+                return self._metrics.summary()
             logger.warning("ignoring unknown op: %r", op)
             return "error"
         except Exception as exc:
@@ -592,6 +598,7 @@ class VoiceDaemon:
                 return "cancelled"
 
             self._state = DaemonState.RECORDING
+            self._metric_sequence = self._metrics.begin()
             logger.info("state -> recording")
             self._notify(NOTIFY_RECORDING)
             return "started"
@@ -672,6 +679,7 @@ class VoiceDaemon:
     def _transcribe_and_commit(self) -> None:
         self._state = DaemonState.TRANSCRIBING
         logger.info("state -> transcribing")
+        pipeline_started = self._monotonic()
         try:
             try:
                 artifact = self._recorder.stop()
@@ -679,28 +687,49 @@ class VoiceDaemon:
                 logger.warning(
                     "transcribe aborted: capture failed (%s)", type(exc).__name__
                 )
+                self._record_metric(error_code="capture")
                 self._notify(NOTIFY_RECOGNITION_FAILED.format(category="capture"))
                 return
+            if artifact.duration_ms is not None:
+                self._record_metric(capture_duration_ms=artifact.duration_ms)
 
+            asr_started = self._monotonic()
             try:
                 transcription = self._worker.transcribe(artifact)
             except EmptySpeechError:
+                self._record_metric(
+                    asr_ms=_elapsed_ms(asr_started, self._monotonic()),
+                    error_code="empty_speech",
+                )
                 self._notify(NOTIFY_EMPTY_SPEECH)
                 return
             except WorkerError as exc:
+                self._record_metric(
+                    asr_ms=_elapsed_ms(asr_started, self._monotonic()),
+                    error_code=str(exc.code),
+                )
                 logger.warning("transcribe failed: %s", exc.code)
                 self._notify(NOTIFY_RECOGNITION_FAILED.format(category=str(exc.code)))
                 return
+            self._record_metric(asr_ms=_elapsed_ms(asr_started, self._monotonic()))
 
             text = transcription.text
             if not text:
+                self._record_metric(error_code="empty_speech")
                 self._notify(NOTIFY_EMPTY_SPEECH)
                 return
 
             corrector = self._corrector
             if corrector is not None:
+                correction_started = self._monotonic()
                 try:
                     candidate = corrector.correct(text)
+                    self._record_metric(
+                        correction_ms=_elapsed_ms(
+                            correction_started, self._monotonic()
+                        ),
+                        correction="corrected" if candidate else "raw_fallback",
+                    )
                     if candidate:
                         text = candidate
                 except CorrectionError as exc:
@@ -708,13 +737,32 @@ class VoiceDaemon:
                     # the code-only log and avoid an extra desktop notification
                     # for every transient model failure.
                     logger.warning("correction unavailable: %s", exc.code)
+                    self._record_metric(
+                        correction_ms=_elapsed_ms(
+                            correction_started, self._monotonic()
+                        ),
+                        correction="failed",
+                    )
                 except Exception as exc:  # noqa: BLE001 - raw text is resilient
                     logger.warning("correction unavailable: %s", type(exc).__name__)
+                    self._record_metric(
+                        correction_ms=_elapsed_ms(
+                            correction_started, self._monotonic()
+                        ),
+                        correction="failed",
+                    )
 
             self._state = DaemonState.COMMITTING
             logger.info("state -> committing")
+            commit_started = self._monotonic()
             self._commit(text)
+            self._record_metric(
+                commit_ms=_elapsed_ms(commit_started, self._monotonic())
+            )
         finally:
+            self._record_metric(
+                end_to_end_ms=_elapsed_ms(pipeline_started, self._monotonic())
+            )
             self._cleanup()
 
     def _commit(self, text: str) -> None:
@@ -812,6 +860,7 @@ class VoiceDaemon:
         self._recorder.cleanup()
         session = self._session
         self._session = None
+        self._metric_sequence = None
         if session is not None:
             with contextlib.suppress(Exception):
                 session.fcitx.close()
@@ -822,6 +871,19 @@ class VoiceDaemon:
             self._notifier.notify(message)
         except Exception:
             logger.debug("notification failed (ignored)")
+
+    def _record_metric(self, **updates: object) -> None:
+        """Best-effort telemetry that can never affect the input pipeline."""
+        sequence = self._metric_sequence
+        if sequence is None:
+            return
+        with contextlib.suppress(ValueError):
+            self._metrics.record(sequence, **updates)
+
+
+def _elapsed_ms(started: float, finished: float) -> int:
+    """Convert a monotonic interval to a non-negative integer milliseconds."""
+    return max(0, round((finished - started) * 1000))
 
 
 # --- Socket transport --------------------------------------------------------

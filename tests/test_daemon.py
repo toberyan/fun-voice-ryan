@@ -370,6 +370,25 @@ def test_mark_hotkey_registered_changes_only_registration_boolean() -> None:
     }
 
 
+def test_dispatch_metrics_returns_empty_aggregate_without_session_data() -> None:
+    assert Harness().daemon.dispatch({"op": "metrics"}) == {"count": 0}
+
+
+def test_completed_session_metrics_contain_only_aggregate_stage_data() -> None:
+    h = Harness()
+    _started(h)
+    h.daemon.stop()
+
+    report = h.daemon.dispatch({"op": "metrics"})
+
+    assert report["count"] == 1
+    assert report["capture_duration_ms"] == {"p50": 1000, "p95": 1000}
+    assert "asr_ms" in report
+    assert "commit_ms" in report
+    assert "你好" not in repr(report)
+    assert ARTIFACT.audio not in repr(report)
+
+
 def test_start_cancels_when_c_not_pressed() -> None:
     values = iter([0.0, 1.0])
     h = Harness(
