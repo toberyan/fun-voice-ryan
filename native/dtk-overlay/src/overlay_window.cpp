@@ -12,6 +12,7 @@
 #include <QLabel>
 #include <QPalette>
 #include <QScreen>
+#include <QtMath>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -22,12 +23,14 @@ DGUI_USE_NAMESPACE
 namespace fun_voice_overlay {
 namespace {
 
-constexpr int kBottomMargin = 36;
-constexpr int kMinimumWidth = 320;
-constexpr int kMaximumWidth = 720;
+constexpr int kScreenMargin = 24;
+constexpr int kMaximumHeightDivisor = 3;
 constexpr int kCardRadius = 16;
 constexpr int kOuterMargin = 12;
 constexpr int kContentMargin = 14;
+constexpr qreal kStatusPointSize = 18.0;
+constexpr qreal kTranscriptPointSize = 15.0;
+constexpr qreal kLevelPointSize = 13.0;
 
 QString phaseLabel(const QString &phase) {
     static const QHash<QString, QString> labels{
@@ -58,7 +61,8 @@ QString elideForWidth(const QLabel *label, const QString &text, int width) {
 
 }  // namespace
 
-OverlayWindow::OverlayWindow(QWidget *parent) : QWidget(parent) {
+OverlayWindow::OverlayWindow(OverlayLayout layout, QWidget *parent)
+    : QWidget(parent), layout_(layout) {
     setWindowFlags(Qt::ToolTip | Qt::FramelessWindowHint |
                    Qt::WindowStaysOnTopHint | Qt::WindowDoesNotAcceptFocus |
                    Qt::WindowTransparentForInput);
@@ -85,7 +89,6 @@ OverlayWindow::OverlayWindow(QWidget *parent) : QWidget(parent) {
     statusLabel_->setObjectName(QStringLiteral("status-text"));
     statusLabel_->setTextFormat(Qt::PlainText);
     statusLabel_->setTextInteractionFlags(Qt::NoTextInteraction);
-    statusLabel_->setFont(QFont(font().family(), font().pointSize(), QFont::DemiBold));
     levelLabel_ = new QLabel(content);
     levelLabel_->setObjectName(QStringLiteral("level-text"));
     levelLabel_->setTextFormat(Qt::PlainText);
@@ -94,6 +97,7 @@ OverlayWindow::OverlayWindow(QWidget *parent) : QWidget(parent) {
     provisionalLabel_ = new QLabel(content);
     configureTextLabel(stableLabel_, QStringLiteral("stable-text"));
     configureTextLabel(provisionalLabel_, QStringLiteral("provisional-text"));
+    applyFonts();
 
     contentLayout_->addWidget(statusLabel_);
     contentLayout_->addWidget(levelLabel_);
@@ -112,7 +116,10 @@ OverlayWindow::OverlayWindow(QWidget *parent) : QWidget(parent) {
     connect(helper, &DGuiApplicationHelper::themeTypeChanged, this,
             [this](DGuiApplicationHelper::ColorType) { applyTheme(); });
     connect(helper, &DGuiApplicationHelper::fontChanged, this,
-            [this](const QFont &) { placeOnActiveScreen(); });
+            [this](const QFont &) {
+                applyFonts();
+                placeOnActiveScreen();
+            });
     connect(DWindowManagerHelper::instance(),
             &DWindowManagerHelper::hasCompositeChanged, this,
             [this] { applyTheme(); });
@@ -122,16 +129,36 @@ OverlayWindow::OverlayWindow(QWidget *parent) : QWidget(parent) {
     applyTheme();
 }
 
-QRect OverlayWindow::bottomCenteredRect(const QRect &available, QSize requested) {
-    const int maximumWidth = std::max(1, std::min(kMaximumWidth,
-                                                   available.width() - 48));
-    const int minimumWidth = std::min(kMinimumWidth, maximumWidth);
-    const int width = std::clamp(requested.width(), minimumWidth, maximumWidth);
-    const int maximumHeight = std::max(1, available.height() / 3);
+void OverlayWindow::applyFonts() {
+    const QFont base = font();
+    auto scaled = [this, &base](qreal points, QFont::Weight weight) {
+        QFont result(base);
+        result.setPointSizeF(points * layout_.fontScale);
+        result.setWeight(weight);
+        return result;
+    };
+    statusLabel_->setFont(scaled(kStatusPointSize, QFont::DemiBold));
+    levelLabel_->setFont(scaled(kLevelPointSize, QFont::Normal));
+    stableLabel_->setFont(scaled(kTranscriptPointSize, QFont::Normal));
+    provisionalLabel_->setFont(scaled(kTranscriptPointSize, QFont::Normal));
+}
+
+QRect OverlayWindow::centeredRect(const QRect &available, QSize requested,
+                                  const OverlayLayout &layout) {
+    const QRect inset = available.adjusted(kScreenMargin, kScreenMargin,
+                                           -kScreenMargin, -kScreenMargin);
+    const QRect bounds = inset.isValid() ? inset : available;
+    const int width = std::clamp(layout.widthPx, 1, std::max(1, bounds.width()));
+    const int maximumHeight = std::max(
+        1, std::min(std::max(1, bounds.height()),
+                    std::max(1, available.height() / kMaximumHeightDivisor)));
     const int height = std::clamp(requested.height(), 1, maximumHeight);
     const int x = available.x() + (available.width() - width) / 2;
-    const int y = std::max(available.y(), available.bottom() + 1 -
-                                            kBottomMargin - height);
+    const int centerY = available.y() +
+                        qRound(available.height() * layout.verticalCenterRatio);
+    const int minimumY = bounds.top();
+    const int maximumY = std::max(minimumY, bounds.bottom() + 1 - height);
+    const int y = std::clamp(centerY - height / 2, minimumY, maximumY);
     return QRect(x, y, width, height);
 }
 
@@ -203,13 +230,16 @@ void OverlayWindow::placeOnActiveScreen() {
 }
 
 void OverlayWindow::resizeForContent(const QRect &available) {
-    const int maximumWidth = std::max(1, std::min(kMaximumWidth,
-                                                   available.width() - 48));
-    const int textWidth = std::max(1, maximumWidth - 2 * (kOuterMargin + kContentMargin));
+    const QRect inset = available.adjusted(kScreenMargin, kScreenMargin,
+                                           -kScreenMargin, -kScreenMargin);
+    const QRect bounds = inset.isValid() ? inset : available;
+    const int width = std::clamp(layout_.widthPx, 1, std::max(1, bounds.width()));
+    const int textWidth =
+        std::max(1, width - 2 * (kOuterMargin + kContentMargin));
     stableLabel_->setText(elideForWidth(stableLabel_, stableLabel_->text(), textWidth));
     provisionalLabel_->setText(
         elideForWidth(provisionalLabel_, provisionalLabel_->text(), textWidth));
-    const QRect target = bottomCenteredRect(available, sizeHint());
+    const QRect target = centeredRect(available, sizeHint(), layout_);
     resize(target.size());
     move(target.topLeft());
 }

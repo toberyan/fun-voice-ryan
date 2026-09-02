@@ -35,4 +35,13 @@ int main(int argc, char **argv) {
     assert(overlay.waitForFinished(2000));
     assert(overlay.exitStatus() == QProcess::NormalExit);
     assert(overlay.exitCode() == 0);
+
+    QProcess invalid;
+    invalid.setProgram(QString::fromLocal8Bit(argv[1]));
+    invalid.setArguments(
+        {QStringLiteral("--width-px"), QStringLiteral("419")});
+    invalid.start();
+    assert(invalid.waitForFinished(2000));
+    assert(invalid.exitStatus() == QProcess::NormalExit);
+    assert(invalid.exitCode() != 0);
 }
