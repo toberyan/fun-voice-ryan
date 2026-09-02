@@ -1,177 +1,168 @@
-"""Unit tests for the non-interactive transient X11 overlay."""
+"""Unit tests for the private, native DTK transient overlay controller."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import subprocess
+from pathlib import Path
 
 from fun_voice.contracts import DaemonState
-from fun_voice.overlay import OverlayModel, X11TransientOverlay
+from fun_voice.overlay import (
+    DtkOverlayController,
+    OverlayModel,
+    default_overlay_executable,
+)
 
 
-@dataclass
-class FakePointer:
-    root_x: int = 320
-    root_y: int = 240
+class FakeWriter:
+    def __init__(self, *, broken: bool = False) -> None:
+        self.broken = broken
+        self.data = bytearray()
+        self.closed = False
 
+    def write(self, data: bytes) -> int:
+        if self.broken:
+            raise BrokenPipeError
+        self.data.extend(data)
+        return len(data)
 
-class FakeGc:
-    def __init__(self) -> None:
-        self.foregrounds: list[int] = []
-
-    def change(self, *, foreground: int) -> None:
-        self.foregrounds.append(foreground)
-
-
-class FakeWindow:
-    def __init__(self) -> None:
-        self.gc = FakeGc()
-        self.maps = 0
-        self.unmaps = 0
-        self.clears = 0
-        self.draws: list[str] = []
-
-    def create_gc(self, **_kwargs: object) -> FakeGc:
-        return self.gc
-
-    def map(self) -> None:
-        self.maps += 1
-
-    def unmap(self) -> None:
-        self.unmaps += 1
-
-    def clear_area(self) -> None:
-        self.clears += 1
-
-    def draw_text(self, _gc: FakeGc, _x: int, _y: int, text: str) -> None:
-        self.draws.append(text)
-
-
-class FakeRoot:
-    def __init__(self) -> None:
-        self.window = FakeWindow()
-        self.create_calls: list[dict[str, object]] = []
-        self.focus_calls = 0
-
-    def query_pointer(self) -> FakePointer:
-        return FakePointer()
-
-    def create_window(self, **kwargs: object) -> FakeWindow:
-        self.create_calls.append(kwargs)
-        return self.window
-
-    def set_input_focus(self) -> None:
-        self.focus_calls += 1
-
-
-class FakeScreen:
-    def __init__(self) -> None:
-        self.root = FakeRoot()
-        self.root_depth = 24
-        self.white_pixel = 0xFFFFFF
-        self.black_pixel = 0
-        self.width_in_pixels = 1920
-        self.height_in_pixels = 1080
-
-
-class FakeDisplay:
-    def __init__(self) -> None:
-        self._screen = FakeScreen()
-        self.sync_calls = 0
-        self.close_calls = 0
-
-    def screen(self) -> FakeScreen:
-        return self._screen
-
-    def sync(self) -> None:
-        self.sync_calls += 1
+    def flush(self) -> None:
+        pass
 
     def close(self) -> None:
-        self.close_calls += 1
+        self.closed = True
 
 
-def test_overlay_maps_an_override_redirect_window_without_focusing() -> None:
-    display = FakeDisplay()
-    overlay = X11TransientOverlay(make_display=lambda: display)
-    try:
-        overlay.show(OverlayModel(phase=DaemonState.PREPARING))
-        assert overlay.wait_idle(timeout=1.0)
+class FakeProcess:
+    def __init__(self, *, broken: bool = False) -> None:
+        self.stdin: FakeWriter | None = FakeWriter(broken=broken)
+        self.stdout = None
+        self.returncode: int | None = None
+        self.terminate_calls = 0
 
-        root = display.screen().root
-        assert root.create_calls[0]["override_redirect"] == 1
-        assert root.create_calls[0]["event_mask"] == 0
-        assert root.window.maps == 1
-        assert root.focus_calls == 0
-    finally:
-        overlay.close()
+    def poll(self) -> int | None:
+        return self.returncode
 
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self.returncode = -15
 
-def test_overlay_marks_stable_and_provisional_content_with_distinct_tones() -> None:
-    display = FakeDisplay()
-    overlay = X11TransientOverlay(make_display=lambda: display)
-    try:
-        overlay.show(
-            OverlayModel(
-                phase=DaemonState.RECORDING,
-                stable_text="stable",
-                provisional_text="tail",
-                level=42,
-            )
-        )
-        assert overlay.wait_idle(timeout=1.0)
-
-        frame = overlay.last_frame
-        assert frame is not None
-        assert frame.stable_tone == "dark"
-        assert frame.provisional_tone == "light"
-        assert "stable" in display.screen().root.window.draws
-        assert "tail" in display.screen().root.window.draws
-    finally:
-        overlay.close()
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fun-voice-overlay", timeout)
+        return self.returncode
 
 
-def test_overlay_clear_overwrites_unmaps_and_discards_text_references() -> None:
-    display = FakeDisplay()
-    overlay = X11TransientOverlay(make_display=lambda: display)
-    try:
-        overlay.show(
-            OverlayModel(
-                phase=DaemonState.RECORDING,
-                stable_text="private stable",
-                provisional_text="private tail",
-            )
-        )
-        assert overlay.wait_idle(timeout=1.0)
-
-        overlay.clear()
-        assert overlay.wait_idle(timeout=1.0)
-
-        window = display.screen().root.window
-        assert window.clears >= 2
-        assert window.unmaps == 1
-        assert overlay.last_frame is None
-        assert overlay.current_model is None
-    finally:
-        overlay.close()
-        overlay.close()
-    assert display.close_calls == 1
+def decode_frames(writer: FakeWriter) -> list[dict[str, object]]:
+    raw = bytes(writer.data)
+    frames: list[dict[str, object]] = []
+    while raw:
+        length = int.from_bytes(raw[:4], "big")
+        payload = raw[4 : 4 + length]
+        assert len(payload) == length
+        frames.append(json.loads(payload.decode("utf-8")))
+        raw = raw[4 + length :]
+    return frames
 
 
-def test_overlay_becomes_a_noop_after_x11_creation_failure() -> None:
-    attempts: list[None] = []
+def test_dtk_controller_starts_lazily_and_writes_one_bounded_show_frame() -> None:
+    spawned: list[FakeProcess] = []
 
-    def fail_display() -> FakeDisplay:
-        attempts.append(None)
-        raise RuntimeError("no display")
+    def popen(_argv: list[str]) -> FakeProcess:
+        process = FakeProcess()
+        spawned.append(process)
+        return process
 
-    overlay = X11TransientOverlay(make_display=fail_display)
-    try:
-        overlay.show(OverlayModel(phase=DaemonState.PREPARING))
-        assert overlay.wait_idle(timeout=1.0)
-        overlay.show(OverlayModel(phase=DaemonState.RECORDING))
-        assert overlay.wait_idle(timeout=1.0)
+    controller = DtkOverlayController(
+        executable=Path("/native/fun-voice-overlay"), popen=popen
+    )
 
-        assert overlay.unavailable is True
-        assert overlay.current_model is None
-        assert attempts == [None]
-    finally:
-        overlay.close()
+    controller.show(OverlayModel(phase=DaemonState.RECORDING, level=42))
+
+    assert len(spawned) == 1
+    writer = spawned[0].stdin
+    assert writer is not None
+    assert decode_frames(writer) == [
+        {
+            "command": "show",
+            "level": 42,
+            "phase": "recording",
+            "provisional_text": "",
+            "stable_text": "",
+        }
+    ]
+
+
+def test_dtk_controller_clear_replaces_transient_text_with_a_text_free_command(
+) -> None:
+    process = FakeProcess()
+    controller = DtkOverlayController(
+        executable=Path("overlay"), popen=lambda _argv: process
+    )
+
+    controller.show(
+        OverlayModel(phase=DaemonState.RECORDING, stable_text="私密文本")
+    )
+    controller.clear()
+
+    writer = process.stdin
+    assert writer is not None
+    assert decode_frames(writer)[-1] == {"command": "clear"}
+
+
+def test_dtk_controller_does_not_spawn_for_an_oversized_transient_model() -> None:
+    spawned: list[FakeProcess] = []
+    controller = DtkOverlayController(
+        executable=Path("overlay"),
+        popen=lambda _argv: spawned.append(FakeProcess()) or spawned[-1],
+    )
+
+    controller.show(
+        OverlayModel(phase=DaemonState.RECORDING, stable_text="a" * (64 * 1024))
+    )
+
+    assert spawned == []
+
+
+def test_dtk_controller_recovers_from_a_broken_pipe_on_the_next_show() -> None:
+    failed = FakeProcess(broken=True)
+    recovered = FakeProcess()
+    processes = iter((failed, recovered))
+    controller = DtkOverlayController(
+        executable=Path("overlay"), popen=lambda _argv: next(processes)
+    )
+
+    controller.show(OverlayModel(phase=DaemonState.RECORDING))
+    controller.show(OverlayModel(phase=DaemonState.FINALIZING))
+
+    writer = recovered.stdin
+    assert writer is not None
+    assert decode_frames(writer) == [
+        {
+            "command": "show",
+            "phase": "finalizing",
+            "provisional_text": "",
+            "stable_text": "",
+        }
+    ]
+    assert failed.terminate_calls == 1
+
+
+def test_dtk_controller_shutdowns_the_owned_process() -> None:
+    process = FakeProcess()
+    controller = DtkOverlayController(
+        executable=Path("overlay"), popen=lambda _argv: process
+    )
+    controller.show(OverlayModel(phase=DaemonState.RECORDING))
+    controller.close()
+
+    writer = process.stdin
+    assert writer is not None
+    assert decode_frames(writer)[-1] == {"command": "shutdown"}
+    assert process.terminate_calls == 1
+
+
+def test_default_overlay_binary_uses_the_user_scoped_install_location() -> None:
+    assert default_overlay_executable() == (
+        Path.home() / ".local/lib/fun-voice-ryan/fun-voice-overlay"
+    )

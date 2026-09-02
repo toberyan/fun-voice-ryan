@@ -19,6 +19,19 @@ target_include_directories(fun-voice-overlay-protocol PUBLIC
 )
 target_link_libraries(fun-voice-overlay-protocol PUBLIC Qt6::Core)
 
+add_executable(fun-voice-overlay
+    src/main.cpp
+    src/overlay_window.cpp
+    src/overlay_window.h
+)
+target_link_libraries(fun-voice-overlay PRIVATE
+    fun-voice-overlay-protocol
+    Qt6::Gui
+    Qt6::Widgets
+    Dtk6::Gui
+    Dtk6::Widget
+)
+
 enable_testing()
 
 add_executable(overlay_protocol_test tests/protocol_test.cpp)
@@ -42,5 +55,17 @@ target_link_libraries(overlay_window_test PRIVATE
 )
 add_test(NAME overlay_window_test COMMAND overlay_window_test)
 set_tests_properties(overlay_window_test PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
+
+add_executable(overlay_runtime_test tests/runtime_test.cpp)
+target_link_libraries(overlay_runtime_test PRIVATE
+    fun-voice-overlay-protocol
+    Qt6::Core
+)
+add_test(NAME overlay_runtime_test
+    COMMAND overlay_runtime_test $<TARGET_FILE:fun-voice-overlay>
+)
+set_tests_properties(overlay_runtime_test PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )

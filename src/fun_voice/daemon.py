@@ -77,10 +77,11 @@ from fun_voice.desktop import (
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
 from fun_voice.metrics import MetricsLedger
 from fun_voice.overlay import (
+    DtkOverlayController,
     NullOverlay,
     OverlayController,
     OverlayModel,
-    X11TransientOverlay,
+    default_overlay_executable,
 )
 from fun_voice.scheduler import (
     CorrectionOutcome,
@@ -1762,7 +1763,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_dir=paths.runtime_dir,
     )
     guard = X11FocusGuard()
-    overlay: OverlayController = X11TransientOverlay()
+    overlay: OverlayController = DtkOverlayController(
+        executable=default_overlay_executable()
+    )
     nano_worker = SocketWorkerClient(
         paths.worker_socket,
         start_service=functools.partial(default_start_worker_service, "nano"),
