@@ -13,11 +13,12 @@ import os
 import socket
 import threading
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
 from fun_voice import worker as worker_mod
-from fun_voice.config import Config, InferenceConfig, RuntimePaths
+from fun_voice.config import Config, RuntimePaths
 from fun_voice.contracts import (
     MAX_MESSAGE_BYTES,
     WORKER_RESPONSE_MAX_BYTES,
@@ -28,6 +29,7 @@ from fun_voice.contracts import (
     decode_message,
     encode_message,
 )
+from fun_voice.runtime_selection import RuntimeSelection
 from fun_voice.worker import LazyTranscriber, Worker, WorkerServer, peer_uid
 
 
@@ -117,6 +119,44 @@ def _read_response(client: socket.socket) -> bytes:
             break
         data.extend(chunk)
     return bytes(data)
+
+
+def _selection(backend: str) -> RuntimeSelection:
+    if backend == "cpu":
+        return RuntimeSelection(
+            schema_version=1,
+            backend="cpu",
+            python=Path("/selected-runtime/bin/python"),
+            device="cpu",
+            dtype="float32",
+            primary_asr_profile="sensevoice",
+            fallback_asr_profile=None,
+            enhanced_enabled=False,
+            speaker_enabled=False,
+            model_revisions={"sensevoice": "master", "vad": "master"},
+            probe_status="pass",
+            selected_at=1,
+        )
+    return RuntimeSelection(
+        schema_version=1,
+        backend="xpu",
+        python=Path("/selected-runtime/bin/python"),
+        device="xpu:0",
+        dtype="bf16",
+        primary_asr_profile="nano",
+        fallback_asr_profile="sensevoice",
+        enhanced_enabled=True,
+        speaker_enabled=True,
+        model_revisions={
+            "nano": "master",
+            "sensevoice": "master",
+            "vad": "master",
+            "qwen": "master",
+            "campplus": "master",
+        },
+        probe_status="pass",
+        selected_at=1,
+    )
 
 
 # --- Peer credential gating -------------------------------------------------
@@ -394,7 +434,7 @@ def test_server_keeps_listening_after_error(tmp_path) -> None:
         thread.join(timeout=5)
 
 
-def test_worker_main_uses_toml_inference_config(monkeypatch, tmp_path) -> None:
+def test_worker_main_uses_selected_accelerator_config(monkeypatch, tmp_path) -> None:
     runtime_dir = tmp_path / "runtime"
     paths = RuntimePaths(
         runtime_dir=runtime_dir,
@@ -402,15 +442,10 @@ def test_worker_main_uses_toml_inference_config(monkeypatch, tmp_path) -> None:
         daemon_socket=runtime_dir / "daemon.sock",
         fcitx_socket=tmp_path / "fcitx.sock",
     )
-    cfg = Config(
-        inference=InferenceConfig(
-            device="xpu:0",
-            dtype="bf16",
-            gpu_memory_utilization=0.2,
-            enforce_eager=False,
-        )
-    )
+    cfg = Config()
     captured: dict[str, object] = {}
+    selection = _selection("xpu")
+    monkeypatch.setattr(worker_mod, "load_runtime_selection", lambda: selection)
     monkeypatch.setattr(worker_mod.config, "load_config", lambda: cfg)
     monkeypatch.setattr(worker_mod.config, "resolve_runtime_dir", lambda: runtime_dir)
     monkeypatch.setattr(worker_mod.config, "build_runtime_paths", lambda _path: paths)
@@ -430,14 +465,14 @@ def test_worker_main_uses_toml_inference_config(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(worker_mod, "serve", fake_serve)
 
     assert worker_mod.main([]) == 0
-    assert captured["device"] == "xpu:0"
-    assert captured["dtype"] == "bf16"
-    assert captured["gpu_memory_utilization"] == 0.2
-    assert captured["max_model_len"] == 1536
-    assert captured["enforce_eager"] is False
+    assert captured["selection"] == selection
+    assert captured["inference"].device == "xpu:0"
+    assert captured["inference"].dtype == "bf16"
 
 
-def test_worker_main_rejects_cpu_cli_override(monkeypatch, tmp_path) -> None:
+def test_worker_main_rejects_nonmatching_cli_policy_override(
+    monkeypatch, tmp_path
+) -> None:
     runtime_dir = tmp_path / "runtime"
     paths = RuntimePaths(
         runtime_dir=runtime_dir,
@@ -452,14 +487,57 @@ def test_worker_main_rejects_cpu_cli_override(monkeypatch, tmp_path) -> None:
         called = True
         return FakeRuntime()
 
+    monkeypatch.setattr(worker_mod, "load_runtime_selection", lambda: _selection("xpu"))
     monkeypatch.setattr(worker_mod.config, "load_config", Config)
     monkeypatch.setattr(worker_mod.config, "resolve_runtime_dir", lambda: runtime_dir)
     monkeypatch.setattr(worker_mod.config, "build_runtime_paths", lambda _path: paths)
     monkeypatch.setattr(worker_mod, "load_nano_runtime", _load_runtime)
     monkeypatch.setattr(worker_mod, "serve", lambda _path, _worker: 0)
 
-    assert worker_mod.main(["--device", "cpu"]) == 1
+    assert worker_mod.main(["--device", "cpu"]) == 2
     assert called is False
+
+
+def test_worker_cpu_rejects_nano_before_creating_a_socket(monkeypatch) -> None:
+    served_workers: list[Worker] = []
+    monkeypatch.setattr(worker_mod, "load_runtime_selection", lambda: _selection("cpu"))
+    monkeypatch.setattr(worker_mod.config, "load_config", Config)
+    monkeypatch.setattr(
+        worker_mod,
+        "serve",
+        lambda _path, worker, **_kwargs: served_workers.append(worker) or 0,
+    )
+    monkeypatch.setattr(
+        worker_mod.config,
+        "resolve_runtime_dir",
+        lambda: pytest.fail("unsupported profile must not resolve a runtime directory"),
+    )
+
+    assert worker_mod.main(["--profile", "nano"]) == 2
+    assert served_workers == []
+
+
+def test_worker_cpu_starts_only_sensevoice(monkeypatch, tmp_path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    paths = RuntimePaths(
+        runtime_dir=runtime_dir,
+        worker_socket=runtime_dir / "worker.sock",
+        daemon_socket=runtime_dir / "daemon.sock",
+        fcitx_socket=tmp_path / "fcitx.sock",
+    )
+    served_workers: list[Worker] = []
+    monkeypatch.setattr(worker_mod, "load_runtime_selection", lambda: _selection("cpu"))
+    monkeypatch.setattr(worker_mod.config, "load_config", Config)
+    monkeypatch.setattr(worker_mod.config, "resolve_runtime_dir", lambda: runtime_dir)
+    monkeypatch.setattr(worker_mod.config, "build_runtime_paths", lambda _path: paths)
+    monkeypatch.setattr(
+        worker_mod,
+        "serve",
+        lambda _path, worker, **_kwargs: served_workers.append(worker) or 0,
+    )
+
+    assert worker_mod.main(["--profile", "sensevoice"]) == 0
+    assert served_workers[0].handle({"op": "health"})["device"] == "cpu"
 
 
 # --- Framing / protocol errors ----------------------------------------------

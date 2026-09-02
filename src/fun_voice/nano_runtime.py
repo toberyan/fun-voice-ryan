@@ -1,10 +1,11 @@
-"""XPU ASR runtime adapters for Nano and SenseVoiceSmall.
+"""Selected-runtime ASR adapters for Nano and SenseVoiceSmall.
 
 The runtime loads the Nano engine and the FSMN-VAD model exactly once and keeps
 them warm for the worker's lifetime. Each request reuses both models:
 
 1. audio is loaded to a float32 16 kHz mono array (WAV or raw s16le),
-2. the XPU FSMN-VAD segments speech, returning ``[start_ms, end_ms]`` regions,
+2. the selected-runtime FSMN-VAD segments speech, returning ``[start_ms, end_ms]``
+   regions,
 3. a fixed small overlap is added to each region boundary when slicing audio,
 4. the Nano engine transcribes the slices in original-audio-time order, and
 5. the per-segment texts are concatenated verbatim (no character is inserted or
@@ -28,10 +29,11 @@ import time
 import wave
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast
 
 import numpy as np
 
+from fun_voice.config import InferenceConfig
 from fun_voice.contracts import (
     AsrStageTiming,
     ErrorCode,
@@ -39,12 +41,11 @@ from fun_voice.contracts import (
     Transcription,
     WorkerHealth,
 )
+from fun_voice.runtime_selection import RuntimeSelection
 
 logger = logging.getLogger(__name__)
 
 VERSION = "0.1.0"
-DEVICE = "xpu:0"
-EXPECTED_DEVICE_TYPE = "xpu"
 VAD_OVERLAP_MS = 250  # fixed small overlap applied to VAD region boundaries
 VAD_MAX_SINGLE_SEGMENT_TIME_MS = 30000  # FSMN-VAD hard cap per speech segment (30 s)
 
@@ -124,7 +125,7 @@ class ModelOutputError(NanoRuntimeError):
 
 
 class ModelLoadError(NanoRuntimeError):
-    """A local XPU model could not be constructed for a request."""
+    """A local selected-runtime model could not be constructed for a request."""
 
     error_code: ErrorCode = ErrorCode("worker", "model_load")
 
@@ -139,6 +140,9 @@ class LiveAudioProtocolError(NanoRuntimeError):
     """A received live descriptor violates the bounded local socket contract."""
 
     error_code: ErrorCode = ErrorCode("worker", "protocol")
+
+
+SelectedDeviceType = Literal["cuda", "xpu", "cpu"]
 
 
 # --- Protocols (the seams the fakes implement) ------------------------------
@@ -227,15 +231,23 @@ def _module_device_type(module: Any) -> str | None:
     return device_type if isinstance(device_type, str) else None
 
 
-def check_engine_devices(engine: Any, *, expected: str = EXPECTED_DEVICE_TYPE) -> None:
-    """Raise :class:`DeviceMismatchError` if encoder/adaptor/embeds aren't on XPU."""
+def device_type(device: str) -> SelectedDeviceType:
+    """Return the supported backend type for one selected device string."""
+    value = device.split(":", 1)[0]
+    if value not in {"cuda", "xpu", "cpu"}:
+        raise DeviceMismatchError("unsupported selected device")
+    return cast(SelectedDeviceType, value)
+
+
+def check_engine_devices(engine: Any, *, expected: SelectedDeviceType) -> None:
+    """Raise if encoder, adaptor, or embeddings miss the selected backend."""
     for name in ("audio_encoder", "audio_adaptor", "embed_tokens"):
         module = getattr(engine, name, None)
         if module is None:
             raise DeviceMismatchError(f"engine is missing {name}")
         actual = _module_device_type(module)
         if actual != expected:
-            raise DeviceMismatchError(f"{name} is on {actual!r}, expected {expected}")
+            raise DeviceMismatchError(f"{name} is on {actual!r}, expected {expected!r}")
 
 
 def _is_oom_error(exc: BaseException) -> bool:
@@ -304,7 +316,7 @@ def _load_pcm_fd(fd: int) -> np.ndarray:
 
 
 class FsmnVadSegmenter:
-    """XPU FSMN-VAD adapter.
+    """Selected-runtime FSMN-VAD adapter.
 
     FunASR ``fsmn-vad`` returns ``[{"key": str, "value": [[start_ms, end_ms], ...]}]``
     where ``value`` is a list of ``[start_ms, end_ms]`` integer pairs in
@@ -375,12 +387,15 @@ class NanoRuntime:
         engine: AsrEngine,
         vad: VadSegmenter,
         *,
-        device: str = DEVICE,
+        selection: RuntimeSelection,
         default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self.engine = engine
         self.vad = vad
-        self.device = device
+        self.selection = selection
+        self.device = selection.device
+        self.dtype = selection.dtype
+        self.expected_device_type = device_type(selection.device)
         self.default_timeout = default_timeout
         self.last_error: ErrorCode | None = None
         self._generate_lock = threading.Lock()
@@ -407,15 +422,15 @@ class NanoRuntime:
         )
 
     def device_evidence(self) -> tuple[str, str]:
-        """Return separately verified Nano/VAD XPU evidence for the POC gate."""
-        if self.device != DEVICE:
-            raise DeviceMismatchError("Nano runtime requires xpu:0")
-        check_engine_devices(self.engine)
+        """Return separately verified Nano/VAD selected-device evidence."""
+        check_engine_devices(self.engine, expected=self.expected_device_type)
         vad_model = getattr(self.vad, "_model", None)
         if vad_model is None:
             raise DeviceMismatchError("FSMN-VAD exposes no inspectable model")
-        _assert_funasr_model_xpu(vad_model, name="FSMN-VAD")
-        return DEVICE, DEVICE
+        _assert_funasr_model_device(
+            vad_model, name="FSMN-VAD", expected=self.expected_device_type
+        )
+        return self.device, self.device
 
     def close(self) -> None:
         """Mark the runtime closed; the worker process owns native model release."""
@@ -425,7 +440,11 @@ class NanoRuntime:
         try:
             import torch
 
-            return bool(torch.xpu.is_available())
+            if self.expected_device_type == "cpu":
+                return True
+            backend = getattr(torch, self.expected_device_type, None)
+            available = getattr(backend, "is_available", None)
+            return bool(available()) if callable(available) else False
         except Exception:
             return False
 
@@ -435,7 +454,10 @@ class NanoRuntime:
         engine = self.engine
         for name in ("audio_encoder", "audio_adaptor", "embed_tokens"):
             module = getattr(engine, name, None)
-            if module is None or _module_device_type(module) != EXPECTED_DEVICE_TYPE:
+            if (
+                module is None
+                or _module_device_type(module) != self.expected_device_type
+            ):
                 return False
         return True
 
@@ -448,9 +470,9 @@ class NanoRuntime:
         sample_rate: int = 16000,
         timeout: float | None = None,
     ) -> Transcription:
-        """Transcribe an audio path, refusing non-XPU devices before any work."""
+        """Transcribe an audio path after checking the selected backend."""
         try:
-            check_engine_devices(self.engine)
+            check_engine_devices(self.engine, expected=self.expected_device_type)
             load_started = time.perf_counter()
             samples = _load_audio_samples(audio, sample_rate)
         except NanoRuntimeError as exc:
@@ -487,7 +509,7 @@ class NanoRuntime:
         self, fd: int, *, sample_rate: int = 16000
     ) -> tuple[tuple[int, int], ...]:
         """Run the already-loaded VAD over a received anonymous PCM window."""
-        self._require_xpu_zero_for_live_audio()
+        self._require_selected_device_for_live_audio()
         try:
             regions = self.vad.detect(_load_pcm_fd(fd), sample_rate)
             return tuple(sorted(regions, key=lambda region: region[0]))
@@ -507,7 +529,7 @@ class NanoRuntime:
         """Decode one live window and express its segments in source time."""
         if source_start_ms < 0 or source_end_ms <= source_start_ms:
             raise AudioFormatError("invalid live source range")
-        self._require_xpu_zero_for_live_audio()
+        self._require_selected_device_for_live_audio()
         try:
             result = self.transcribe_samples(
                 _load_pcm_fd(fd), sample_rate=sample_rate, timeout=timeout
@@ -531,10 +553,10 @@ class NanoRuntime:
             worker_elapsed_ms=result.worker_elapsed_ms,
         )
 
-    def _require_xpu_zero_for_live_audio(self) -> None:
-        """Reject every live descriptor before it is read on a wrong device."""
-        if self.device != DEVICE:
-            raise DeviceMismatchError("live ASR requires xpu:0")
+    def _require_selected_device_for_live_audio(self) -> None:
+        """Reject every live descriptor unless Nano is permitted by its selection."""
+        if "nano" not in self.selection.policy().allowed_profiles:
+            raise DeviceMismatchError("live ASR profile is not allowed")
 
     def _transcribe_impl(
         self,
@@ -678,27 +700,26 @@ def vad_model_dir(env: Mapping[str, str] | None = None) -> Path:
 
 def load_nano_runtime(
     *,
-    device: str = DEVICE,
-    dtype: str = "bf16",
-    gpu_memory_utilization: float = 0.15,
-    enforce_eager: bool = True,
-    max_model_len: int = 1536,
+    selection: RuntimeSelection,
+    inference: InferenceConfig,
     default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> NanoRuntime:
-    """Load native Fun-ASR-Nano and FSMN-VAD once, on XPU.
+    """Load native Fun-ASR-Nano and FSMN-VAD for one selected accelerator.
 
     vLLM-specific sizing options remain accepted for configuration/API
     compatibility, but the native backend owns neither a KV cache nor a vLLM
     engine process.
     """
-    if device != DEVICE:
-        raise DeviceMismatchError("Nano runtime requires xpu:0")
-    if dtype != "bf16":
-        raise ModelLoadError("native Nano requires bf16")
+    if "nano" not in selection.policy().allowed_profiles:
+        raise ModelLoadError("nano is not allowed by selected runtime")
+    selected_device = selection.device
+    expected_device_type = device_type(selected_device)
+    if selection.dtype not in {"bf16", "fp16"}:
+        raise ModelLoadError("native Nano requires an accelerator dtype")
     if (
-        gpu_memory_utilization != 0.15
-        or not enforce_eager
-        or max_model_len != 1536
+        inference.gpu_memory_utilization != 0.15
+        or not inference.enforce_eager
+        or inference.max_model_len != 1536
     ):
         logger.warning(
             "native Nano ignores deprecated vLLM-only KV/cache settings; "
@@ -707,23 +728,27 @@ def load_nano_runtime(
     # Reuse the already-downloaded FSMN-VAD instead of re-downloading it.
     os.environ.setdefault("MODELSCOPE_CACHE", str(models_root()))
 
-    engine = load_native_nano_engine(device)
-    check_engine_devices(engine)
-    vad = _load_vad(device)
+    engine = load_native_nano_engine(selected_device)
+    check_engine_devices(engine, expected=expected_device_type)
+    vad = _load_vad(selected_device)
     return NanoRuntime(
-        engine=engine, vad=vad, device=device, default_timeout=default_timeout
+        engine=engine,
+        vad=vad,
+        selection=selection,
+        default_timeout=default_timeout,
     )
 
 
 def load_native_nano_engine(
     device: str, *, model_dir: str | Path | None = None
 ) -> NativeNanoEngine:
-    """Load a local native Nano checkpoint and prove it is entirely on XPU.
+    """Load a local native Nano checkpoint for a selected supported device.
 
     ``model_dir`` is only a local snapshot path.  Supplying it lets preflight
     load exactly the same native backend as the worker without downloading or
     using the unstable vLLM prompt-embedding route.
     """
+    expected_device_type = device_type(device)
     from funasr import AutoModel
 
     model = AutoModel(
@@ -732,11 +757,14 @@ def load_native_nano_engine(
         device=device,
         disable_update=True,
     )
-    _assert_funasr_model_xpu(model, name="Fun-ASR-Nano")
+    _assert_funasr_model_device(
+        model, name="Fun-ASR-Nano", expected=expected_device_type
+    )
     return NativeNanoEngine(model)
 
 
 def _load_vad(device: str) -> FsmnVadSegmenter:
+    expected_device_type = device_type(device)
     from funasr import AutoModel
 
     model = AutoModel(
@@ -745,12 +773,14 @@ def _load_vad(device: str) -> FsmnVadSegmenter:
         disable_update=True,
         max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
     )
-    _assert_funasr_model_xpu(model, name="FSMN-VAD")
+    _assert_funasr_model_device(model, name="FSMN-VAD", expected=expected_device_type)
     return FsmnVadSegmenter(model)
 
 
-def _assert_funasr_model_xpu(model: Any, *, name: str) -> None:
-    """Reject a FunASR model unless an inspectable module is entirely on XPU."""
+def _assert_funasr_model_device(
+    model: Any, *, name: str, expected: SelectedDeviceType
+) -> None:
+    """Reject a FunASR model unless it is entirely on the selected backend."""
     for candidate in (
         model,
         getattr(model, "model", None),
@@ -763,24 +793,29 @@ def _assert_funasr_model_xpu(model: Any, *, name: str) -> None:
             continue
         devices = {str(parameter.device.type) for parameter in parameters()}
         if devices:
-            if devices != {EXPECTED_DEVICE_TYPE}:
-                raise DeviceMismatchError(f"{name} is not entirely on XPU")
+            if devices != {expected}:
+                raise DeviceMismatchError(
+                    f"{name} is not entirely on {expected!r}"
+                )
             return
     raise DeviceMismatchError(f"{name} exposes no inspectable parameters")
 
 
 class SenseVoiceRuntime:
-    """Local-snapshot SenseVoiceSmall fallback, entirely on the Intel XPU."""
+    """Local-snapshot SenseVoiceSmall runtime on the selected backend."""
 
     def __init__(
         self,
         model: Any,
         *,
-        device: str = DEVICE,
+        selection: RuntimeSelection,
         default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._model = model
-        self.device = device
+        self.selection = selection
+        self.device = selection.device
+        self.dtype = selection.dtype
+        self.expected_device_type = device_type(selection.device)
         self.default_timeout = default_timeout
         self.last_error: ErrorCode | None = None
         self._closed = False
@@ -789,7 +824,11 @@ class SenseVoiceRuntime:
         ready = not self._closed
         if ready:
             try:
-                _assert_funasr_model_xpu(self._model, name="SenseVoiceSmall")
+                _assert_funasr_model_device(
+                    self._model,
+                    name="SenseVoiceSmall",
+                    expected=self.expected_device_type,
+                )
             except DeviceMismatchError:
                 ready = False
         return WorkerHealth(
@@ -817,7 +856,11 @@ class SenseVoiceRuntime:
         if self._closed:
             raise ModelLoadError("SenseVoiceSmall runtime is closed")
         try:
-            _assert_funasr_model_xpu(self._model, name="SenseVoiceSmall")
+            _assert_funasr_model_device(
+                self._model,
+                name="SenseVoiceSmall",
+                expected=self.expected_device_type,
+            )
             results = self._model.generate(input=audio)
         except NanoRuntimeError as exc:
             self.last_error = exc.error_code
@@ -860,18 +903,30 @@ class SenseVoiceRuntime:
 
 
 def load_sensevoice_runtime(
-    *, device: str = DEVICE, default_timeout: float = DEFAULT_TIMEOUT_SECONDS
+    *,
+    selection: RuntimeSelection,
+    inference: InferenceConfig,
+    default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> SenseVoiceRuntime:
-    """Load SenseVoiceSmall and FSMN-VAD from local snapshots on XPU only."""
+    """Load SenseVoiceSmall and FSMN-VAD from local selected-runtime snapshots."""
+    if "sensevoice" not in selection.policy().allowed_profiles:
+        raise ModelLoadError("sensevoice is not allowed by selected runtime")
+    selected_device = selection.device
+    expected_device_type = device_type(selected_device)
+    del inference
     os.environ.setdefault("MODELSCOPE_CACHE", str(models_root()))
     from funasr import AutoModel
 
     model = AutoModel(
         model=str(sensevoice_model_dir()),
         vad_model=str(vad_model_dir()),
-        device=device,
+        device=selected_device,
         disable_update=True,
         max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
     )
-    _assert_funasr_model_xpu(model, name="SenseVoiceSmall")
-    return SenseVoiceRuntime(model, device=device, default_timeout=default_timeout)
+    _assert_funasr_model_device(
+        model, name="SenseVoiceSmall", expected=expected_device_type
+    )
+    return SenseVoiceRuntime(
+        model, selection=selection, default_timeout=default_timeout
+    )

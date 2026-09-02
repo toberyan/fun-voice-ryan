@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
@@ -57,6 +58,7 @@ from fun_voice.nano_runtime import (
     load_nano_runtime,
     load_sensevoice_runtime,
 )
+from fun_voice.runtime_selection import RuntimeSelectionError, load_runtime_selection
 
 logger = logging.getLogger(__name__)
 
@@ -777,7 +779,7 @@ def serve(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fun-voice-worker",
-        description="On-demand XPU ASR worker over a private Unix socket.",
+        description="On-demand selected-runtime ASR worker over a private Unix socket.",
     )
     parser.add_argument("--profile", choices=("nano", "sensevoice"), default="nano")
     parser.add_argument("--device", default=None)
@@ -804,33 +806,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=sys.stderr,
     )
     try:
+        selection = load_runtime_selection()
+    except RuntimeSelectionError:
+        logger.error("runtime_configuration_unavailable")
+        return 1
+
+    if args.profile not in selection.policy().allowed_profiles:
+        logger.error("unsupported_profile")
+        return 2
+
+    try:
         cfg = config.load_config()
+        effective = config.effective_runtime_config(cfg, selection)
+    except config.ConfigError:
+        logger.error("runtime_configuration_unavailable")
+        return 1
+
+    if (
+        args.device is not None
+        and args.device != effective.inference.device
+        or args.dtype is not None
+        and args.dtype != effective.inference.dtype
+    ):
+        logger.error("runtime_policy_override")
+        return 2
+
+    try:
+        if args.timeout_ms <= 0:
+            raise config.ConfigError("timeout must be positive")
         inference = config.validate_inference_config(
-            config.InferenceConfig(
-                device=args.device if args.device is not None else cfg.inference.device,
-                dtype=args.dtype if args.dtype is not None else cfg.inference.dtype,
+            replace(
+                effective.inference,
                 gpu_memory_utilization=(
                     args.gpu_memory_utilization
                     if args.gpu_memory_utilization is not None
-                    else cfg.inference.gpu_memory_utilization
+                    else effective.inference.gpu_memory_utilization
                 ),
                 max_model_len=(
                     args.max_model_len
                     if args.max_model_len is not None
-                    else cfg.inference.max_model_len
+                    else effective.inference.max_model_len
                 ),
                 worker_failsafe_idle_seconds=(
                     args.worker_failsafe_idle_seconds
                     if args.worker_failsafe_idle_seconds is not None
-                    else cfg.inference.worker_failsafe_idle_seconds
+                    else effective.inference.worker_failsafe_idle_seconds
                 ),
-                allow_sensevoice_fallback=cfg.inference.allow_sensevoice_fallback,
-                enforce_eager=cfg.inference.enforce_eager,
-            )
+            ),
+            selection.policy(),
         )
+        effective = replace(effective, inference=inference)
         paths = config.build_runtime_paths(config.resolve_runtime_dir())
-    except config.ConfigError as exc:
-        logger.error("cannot load worker configuration: %s", exc)
+    except config.ConfigError:
+        logger.error("runtime_configuration_unavailable")
         return 1
 
     runtime_dir = paths.runtime_dir
@@ -839,15 +867,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     def load_profile_runtime() -> Transcriber:
         if args.profile == "nano":
             return load_nano_runtime(
-                device=inference.device,
-                dtype=inference.dtype,
-                gpu_memory_utilization=inference.gpu_memory_utilization,
-                enforce_eager=inference.enforce_eager,
-                max_model_len=inference.max_model_len,
+                selection=selection,
+                inference=effective.inference,
                 default_timeout=args.timeout_ms / 1000.0,
             )
         return load_sensevoice_runtime(
-            device=inference.device, default_timeout=args.timeout_ms / 1000.0
+            selection=selection,
+            inference=effective.inference,
+            default_timeout=args.timeout_ms / 1000.0,
         )
 
     socket_path = (
@@ -855,11 +882,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.profile == "nano"
         else paths.runtime_dir / "worker-sensevoice.sock"
     )
-    worker = Worker(LazyTranscriber(load_profile_runtime, device=inference.device))
+    worker = Worker(
+        LazyTranscriber(load_profile_runtime, device=effective.inference.device)
+    )
     return serve(
         socket_path,
         worker,
-        idle_unload_seconds=inference.worker_failsafe_idle_seconds,
+        idle_unload_seconds=effective.inference.worker_failsafe_idle_seconds,
     )
 
 

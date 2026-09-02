@@ -11,13 +11,15 @@ import sys
 import tempfile
 import time
 import wave
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pytest
 
 from fun_voice import nano_runtime as nano_mod
+from fun_voice.config import InferenceConfig
 from fun_voice.contracts import ErrorCode, Segment, Transcription, WorkerHealth
 from fun_voice.nano_runtime import (
     MAX_LIVE_PCM_BYTES,
@@ -30,6 +32,7 @@ from fun_voice.nano_runtime import (
     FsmnVadSegmenter,
     InferenceTimeoutError,
     LiveAudioProtocolError,
+    ModelLoadError,
     ModelOutputError,
     NanoRuntime,
     NanoRuntimeError,
@@ -39,6 +42,7 @@ from fun_voice.nano_runtime import (
     _slice_windows,
     check_engine_devices,
 )
+from fun_voice.runtime_selection import RuntimeSelection
 from fun_voice.worker import VERSION, LazyTranscriber, Worker
 
 # --- Fakes ------------------------------------------------------------------
@@ -54,6 +58,11 @@ class FakeVad:
     def detect(self, samples: np.ndarray, sample_rate: int) -> list[tuple[int, int]]:
         self.detect_calls.append((len(samples), sample_rate))
         return list(self.regions)
+
+
+class FakeModule:
+    def __init__(self, device_type: str) -> None:
+        self.device = SimpleNamespace(type=device_type)
 
 
 class FakeEngine:
@@ -158,8 +167,65 @@ class FlakyRuntime:
     def close(self) -> None:
         pass
 
-def _runtime(engine: FakeEngine, vad: FakeVad) -> NanoRuntime:
-    return NanoRuntime(engine=engine, vad=vad)  # type: ignore[arg-type]
+def _selection(backend: Literal["cuda", "xpu", "cpu"] = "xpu") -> RuntimeSelection:
+    if backend == "cpu":
+        device = "cpu"
+        dtype = "float32"
+        primary = "sensevoice"
+        fallback = None
+        enhanced_enabled = False
+        speaker_enabled = False
+        revisions = {"sensevoice": "master", "vad": "master"}
+    else:
+        device = f"{backend}:0"
+        dtype = "bf16"
+        primary = "nano"
+        fallback = "sensevoice"
+        enhanced_enabled = True
+        speaker_enabled = True
+        revisions = {
+            "nano": "master",
+            "sensevoice": "master",
+            "vad": "master",
+            "qwen": "master",
+            "campplus": "master",
+        }
+    return RuntimeSelection(
+        schema_version=1,
+        backend=backend,
+        python=Path("/selected-runtime/bin/python"),
+        device=device,
+        dtype=dtype,
+        primary_asr_profile=primary,
+        fallback_asr_profile=fallback,
+        enhanced_enabled=enhanced_enabled,
+        speaker_enabled=speaker_enabled,
+        model_revisions=revisions,
+        probe_status="pass",
+        selected_at=1,
+    )
+
+
+def _inference(selection: RuntimeSelection) -> InferenceConfig:
+    return InferenceConfig(
+        device=selection.device,
+        dtype=selection.dtype,
+        allow_sensevoice_fallback=(
+            selection.fallback_asr_profile == "sensevoice"
+        ),
+    )
+
+
+def _runtime(
+    engine: FakeEngine,
+    vad: FakeVad,
+    selection: RuntimeSelection | None = None,
+) -> NanoRuntime:
+    return NanoRuntime(
+        engine=engine,
+        vad=vad,
+        selection=_selection("xpu") if selection is None else selection,
+    )  # type: ignore[arg-type]
 
 
 def _silence(seconds: float = 1.0, sample_rate: int = 16000) -> np.ndarray:
@@ -284,7 +350,7 @@ def test_native_nano_engine_adapts_repeated_in_memory_slices_without_vllm(
             "llm_kwargs": {"do_sample": False},
         },
     ]
-    check_engine_devices(engine)
+    check_engine_devices(engine, expected="xpu")
     assert engine.backend == "native_funasr_pytorch"
     assert engine.decoder_device_type == "xpu"
 
@@ -394,7 +460,10 @@ def test_runtime_timeout_raises_then_next_request_succeeds() -> None:
     # A timed-out generate keeps holding the generate lock until it finishes;
     # the next request must wait for the lock and then succeed (Minor 4).
     runtime = NanoRuntime(
-        engine=SlowEngine(), vad=FakeVad([(0, 100)]), default_timeout=0.05
+        engine=SlowEngine(),
+        vad=FakeVad([(0, 100)]),
+        selection=_selection("xpu"),
+        default_timeout=0.05,
     )
     with pytest.raises(InferenceTimeoutError):
         runtime.transcribe_samples(_silence(), timeout=0.05)
@@ -410,13 +479,23 @@ def _engine_on(device_type: str) -> SimpleNamespace:
     return SimpleNamespace(audio_encoder=mod, audio_adaptor=mod, embed_tokens=mod)
 
 
-def test_check_engine_devices_accepts_xpu() -> None:
-    check_engine_devices(_engine_on("xpu"))
+def test_engine_device_check_uses_selected_cuda_type() -> None:
+    engine = FakeEngine(texts=["ok"])
+    engine.audio_encoder = FakeModule("cuda")  # type: ignore[attr-defined]
+    engine.audio_adaptor = FakeModule("cuda")  # type: ignore[attr-defined]
+    engine.embed_tokens = FakeModule("cuda")  # type: ignore[attr-defined]
+
+    check_engine_devices(engine, expected="cuda")
 
 
-def test_check_engine_devices_rejects_non_xpu() -> None:
-    with pytest.raises(DeviceMismatchError):
-        check_engine_devices(_engine_on("cpu"))
+def test_engine_device_check_rejects_cpu_when_cuda_selected() -> None:
+    engine = FakeEngine(texts=["ok"])
+    engine.audio_encoder = FakeModule("cpu")  # type: ignore[attr-defined]
+    engine.audio_adaptor = FakeModule("cuda")  # type: ignore[attr-defined]
+    engine.embed_tokens = FakeModule("cuda")  # type: ignore[attr-defined]
+
+    with pytest.raises(DeviceMismatchError, match="expected 'cuda'"):
+        check_engine_devices(engine, expected="cuda")
 
 
 def test_transcribe_rejects_non_xpu_before_asr(tmp_path) -> None:
@@ -433,24 +512,6 @@ def test_transcribe_rejects_non_xpu_before_asr(tmp_path) -> None:
     with pytest.raises(DeviceMismatchError):
         runtime.transcribe(str(wav_path))
     assert not engine.inputs  # rejected before any ASR call
-
-
-def test_live_fd_paths_reject_non_xpu_zero_before_reading_audio() -> None:
-    engine = FakeEngine(texts=["x"])
-    vad = FakeVad([(0, 100)])
-    runtime = NanoRuntime(engine=engine, vad=vad, device="xpu:1")
-    with tempfile.TemporaryFile() as audio:
-        audio.write(b"\x00\x00" * 1600)
-        audio.flush()
-        with pytest.raises(DeviceMismatchError):
-            runtime.detect_vad_fd(audio.fileno())
-        with pytest.raises(DeviceMismatchError):
-            runtime.transcribe_window_fd(
-                audio.fileno(), source_start_ms=0, source_end_ms=100
-            )
-
-    assert vad.detect_calls == []
-    assert engine.inputs == []
 
 
 def test_live_fd_rejects_an_oversized_descriptor_before_vad() -> None:
@@ -485,7 +546,78 @@ def test_nano_loader_rejects_a_non_xpu_engine(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(nano_mod, "_load_vad", lambda _device: FakeVad([(0, 100)]))
 
     with pytest.raises(DeviceMismatchError):
-        nano_mod.load_nano_runtime()
+        nano_mod.load_nano_runtime(
+            selection=_selection("xpu"), inference=_inference(_selection("xpu"))
+        )
+
+
+@pytest.mark.parametrize("backend", ["cuda", "xpu"], ids=["cuda", "xpu"])
+def test_nano_loader_uses_accelerator_selection_not_toml(
+    monkeypatch: pytest.MonkeyPatch, backend: Literal["cuda", "xpu"]
+) -> None:
+    selection = _selection(backend)
+    captured: dict[str, str] = {}
+
+    def load_engine(device: str) -> SimpleNamespace:
+        captured["engine_device"] = device
+        return _engine_on(backend)
+
+    def load_vad(device: str) -> FakeVad:
+        captured["vad_device"] = device
+        return FakeVad([(0, 100)])
+
+    monkeypatch.setattr(nano_mod, "load_native_nano_engine", load_engine)
+    monkeypatch.setattr(nano_mod, "_load_vad", load_vad)
+
+    runtime = nano_mod.load_nano_runtime(
+        selection=selection, inference=_inference(selection)
+    )
+
+    assert runtime.device == f"{backend}:0"
+    assert captured == {
+        "engine_device": f"{backend}:0",
+        "vad_device": f"{backend}:0",
+    }
+
+
+def test_cpu_sensevoice_loader_uses_selected_cpu_dtype_and_device_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection("cpu")
+    captured: dict[str, object] = {}
+    parameter = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+    model = SimpleNamespace(parameters=lambda: iter([parameter]))
+
+    def auto_model(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setitem(sys.modules, "funasr", SimpleNamespace(AutoModel=auto_model))
+
+    runtime = nano_mod.load_sensevoice_runtime(
+        selection=selection, inference=_inference(selection)
+    )
+
+    assert captured["device"] == "cpu"
+    assert runtime.device == "cpu"
+    assert runtime.dtype == "float32"
+    assert runtime.expected_device_type == "cpu"
+
+
+def test_nano_loader_rejects_cpu_selection_before_model_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection("cpu")
+    monkeypatch.setattr(
+        nano_mod,
+        "load_native_nano_engine",
+        lambda _device: pytest.fail("Nano engine must not load for CPU"),
+    )
+
+    with pytest.raises(ModelLoadError, match="nano is not allowed"):
+        nano_mod.load_nano_runtime(
+            selection=selection, inference=_inference(selection)
+        )
 
 
 def _write_wav(path: Any, pcm: np.ndarray) -> None:
