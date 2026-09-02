@@ -19,7 +19,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from fun_voice import config
 from fun_voice.nano_runtime import EmptySpeechError
+from fun_voice.runtime_selection import load_runtime_selection
 
 DEVICE = "xpu:0"
 NANO_MODEL_ID = "FunAudioLLM/Fun-ASR-Nano-2512"
@@ -383,9 +385,13 @@ def _edit_distance(reference: str, candidate: str) -> int:
 
 def _default_runtime_factory() -> _PocRuntime:
     """Import the real runtime only for an explicit POC invocation."""
+    selection = load_runtime_selection()
+    if selection.backend != "xpu" or selection.device != DEVICE:
+        raise RuntimeError("incremental POC requires selected XPU runtime")
+    effective = config.effective_runtime_config(config.load_config(), selection)
     from fun_voice.nano_runtime import load_nano_runtime
 
-    return load_nano_runtime(device=DEVICE)
+    return load_nano_runtime(selection=selection, inference=effective.inference)
 
 
 def _default_audio_loader(path: str, sample_rate: int) -> Any:
