@@ -7,6 +7,7 @@ import torch / vllm / funasr, so they run in milliseconds.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import time
 import wave
@@ -16,8 +17,12 @@ from typing import Any
 import numpy as np
 import pytest
 
+from fun_voice import nano_runtime as nano_mod
+from fun_voice import preflight
 from fun_voice.contracts import ErrorCode, Segment, Transcription, WorkerHealth
 from fun_voice.nano_runtime import (
+    MAX_LIVE_PCM_BYTES,
+    MAX_LIVE_WINDOW_MS,
     VAD_MAX_SINGLE_SEGMENT_TIME_MS,
     VAD_OVERLAP_MS,
     AudioFormatError,
@@ -25,6 +30,7 @@ from fun_voice.nano_runtime import (
     EmptySpeechError,
     FsmnVadSegmenter,
     InferenceTimeoutError,
+    LiveAudioProtocolError,
     ModelOutputError,
     NanoRuntime,
     NanoRuntimeError,
@@ -33,7 +39,7 @@ from fun_voice.nano_runtime import (
     _slice_windows,
     check_engine_devices,
 )
-from fun_voice.worker import VERSION, Worker
+from fun_voice.worker import VERSION, LazyTranscriber, Worker
 
 # --- Fakes ------------------------------------------------------------------
 
@@ -345,6 +351,59 @@ def test_transcribe_rejects_non_xpu_before_asr(tmp_path) -> None:
     assert not engine.inputs  # rejected before any ASR call
 
 
+def test_live_fd_paths_reject_non_xpu_zero_before_reading_audio() -> None:
+    engine = FakeEngine(texts=["x"])
+    vad = FakeVad([(0, 100)])
+    runtime = NanoRuntime(engine=engine, vad=vad, device="xpu:1")
+    with tempfile.TemporaryFile() as audio:
+        audio.write(b"\x00\x00" * 1600)
+        audio.flush()
+        with pytest.raises(DeviceMismatchError):
+            runtime.detect_vad_fd(audio.fileno())
+        with pytest.raises(DeviceMismatchError):
+            runtime.transcribe_window_fd(
+                audio.fileno(), source_start_ms=0, source_end_ms=100
+            )
+
+    assert vad.detect_calls == []
+    assert engine.inputs == []
+
+
+def test_live_fd_rejects_an_oversized_descriptor_before_vad() -> None:
+    vad = FakeVad([(0, 100)])
+    runtime = _runtime(FakeEngine(texts=[]), vad)
+    with tempfile.TemporaryFile() as audio:
+        audio.write(b"\x00" * (MAX_LIVE_PCM_BYTES + 2))
+        audio.flush()
+        with pytest.raises(LiveAudioProtocolError):
+            runtime.detect_vad_fd(audio.fileno())
+
+    assert vad.detect_calls == []
+
+
+def test_vad_loader_rejects_a_non_xpu_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    parameter = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+    model = SimpleNamespace(parameters=lambda: iter([parameter]))
+    monkeypatch.setitem(
+        sys.modules,
+        "funasr",
+        SimpleNamespace(AutoModel=lambda **_kwargs: model),
+    )
+
+    with pytest.raises(DeviceMismatchError):
+        nano_mod._load_vad("xpu:0")
+
+
+def test_nano_loader_rejects_a_non_xpu_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        preflight, "load_nano_engine", lambda *_args, **_kwargs: _engine_on("cpu")
+    )
+    monkeypatch.setattr(nano_mod, "_load_vad", lambda _device: FakeVad([(0, 100)]))
+
+    with pytest.raises(DeviceMismatchError):
+        nano_mod.load_nano_runtime()
+
+
 def _write_wav(path: Any, pcm: np.ndarray) -> None:
     with wave.open(str(path), "wb") as wav:
         wav.setnchannels(1)
@@ -448,6 +507,17 @@ def test_worker_keeps_serving_after_error() -> None:
     assert second["text"] == "ok"
 
 
+def test_worker_error_response_never_echoes_an_audio_path() -> None:
+    runtime = FakeRuntime(error=NanoRuntimeError("/private/audio.pcm"))
+    response = _worker(runtime).handle(
+        {"id": "u1", "op": "transcribe", "audio": "/private/audio.pcm"}
+    )
+
+    assert response["status"] == "error"
+    assert response["error_code"] == "worker.internal"
+    assert "/private/audio.pcm" not in repr(response)
+
+
 def test_worker_passes_timeout_ms_to_runtime() -> None:
     runtime = FakeRuntime()
     _worker(runtime).handle(
@@ -497,7 +567,8 @@ def test_worker_health_never_carries_audio_or_text() -> None:
     assert "segments" not in response
 
 
-def test_worker_live_requests_require_one_fd_and_preserve_source_offsets() -> None:
+def test_worker_live_requests_require_session_metadata_and_preserve_offsets(
+) -> None:
     class LiveRuntime(FakeRuntime):
         def detect_vad_fd(
             self, fd: int, *, sample_rate: int
@@ -522,12 +593,20 @@ def test_worker_live_requests_require_one_fd_and_preserve_source_offsets() -> No
                 segments=(Segment(1200, 1500, "window"),),
             )
 
-    worker = _worker(LiveRuntime())
+    worker = Worker(LazyTranscriber(LiveRuntime, device="xpu:0"))
     fd = os.open("/dev/null", os.O_RDONLY)
     try:
         missing = worker.handle({"id": "missing", "op": "detect_vad"})
         detected = worker.handle(
-            {"id": "vad", "op": "detect_vad", "sample_rate": 16000},
+            {
+                "id": "vad",
+                "op": "detect_vad",
+                "sample_rate": 16000,
+                "session_id": "opaque-session",
+                "generation": 2,
+                "source_start_ms": 1000,
+                "source_end_ms": 2000,
+            },
             audio_fd=fd,
         )
         transcribed = worker.handle(
@@ -535,6 +614,8 @@ def test_worker_live_requests_require_one_fd_and_preserve_source_offsets() -> No
                 "id": "window",
                 "op": "transcribe_window",
                 "sample_rate": 16000,
+                "session_id": "opaque-session",
+                "generation": 2,
                 "source_start_ms": 1200,
                 "source_end_ms": 1500,
             },
@@ -560,10 +641,53 @@ def test_worker_live_requests_require_one_fd_and_preserve_source_offsets() -> No
     ]
 
 
+def test_worker_live_request_rejects_audio_path_and_never_echoes_it() -> None:
+    response = _worker().handle(
+        {
+            "id": "live",
+            "op": "detect_vad",
+            "sample_rate": 16000,
+            "session_id": "opaque-session",
+            "generation": 1,
+            "source_start_ms": 0,
+            "source_end_ms": 100,
+            "audio": "/private/audio.pcm",
+        },
+        audio_fd=3,
+    )
+
+    assert response["error_code"] == "worker.protocol"
+    assert "/private/audio.pcm" not in repr(response)
+
+
+def test_worker_live_request_rejects_an_unbounded_source_range() -> None:
+    response = _worker().handle(
+        {
+            "id": "live",
+            "op": "detect_vad",
+            "sample_rate": 16000,
+            "session_id": "opaque-session",
+            "generation": 1,
+            "source_start_ms": 0,
+            "source_end_ms": MAX_LIVE_WINDOW_MS + 1,
+        },
+        audio_fd=3,
+    )
+
+    assert response["error_code"] == "worker.protocol"
+
+
 def test_worker_unknown_op_returns_protocol_error() -> None:
     response = _worker().handle({"op": "bogus"})
     assert response["status"] == "error"
     assert response["error_code"] == "worker.protocol"
+
+
+def test_worker_unknown_operation_never_echoes_caller_content() -> None:
+    response = _worker().handle({"op": "/private/audio-or-text"})
+
+    assert response["error_code"] == "worker.protocol"
+    assert "/private/audio-or-text" not in repr(response)
 
 
 def test_worker_missing_id_returns_protocol_error() -> None:

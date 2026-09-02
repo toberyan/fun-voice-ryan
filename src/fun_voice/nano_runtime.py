@@ -22,6 +22,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import stat
 import threading
 import time
 import wave
@@ -50,6 +51,8 @@ VAD_MAX_SINGLE_SEGMENT_TIME_MS = 30000  # FSMN-VAD hard cap per speech segment (
 DEFAULT_TIMEOUT_SECONDS = 120.0
 MAX_NEW_TOKENS = 512
 WARMUP_SAMPLE_COUNT = 16_000
+MAX_LIVE_WINDOW_MS = 60_000
+MAX_LIVE_PCM_BYTES = 16_000 * 2 * MAX_LIVE_WINDOW_MS // 1000
 
 # Model cache layout mirrors scripts/run-nano-xpu-poc.sh:
 #   ${XDG_DATA_HOME:-~/.local/share}/fun-voice-ryan/models/
@@ -125,6 +128,12 @@ class AudioFormatError(NanoRuntimeError):
     """The audio input could not be loaded at the expected format."""
 
     error_code: ErrorCode = ErrorCode("worker", "format")
+
+
+class LiveAudioProtocolError(NanoRuntimeError):
+    """A received live descriptor violates the bounded local socket contract."""
+
+    error_code: ErrorCode = ErrorCode("worker", "protocol")
 
 
 # --- Protocols (the seams the fakes implement) ------------------------------
@@ -212,11 +221,21 @@ def _load_audio_samples(path: str, sample_rate: int) -> np.ndarray:
 def _load_pcm_fd(fd: int) -> np.ndarray:
     """Read raw s16le PCM from one received descriptor without a pathname."""
     try:
+        descriptor = os.fstat(fd)
+    except OSError as exc:
+        raise LiveAudioProtocolError("cannot inspect live audio descriptor") from exc
+    if not stat.S_ISREG(descriptor.st_mode):
+        raise LiveAudioProtocolError("live audio descriptor is not a regular file")
+    if descriptor.st_size > MAX_LIVE_PCM_BYTES:
+        raise LiveAudioProtocolError("live audio descriptor exceeds the window limit")
+    try:
         with os.fdopen(os.dup(fd), "rb", closefd=True) as audio:
             audio.seek(0)
-            data = audio.read()
+            data = audio.read(MAX_LIVE_PCM_BYTES + 1)
     except OSError as exc:
         raise AudioFormatError("unable to read live audio descriptor") from exc
+    if len(data) > MAX_LIVE_PCM_BYTES:
+        raise LiveAudioProtocolError("live audio descriptor exceeds the window limit")
     if not data or len(data) % 2:
         raise AudioFormatError("live audio descriptor is not s16le PCM")
     return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -328,6 +347,17 @@ class NanoRuntime:
             ),
         )
 
+    def device_evidence(self) -> tuple[str, str]:
+        """Return separately verified Nano/VAD XPU evidence for the POC gate."""
+        if self.device != DEVICE:
+            raise DeviceMismatchError("Nano runtime requires xpu:0")
+        check_engine_devices(self.engine)
+        vad_model = getattr(self.vad, "_model", None)
+        if vad_model is None:
+            raise DeviceMismatchError("FSMN-VAD exposes no inspectable model")
+        _assert_funasr_model_xpu(vad_model, name="FSMN-VAD")
+        return DEVICE, DEVICE
+
     def close(self) -> None:
         """Mark the runtime closed (offline vLLM has no explicit close API)."""
         self._closed = True
@@ -398,6 +428,7 @@ class NanoRuntime:
         self, fd: int, *, sample_rate: int = 16000
     ) -> tuple[tuple[int, int], ...]:
         """Run the already-loaded VAD over a received anonymous PCM window."""
+        self._require_xpu_zero_for_live_audio()
         try:
             regions = self.vad.detect(_load_pcm_fd(fd), sample_rate)
             return tuple(sorted(regions, key=lambda region: region[0]))
@@ -417,6 +448,7 @@ class NanoRuntime:
         """Decode one live window and express its segments in source time."""
         if source_start_ms < 0 or source_end_ms <= source_start_ms:
             raise AudioFormatError("invalid live source range")
+        self._require_xpu_zero_for_live_audio()
         try:
             result = self.transcribe_samples(
                 _load_pcm_fd(fd), sample_rate=sample_rate, timeout=timeout
@@ -439,6 +471,11 @@ class NanoRuntime:
             timing=result.timing,
             worker_elapsed_ms=result.worker_elapsed_ms,
         )
+
+    def _require_xpu_zero_for_live_audio(self) -> None:
+        """Reject every live descriptor before it is read on a wrong device."""
+        if self.device != DEVICE:
+            raise DeviceMismatchError("live ASR requires xpu:0")
 
     def _transcribe_impl(
         self,
@@ -590,6 +627,8 @@ def load_nano_runtime(
     default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> NanoRuntime:
     """Load the Fun-ASR-Nano engine and FSMN-VAD once, on XPU."""
+    if device != DEVICE:
+        raise DeviceMismatchError("Nano runtime requires xpu:0")
     # Reuse the already-downloaded FSMN-VAD instead of re-downloading it.
     os.environ.setdefault("MODELSCOPE_CACHE", str(models_root()))
 
@@ -603,6 +642,7 @@ def load_nano_runtime(
         enforce_eager=enforce_eager,
         max_model_len=max_model_len,
     )
+    check_engine_devices(engine)
     vad = _load_vad(device)
     return NanoRuntime(
         engine=engine, vad=vad, device=device, default_timeout=default_timeout
@@ -618,6 +658,7 @@ def _load_vad(device: str) -> FsmnVadSegmenter:
         disable_update=True,
         max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
     )
+    _assert_funasr_model_xpu(model, name="FSMN-VAD")
     return FsmnVadSegmenter(model)
 
 

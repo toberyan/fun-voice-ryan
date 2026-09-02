@@ -50,6 +50,7 @@ from fun_voice.contracts import (
 )
 from fun_voice.nano_runtime import (
     DEFAULT_TIMEOUT_SECONDS,
+    MAX_LIVE_WINDOW_MS,
     VERSION,
     ModelLoadError,
     NanoRuntimeError,
@@ -121,6 +122,37 @@ class LazyTranscriber:
     ) -> Transcription:
         return self._get_runtime().transcribe(
             audio, sample_rate=sample_rate, timeout=timeout
+        )
+
+    def detect_vad_fd(
+        self, fd: int, *, sample_rate: int
+    ) -> tuple[tuple[int, int], ...]:
+        """Load Nano on demand and delegate one descriptor-backed VAD request."""
+        detect = getattr(self._get_runtime(), "detect_vad_fd", None)
+        if not callable(detect):
+            raise ModelLoadError("live VAD is unavailable for this profile")
+        return tuple(detect(fd, sample_rate=sample_rate))
+
+    def transcribe_window_fd(
+        self,
+        fd: int,
+        *,
+        sample_rate: int,
+        source_start_ms: int,
+        source_end_ms: int,
+    ) -> Transcription:
+        """Load Nano on demand and delegate one descriptor-backed ASR window."""
+        transcribe = getattr(self._get_runtime(), "transcribe_window_fd", None)
+        if not callable(transcribe):
+            raise ModelLoadError("live ASR is unavailable for this profile")
+        return cast(
+            Transcription,
+            transcribe(
+                fd,
+                sample_rate=sample_rate,
+                source_start_ms=source_start_ms,
+                source_end_ms=source_end_ms,
+            ),
         )
 
     def preload(self) -> PreloadTiming:
@@ -275,7 +307,7 @@ class Worker:
             return self._preload(message)
         if op == "health":
             return self._health(message)
-        return _error_response(message.get("id"), ERR_PROTOCOL, f"unknown op: {op!r}")
+        return _error_response(message.get("id"), ERR_PROTOCOL, "unknown operation")
 
     def _transcribe(self, message: Mapping[str, Any]) -> dict[str, Any]:
         request_id = message.get("id")
@@ -312,9 +344,7 @@ class Worker:
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             code = _error_code_of(exc)
-            detail = (
-                str(exc) if isinstance(exc, NanoRuntimeError) else type(exc).__name__
-            )
+            detail = type(exc).__name__
             logger.warning("transcribe failed: %s (%s)", code, type(exc).__name__)
             return _error_response(request_id, code, detail, elapsed)
         elapsed = int((time.perf_counter() - started) * 1000)
@@ -323,11 +353,12 @@ class Worker:
     def _detect_vad(
         self, message: Mapping[str, Any], audio_fd: int | None
     ) -> dict[str, Any]:
-        request_id, sample_rate = self._live_request_fields(message, audio_fd)
-        if request_id is None or sample_rate is None:
+        fields = self._live_request_fields(message, audio_fd)
+        if fields is None:
             return _error_response(
                 message.get("id"), ERR_PROTOCOL, "invalid live request"
             )
+        request_id, sample_rate, _source_start, _source_end = fields
         detect = getattr(self.runtime, "detect_vad_fd", None)
         if not callable(detect):
             return _error_response(request_id, ERR_INTERNAL, "live VAD unavailable")
@@ -351,22 +382,12 @@ class Worker:
     def _transcribe_window(
         self, message: Mapping[str, Any], audio_fd: int | None
     ) -> dict[str, Any]:
-        request_id, sample_rate = self._live_request_fields(message, audio_fd)
-        if request_id is None or sample_rate is None:
+        fields = self._live_request_fields(message, audio_fd)
+        if fields is None:
             return _error_response(
                 message.get("id"), ERR_PROTOCOL, "invalid live request"
             )
-        start = message.get("source_start_ms")
-        end = message.get("source_end_ms")
-        if (
-            isinstance(start, bool)
-            or isinstance(end, bool)
-            or not isinstance(start, int)
-            or not isinstance(end, int)
-            or start < 0
-            or end <= start
-        ):
-            return _error_response(request_id, ERR_PROTOCOL, "invalid source range")
+        request_id, sample_rate, start, end = fields
         transcribe = getattr(self.runtime, "transcribe_window_fd", None)
         if not callable(transcribe):
             return _error_response(request_id, ERR_INTERNAL, "live ASR unavailable")
@@ -392,9 +413,13 @@ class Worker:
     @staticmethod
     def _live_request_fields(
         message: Mapping[str, Any], audio_fd: int | None
-    ) -> tuple[str | None, int | None]:
+    ) -> tuple[str, int, int, int] | None:
         request_id = message.get("id")
         sample_rate = message.get("sample_rate")
+        session_id = message.get("session_id")
+        generation = message.get("generation")
+        source_start = message.get("source_start_ms")
+        source_end = message.get("source_end_ms")
         if (
             not isinstance(request_id, str)
             or not request_id
@@ -403,9 +428,23 @@ class Worker:
             or isinstance(sample_rate, bool)
             or not isinstance(sample_rate, int)
             or sample_rate <= 0
+            or "audio" in message
+            or not isinstance(session_id, str)
+            or not session_id
+            or len(session_id) > 128
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or isinstance(source_start, bool)
+            or isinstance(source_end, bool)
+            or not isinstance(source_start, int)
+            or not isinstance(source_end, int)
+            or source_start < 0
+            or source_end <= source_start
+            or source_end - source_start > MAX_LIVE_WINDOW_MS
         ):
-            return None, None
-        return request_id, sample_rate
+            return None
+        return request_id, sample_rate, source_start, source_end
 
     def _preload(self, message: Mapping[str, Any]) -> dict[str, Any]:
         """Load the lazy runtime and return health, without audio or text."""
@@ -637,8 +676,10 @@ def _read_line_with_fds(
                     _close_fds(fds)
                     raise ProtocolError("unexpected ancillary data")
                 ints = array.array("i")
-                usable = len(data) - (len(data) % ints.itemsize)
-                ints.frombytes(data[:usable])
+                if len(data) % ints.itemsize:
+                    _close_fds(fds)
+                    raise ProtocolError("malformed ancillary data")
+                ints.frombytes(data)
                 fds.extend(ints)
         else:
             chunk = conn.recv(4096)

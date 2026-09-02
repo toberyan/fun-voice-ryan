@@ -21,6 +21,7 @@ from fun_voice.config import Config, InferenceConfig, RuntimePaths
 from fun_voice.contracts import (
     MAX_MESSAGE_BYTES,
     WORKER_RESPONSE_MAX_BYTES,
+    ProtocolError,
     Segment,
     Transcription,
     WorkerHealth,
@@ -186,7 +187,15 @@ def test_health_over_socket(server) -> None:
 def test_live_vad_socket_request_transfers_exactly_one_fd(server) -> None:
     _worker_server, _runtime, socket_path = server
     request = encode_message(
-        {"id": "live", "op": "detect_vad", "sample_rate": 16000}
+        {
+            "id": "live",
+            "op": "detect_vad",
+            "sample_rate": 16000,
+            "session_id": "opaque-session",
+            "generation": 1,
+            "source_start_ms": 0,
+            "source_end_ms": 100,
+        }
     ) + b"\n"
     fd = os.open("/dev/null", os.O_RDONLY)
     try:
@@ -213,6 +222,20 @@ def test_live_vad_socket_request_transfers_exactly_one_fd(server) -> None:
         "ranges": [{"start_ms": 0, "end_ms": 100}],
         "error_code": None,
     }
+
+
+def test_live_ancillary_payload_with_partial_descriptor_is_protocol_error() -> None:
+    class MalformedAncillarySocket:
+        def recvmsg(self, _size: int, _ancbuf: int):
+            return (
+                b'{"op":"health"}\n',
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, b"\x01")],
+                0,
+                None,
+            )
+
+    with pytest.raises(ProtocolError, match="malformed ancillary data"):
+        worker_mod._read_line_with_fds(MalformedAncillarySocket())
 
 
 def test_lazy_transcriber_loads_only_for_first_transcription() -> None:

@@ -29,6 +29,7 @@ from fun_voice.contracts import (
     DaemonState,
     ErrorCode,
     FocusSnapshot,
+    SessionKey,
     Transcription,
     WorkerHealth,
     split_utf8,
@@ -725,7 +726,12 @@ def test_worker_client_live_vad_uses_an_anonymous_audio_lease(tmp_path: Path) ->
             try:
                 ranges = SocketWorkerClient(
                     tmp_path / "worker.sock", timeout=1.0
-                ).detect_vad(lease)
+                ).detect_vad(
+                    lease,
+                    SessionKey("opaque-session", generation=1),
+                    source_start_ms=0,
+                    source_end_ms=100,
+                )
             finally:
                 lease.release()
     finally:
@@ -734,6 +740,46 @@ def test_worker_client_live_vad_uses_an_anonymous_audio_lease(tmp_path: Path) ->
     assert ranges == ((0, 100),)
     assert server.requests[0]["op"] == "detect_vad"
     assert "audio" not in server.requests[0]
+    assert server.requests[0]["session_id"] == "opaque-session"
+    assert server.requests[0]["generation"] == 1
+    assert server.requests[0]["source_start_ms"] == 0
+    assert server.requests[0]["source_end_ms"] == 100
+
+
+def test_worker_client_live_window_transmits_the_same_session_metadata(
+    tmp_path: Path,
+) -> None:
+    server = _WorkerSocket(tmp_path / "worker.sock", _ok_responder)
+    try:
+        with tempfile.TemporaryFile() as backing:
+            backing.write(b"\x00\x00" * 1600)
+            backing.flush()
+            lease = AudioLease(
+                CaptureArtifact(
+                    audio=f"/proc/self/fd/{backing.fileno()}", duration_ms=100
+                ),
+                backing,
+            )
+            try:
+                result = SocketWorkerClient(
+                    tmp_path / "worker.sock", timeout=1.0
+                ).transcribe_window(
+                    lease,
+                    SessionKey("opaque-session", generation=3),
+                    source_start_ms=1200,
+                    source_end_ms=1300,
+                )
+            finally:
+                lease.release()
+    finally:
+        server.close()
+
+    assert result.text == "你好"
+    assert server.requests[0]["op"] == "transcribe_window"
+    assert server.requests[0]["session_id"] == "opaque-session"
+    assert server.requests[0]["generation"] == 3
+    assert server.requests[0]["source_start_ms"] == 1200
+    assert server.requests[0]["source_end_ms"] == 1300
 
 
 def test_worker_client_maps_empty_speech(tmp_path: Path) -> None:

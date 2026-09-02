@@ -91,8 +91,9 @@ class SessionKey:
     """Opaque, process-local identity for work belonging to one recording.
 
     The identifier is deliberately omitted from ``repr`` so an accidental debug
-    log cannot correlate otherwise private session work.  It is never a wire
-    protocol identifier.
+    log cannot correlate otherwise private session work.  Live worker requests
+    carry it only as bounded same-UID socket metadata; it is never returned,
+    persisted, or included in telemetry.
     """
 
     session_id: str = field(repr=False)

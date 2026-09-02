@@ -554,9 +554,22 @@ class SocketWorkerClient:
             lifecycle=lifecycle,
         )
 
-    def detect_vad(self, lease: AudioLease) -> tuple[tuple[int, int], ...]:
+    def detect_vad(
+        self,
+        lease: AudioLease,
+        key: SessionKey,
+        *,
+        source_start_ms: int,
+        source_end_ms: int,
+    ) -> tuple[tuple[int, int], ...]:
         """Ask the Nano worker for ranges using exactly one lease descriptor."""
-        request = {"id": uuid.uuid4().hex, "op": "detect_vad", "sample_rate": 16000}
+        request = self._live_request(
+            "detect_vad",
+            lease,
+            key,
+            source_start_ms=source_start_ms,
+            source_end_ms=source_end_ms,
+        )
         try:
             response = self._round_trip_fd(request, lease)
         except _WorkerConnectFailure as exc:
@@ -585,6 +598,48 @@ class SocketWorkerClient:
             parsed.append((start, end))
             previous_end = end
         return tuple(parsed)
+
+    def transcribe_window(
+        self,
+        lease: AudioLease,
+        key: SessionKey,
+        *,
+        source_start_ms: int,
+        source_end_ms: int,
+    ) -> Transcription:
+        """Decode one bounded live window through the same Nano worker."""
+        request = self._live_request(
+            "transcribe_window",
+            lease,
+            key,
+            source_start_ms=source_start_ms,
+            source_end_ms=source_end_ms,
+        )
+        try:
+            return self._parse_response(self._round_trip_fd(request, lease))
+        except _WorkerConnectFailure as exc:
+            raise WorkerError(ErrorCode("worker", "unavailable")) from exc
+
+    @staticmethod
+    def _live_request(
+        op: Literal["detect_vad", "transcribe_window"],
+        lease: AudioLease,
+        key: SessionKey,
+        *,
+        source_start_ms: int,
+        source_end_ms: int,
+    ) -> dict[str, object]:
+        if source_start_ms < 0 or source_end_ms <= source_start_ms:
+            raise ValueError("live source range is invalid")
+        return {
+            "id": uuid.uuid4().hex,
+            "op": op,
+            "sample_rate": lease.artifact.sample_rate,
+            "session_id": key.session_id,
+            "generation": key.generation,
+            "source_start_ms": source_start_ms,
+            "source_end_ms": source_end_ms,
+        }
 
     def _wait_for_worker(
         self, request: Mapping[str, Any], first_failure: _WorkerConnectFailure
