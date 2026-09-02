@@ -177,5 +177,5 @@ def test_user_docs_cover_dtk_build_fallback_and_visual_acceptance() -> None:
     assert "libdtk6widget-dev" in readme
     assert "native/dtk-overlay" in readme
     assert "无悬浮窗" in operations
-    for expected in ("底部居中", "深色", "浅色", "中文", "圆角", "焦点"):
+    for expected in ("中下部", "深色", "浅色", "中文", "圆角", "焦点"):
         assert expected in checklist

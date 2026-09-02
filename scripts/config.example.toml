@@ -17,6 +17,15 @@ commit_timeout_ms = 500
 # fcitx 上屏失败时是否允许 XTEST Ctrl+V 回退；false 时只通知失败，不注入。
 allow_x11_paste_fallback = true
 
+[overlay]
+# DTK 瞬态悬浮窗：中心位于鼠标所在屏幕工作区的 70% 高度；重启 daemon 后生效。
+# 允许范围：vertical_center_ratio 0.50--0.85，width_px 420--1000，font_scale 0.80--1.80。
+vertical_center_ratio = 0.70
+# 固定逻辑宽度；小屏自动收缩并保留边距。
+width_px = 680
+# 1.0 对应状态 18pt、转写 15pt、音量 13pt 的默认大字号。
+font_scale = 1.0
+
 [inference]
 # Worker 推理配置；device 只接受 xpu:0，禁止 CPU 回退。
 device = "xpu:0"

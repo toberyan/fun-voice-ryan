@@ -38,7 +38,10 @@ Fun Voice Ryan 的安装、运行与故障排查。安装脚本为 `scripts/inst
 读取它。当前生效的键包括 PipeWire `audio.source`、Fcitx
 `input_method.commit_timeout_ms`（毫秒）及 `input_method.allow_x11_paste_fallback`、Nano
 的 `inference.*`，以及 `enhanced.enabled` 和 Qwen 的
-`correction.max_source_characters`、`max_new_tokens`、`timeout_seconds`、`protected_terms`。
+`correction.max_source_characters`、`max_new_tokens`、`timeout_seconds`、`protected_terms`，
+以及 daemon 读取的 `overlay.vertical_center_ratio`、`overlay.width_px`、
+`overlay.font_scale`。后者的合法范围分别为 `0.50--0.85`、`420--1000` 和
+`0.80--1.80`；已知的 overlay 字段类型错误或越界会明确拒绝 daemon 启动，而不是静默采用布局。
 Qwen 的模型、设备和精度固定，不能改为其他模型或 CPU。
 
 `inference.device` 只能是 `xpu:0`，任何 CPU/CUDA 设置都会拒绝启动，绝不静默回退。
@@ -93,8 +96,13 @@ fun-voice-selftest --format json
 ### 6.1 DTK 悬浮窗
 
 悬浮窗由 `~/.local/lib/fun-voice-ryan/fun-voice-overlay` 按需启动，不是 systemd 服务，也
-不会在登录后常驻。它在当前屏幕底部居中显示状态和临时转写，跟随 DDE 深浅主题；`clear` 后
-5 秒自动退出。它不获取焦点、不接收鼠标或键盘输入，也不写入剪贴板。
+不会在登录后常驻。它在鼠标所在屏幕的工作区中下部显示状态和临时转写，跟随 DDE 深浅主题；
+`clear` 后 5 秒自动退出。它不获取焦点、不接收鼠标或键盘输入，也不写入剪贴板。
+
+可在 `[overlay]` 配置 `vertical_center_ratio`（窗口中心高度比例）、`width_px`（固定逻辑
+宽度）和 `font_scale`（状态 18 pt、转写 15 pt、音量 13 pt 的统一倍率）。配置仅在 daemon
+启动时读取；修改后执行本节的重启命令生效。布局重启不会启动 Nano、SenseVoice 或 Qwen，模型
+仍仅由实际语音会话按需拉起。
 
 如果二进制缺失、DTK 运行库不可用或窗口进程异常，语音识别和最终上屏会继续运行，但会处于
 **无悬浮窗**状态。重新执行以下命令即可恢复：
