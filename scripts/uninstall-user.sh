@@ -16,6 +16,7 @@ BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 FCITX_LIB_DIR="${HOME}/.local/lib/fcitx5"
 FCITX_ADDON_DIR="${HOME}/.local/share/fcitx5/addon"
+OVERLAY_INSTALL_DIR="${HOME}/.local/lib/fun-voice-ryan"
 AUTOSTART_DIR="${HOME}/.config/autostart"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/fun-voice-ryan"
 MODELS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/models"
@@ -72,6 +73,7 @@ done
 remove_file "${AUTOSTART_DIR}/fun-voice-session.desktop"
 remove_file "${FCITX_LIB_DIR}/fcitx5-fun-voice.so"
 remove_file "${FCITX_ADDON_DIR}/fcitx5-fun-voice.conf"
+remove_file "${OVERLAY_INSTALL_DIR}/fun-voice-overlay"
 
 # --- 3. Remove the console scripts ------------------------------------------
 for script in "${CONSOLE_SCRIPTS[@]}"; do

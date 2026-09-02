@@ -150,3 +150,32 @@ def test_historical_design_links_to_the_x11_replacement() -> None:
         / "2026-08-31-fun-asr-nano-intel-xpu-voice-assistant-design.md"
     ).read_text(encoding="utf-8")
     assert "2026-09-01-x11-hotkey-replacement-design.md" in design
+
+
+def test_installer_validates_and_installs_the_private_dtk_overlay_binary() -> None:
+    install = (ROOT / "scripts/install-user.sh").read_text(encoding="utf-8")
+    assert 'OVERLAY_BIN="${ROOT}/build/dtk-overlay/fun-voice-overlay"' in install
+    assert 'OVERLAY_INSTALL_DIR="${HOME}/.local/lib/fun-voice-ryan"' in install
+    assert (
+        'install_file "${OVERLAY_BIN}" '
+        '"${OVERLAY_INSTALL_DIR}/fun-voice-overlay" 755' in install
+    )
+    assert "enable --now fun-voice-overlay" not in install
+
+
+def test_uninstaller_removes_only_the_owned_overlay_binary() -> None:
+    uninstall = (ROOT / "scripts/uninstall-user.sh").read_text(encoding="utf-8")
+    assert 'OVERLAY_INSTALL_DIR="${HOME}/.local/lib/fun-voice-ryan"' in uninstall
+    assert 'remove_file "${OVERLAY_INSTALL_DIR}/fun-voice-overlay"' in uninstall
+
+
+def test_user_docs_cover_dtk_build_fallback_and_visual_acceptance() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    operations = (ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    checklist = (ROOT / "docs/acceptance-checklist.md").read_text(encoding="utf-8")
+    assert "libdtk6gui-dev" in readme
+    assert "libdtk6widget-dev" in readme
+    assert "native/dtk-overlay" in readme
+    assert "无悬浮窗" in operations
+    for expected in ("底部居中", "深色", "浅色", "中文", "圆角", "焦点"):
+        assert expected in checklist

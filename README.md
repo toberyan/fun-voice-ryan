@@ -16,6 +16,7 @@ Fun Voice Ryan 是一个运行在 Deepin DDE X11 上的本地语音输入助手�
 - Python 3.12 与 `uv`。
 - 桌面环境为 Deepin DDE X11（首版不支持 Wayland）。
 - 已安装 fcitx5 及 Fcitx5Core 开发库。
+- 已安装 Qt 6、`libdtk6gui-dev` 与 `libdtk6widget-dev`，用于构建原生 DDE 悬浮窗。
 - 默认输入走 PipeWire，能提供 48 kHz / 4 通道音频。
 - Intel Arc 显卡，并装好 Intel GPU compute runtime 与 Level Zero。
 
@@ -40,8 +41,9 @@ uv sync --inexact
 即拒绝安装（详见上方 WARNING）。
 
 ```bash
-# 1) 先构建 fcitx addon 与 Python 环境（一次性）
+# 1) 先构建 native 组件与 Python 环境（一次性）
 cmake -S native/fcitx5-fun-voice -B build/fcitx && cmake --build build/fcitx
+cmake -S native/dtk-overlay -B build/dtk-overlay && cmake --build build/dtk-overlay
 scripts/create-xpu-env.sh
 uv sync --inexact
 
@@ -52,7 +54,9 @@ scripts/install-user.sh
 安装内容：6 个 console script 拷贝到 `~/.local/bin/`；两个 systemd user unit
 （worker、daemon）写入 `~/.config/systemd/user/`；fcitx addon 的 `.so` 与
 `.conf` 写入 `~/.local/lib/fcitx5/` 与 `~/.local/share/fcitx5/addon/`；登录自启
-入口写入 `~/.config/autostart/`。脚本幂等，可重复执行。
+入口写入 `~/.config/autostart/`。原生 DTK 悬浮窗安装在
+`~/.local/lib/fun-voice-ryan/fun-voice-overlay`，仅在需要显示临时状态时按需启动。
+脚本幂等，可重复执行。
 
 > [!IMPORTANT]
 > 安装的 console script（shebang）与 autostart `Exec` 都指向**仓库与 `.venv`

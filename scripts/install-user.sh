@@ -13,9 +13,10 @@
 #   1. Console scripts            -> ~/.local/bin
 #   2. systemd units              -> ~/.config/systemd/user  (replaces symlinks)
 #   3. Fcitx addon .so + .conf    -> ~/.local/lib/fcitx5 and ~/.local/share/fcitx5/addon
-#   4. Autostart desktop entry    -> ~/.config/autostart
-#   5. Safely retire a verified legacy DDE bridge shortcut (upgrade only)
-#   6. Retire the warm worker unit, then enable/restart only the lightweight daemon
+#   4. DTK overlay executable     -> ~/.local/lib/fun-voice-ryan
+#   5. Autostart desktop entry    -> ~/.config/autostart
+#   6. Safely retire a verified legacy DDE bridge shortcut (upgrade only)
+#   7. Retire the warm worker unit, then enable/restart only the lightweight daemon
 
 set -euo pipefail
 
@@ -27,6 +28,7 @@ BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 FCITX_LIB_DIR="${HOME}/.local/lib/fcitx5"
 FCITX_ADDON_DIR="${HOME}/.local/share/fcitx5/addon"
+OVERLAY_INSTALL_DIR="${HOME}/.local/lib/fun-voice-ryan"
 AUTOSTART_DIR="${HOME}/.config/autostart"
 LEGACY_SHORTCUT_ID_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/fun-voice-ryan/dde-shortcut-id"
 CONSOLE_SCRIPTS=(
@@ -41,6 +43,7 @@ RUNTIME_MODULES=(torch funasr modelscope transformers Xlib)
 # Source artifacts (validated up front so a missing file fails before any write).
 FCITX_SO="${ROOT}/build/fcitx/fcitx5-fun-voice.so"
 FCITX_CONF="${ROOT}/native/fcitx5-fun-voice/fcitx5-fun-voice.conf"
+OVERLAY_BIN="${ROOT}/build/dtk-overlay/fun-voice-overlay"
 DESKTOP_SRC="${ROOT}/systemd/fun-voice-session.desktop"
 FCITX_LIB_ABS="${FCITX_LIB_DIR}/fcitx5-fun-voice"  # no ".so"; fcitx5 appends it
 log() { printf '[install-user] %s\n' "$*"; }
@@ -168,6 +171,8 @@ done
 [[ -f "${FCITX_SO}" ]] \
     || die "source" "fcitx addon .so missing: ${FCITX_SO} (build it first)"
 [[ -f "${FCITX_CONF}" ]] || die "source" "fcitx addon conf missing: ${FCITX_CONF}"
+[[ -f "${OVERLAY_BIN}" ]] \
+    || die "source" "DTK overlay binary missing: ${OVERLAY_BIN} (build it first)"
 [[ -f "${DESKTOP_SRC}" ]] || die "source" "desktop entry missing: ${DESKTOP_SRC}"
 log "all source artifacts present"
 
@@ -194,14 +199,18 @@ install_file "${FCITX_CONF_TMP}" "${FCITX_ADDON_DIR}/fcitx5-fun-voice.conf" 644
 rm -f "${FCITX_CONF_TMP}"
 log "installed fcitx addon (${FCITX_LIB_DIR}, ${FCITX_ADDON_DIR})"
 
-# --- 4. Autostart desktop entry --------------------------------------------
+# --- 4. Private DTK overlay executable -------------------------------------
+install_file "${OVERLAY_BIN}" "${OVERLAY_INSTALL_DIR}/fun-voice-overlay" 755
+log "installed private DTK overlay binary into ${OVERLAY_INSTALL_DIR}"
+
+# --- 5. Autostart desktop entry --------------------------------------------
 DESKTOP_TMP="$(mktemp)"
 sed "s|@REPO_ROOT@|${ROOT}|g" "${DESKTOP_SRC}" > "${DESKTOP_TMP}"
 install_file "${DESKTOP_TMP}" "${AUTOSTART_DIR}/fun-voice-session.desktop" 644
 rm -f "${DESKTOP_TMP}"
 log "installed autostart desktop entry into ${AUTOSTART_DIR}"
 
-# --- 5. Safely retire the old DDE bridge shortcut (upgrade only) -----------
+# --- 6. Safely retire the old DDE bridge shortcut (upgrade only) -----------
 retire_legacy_dde_shortcut
 if [[ -f "${BIN_DIR}/fun-voice-bridge" || -L "${BIN_DIR}/fun-voice-bridge" ]]; then
     rm -f "${BIN_DIR}/fun-voice-bridge" \
@@ -209,7 +218,7 @@ if [[ -f "${BIN_DIR}/fun-voice-bridge" || -L "${BIN_DIR}/fun-voice-bridge" ]]; t
     log "removed obsolete bridge wrapper"
 fi
 
-# --- 6. Retire warm worker + defer daemon startup to the X11 session -------
+# --- 7. Retire warm worker + defer daemon startup to the X11 session -------
 if ! command -v systemctl >/dev/null 2>&1; then
     die "systemd" "systemctl not found on PATH"
 fi

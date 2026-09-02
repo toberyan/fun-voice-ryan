@@ -90,7 +90,23 @@ fun-voice-selftest --format json
 `activating`。daemon 依赖
 图形会话环境（DISPLAY/XAUTHORITY），由登录时的 autostart 入口导入（见第 8 节）。
 
-### 6.1 内存时延诊断
+### 6.1 DTK 悬浮窗
+
+悬浮窗由 `~/.local/lib/fun-voice-ryan/fun-voice-overlay` 按需启动，不是 systemd 服务，也
+不会在登录后常驻。它在当前屏幕底部居中显示状态和临时转写，跟随 DDE 深浅主题；`clear` 后
+5 秒自动退出。它不获取焦点、不接收鼠标或键盘输入，也不写入剪贴板。
+
+如果二进制缺失、DTK 运行库不可用或窗口进程异常，语音识别和最终上屏会继续运行，但会处于
+**无悬浮窗**状态。重新执行以下命令即可恢复：
+
+```bash
+cmake -S native/dtk-overlay -B build/dtk-overlay
+cmake --build build/dtk-overlay
+scripts/install-user.sh
+systemctl --user restart fun-voice-daemon.service
+```
+
+### 6.2 内存时延诊断
 
 daemon 的 owner-only control socket 支持 `{"op":"metrics"}`。它只返回当前进程最近
 128 次会话的聚合计数、P50/P95 与固定枚举直方图；不会返回会话明细，也不会包含音频、文本、
