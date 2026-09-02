@@ -138,23 +138,29 @@ Level Zero 是 torch-xpu 的底层运行时;若 `torch.xpu.is_available()` 为
 
 ## POC 结果
 
-状态:**需要重新运行** —— 下方记录的是已废弃 vLLM 路径的历史证据，不可用于安装。
-当前原生 FunASR/PyTorch 路径已验证连续请求、XPU 参数设备和 10 秒本地样本可用；仍须运行
-本节末的完整九项硬门，获得 `backend="native_funasr_pytorch"` 的新报告后才可放行。
+状态:**已通过（真实运行）** —— 当前运行态报告
+`${XDG_RUNTIME_DIR}/fun-voice-ryan/poc-report.json` 为 `ready=true`，设备为
+`xpu:0`，九项硬门全部为 `pass`；Nano decoder 后端为
+`native_funasr_pytorch`。该报告以 `0600` 保存，只记录设备、门禁指标和样本构成，
+不含音频路径或转写文本，可作为当前桌面服务的放行证据。
+
+下表摘录的是该真实运行报告的非敏感指标。任何后续环境、驱动或模型变更后，都必须重新运行
+本节末的 POC；新报告只有仍满足 `ready=true`、九项全 `pass` 且
+`backend="native_funasr_pytorch"` 时才能放行。
 
 ### 九项硬门结果
 
 | 检查 | 结果 | 证据 |
 | --- | --- | --- |
 | `xpu_visible` | pass | `torch.xpu.is_available() == True` |
-| `nano_decoder_xpu` | 待重跑 | 必须为 backend=native_funasr_pytorch、decoder_device_type=xpu、alloc_probe=ok |
-| `nano_encoder_xpu` | pass | audio_encoder 参数在 xpu |
-| `nano_adaptor_xpu` | pass | audio_adaptor 参数在 xpu |
-| `prompt_embeddings_xpu` | pass | embed_tokens 参数在 xpu |
-| `decode_10s` | pass | VAD 分段后每段对应一个 Nano 结果，产出非空文本 |
-| `decode_60s` | pass | VAD 分段≥2、按时间序拼接，且结果数与段数完全一致 |
-| `no_cpu_decoder_fallback` | pass | decoder_device_type=xpu,无回退 |
-| `oom_survives` | pass | allocator_oom=OutOfMemoryError,恢复解码成功 |
+| `nano_decoder_xpu` | pass | `backend=native_funasr_pytorch`、`decoder_device_type=xpu`、`alloc_probe=ok` |
+| `nano_encoder_xpu` | pass | audio_encoder 参数为 `xpu` |
+| `nano_adaptor_xpu` | pass | audio_adaptor 参数为 `xpu` |
+| `prompt_embeddings_xpu` | pass | embed_tokens 参数为 `xpu` |
+| `decode_10s` | pass | VAD 分段 1 段；结果非空（长度指标 20） |
+| `decode_60s` | pass | VAD 分段 2 段、按时间序拼接；结果非空（长度指标 508） |
+| `no_cpu_decoder_fallback` | pass | `decoder_device_type=xpu`，无 CPU 回退原因 |
+| `oom_survives` | pass | `allocator_oom=OutOfMemoryError`，恢复解码成功 |
 
 报告路径:`${XDG_RUNTIME_DIR}/fun-voice-ryan/poc-report.json`。
 

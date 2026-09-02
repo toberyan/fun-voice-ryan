@@ -36,7 +36,7 @@ CONSOLE_SCRIPTS=(
 SYSTEMD_UNITS=(fun-voice-worker@.service fun-voice-daemon.service)
 
 POC_REPORT="${XDG_RUNTIME_DIR:-}/fun-voice-ryan/poc-report.json"
-RUNTIME_MODULES=(torch funasr modelscope)
+RUNTIME_MODULES=(torch funasr modelscope transformers Xlib)
 
 # Source artifacts (validated up front so a missing file fails before any write).
 FCITX_SO="${ROOT}/build/fcitx/fcitx5-fun-voice.so"

@@ -17,6 +17,7 @@ import argparse
 import json
 import shutil
 import socket
+import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -37,6 +38,8 @@ from fun_voice.preflight import (
 # The persisted POC report produced by a real ``run_preflight`` run.
 REPORT_RELATIVE_PATH = "fun-voice-ryan/poc-report.json"
 DAEMON_DIAGNOSTICS_TIMEOUT_SECONDS = 1.0
+WORKER_SYSTEMD_TIMEOUT_SECONDS = 1.0
+WORKER_PROFILES: tuple[str, ...] = ("nano", "sensevoice")
 
 # Check names in report order (stable, used by tests and the human view).
 CHECK_NAMES_SELFTEST: tuple[str, ...] = (
@@ -251,9 +254,79 @@ def check_xtest_eligibility(
 # --- Worker / XPU checks (reuse preflight) -----------------------------------
 
 
-def check_worker_health(result: CheckResult | None = None) -> SelfTestResult:
-    """Reuse ``probe_worker_health`` to report the worker socket health."""
+def probe_worker_unit_state(profile: str) -> tuple[str, str] | None:
+    """Return the loaded systemd unit's ``(LoadState, ActiveState)``.
+
+    A missing worker socket is healthy only after both explicitly on-demand
+    worker units are loaded and inactive.  Do not infer that state from a
+    socket error alone: it would hide a missing unit or a worker crash.
+    """
+    if profile not in WORKER_PROFILES:
+        raise ValueError(f"unsupported worker profile: {profile}")
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                f"fun-voice-worker@{profile}.service",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--value",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=WORKER_SYSTEMD_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    values = result.stdout.splitlines()
+    if len(values) != 2:
+        return None
+    load_state, active_state = values
+    if load_state != "loaded" or active_state not in {
+        "active",
+        "activating",
+        "deactivating",
+        "failed",
+        "inactive",
+        "reloading",
+    }:
+        return None
+    return load_state, active_state
+
+
+def check_worker_health(
+    result: CheckResult | None = None,
+    *,
+    worker_state_probe: Callable[[str], tuple[str, str] | None] = (
+        probe_worker_unit_state
+    ),
+) -> SelfTestResult:
+    """Report a ready worker or the explicit, healthy on-demand idle state."""
     probe = result if result is not None else probe_worker_health()
+    if (
+        probe.status == STATUS_FAIL
+        and probe.detail.get("error_class") == "FileNotFoundError"
+    ):
+        try:
+            states = {
+                profile: worker_state_probe(profile) for profile in WORKER_PROFILES
+            }
+        except Exception:  # noqa: BLE001 - self-test must fail closed on probe errors
+            states = {}
+        if all(state == ("loaded", "inactive") for state in states.values()):
+            return SelfTestResult(
+                "worker_health",
+                STATUS_PASS,
+                {
+                    "lifecycle": "on_demand_idle",
+                    "profiles": {
+                        profile: "inactive" for profile in WORKER_PROFILES
+                    },
+                },
+            )
     return SelfTestResult("worker_health", probe.status, probe.detail)
 
 

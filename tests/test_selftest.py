@@ -248,6 +248,39 @@ def test_worker_health_converts_preflight_result() -> None:
     assert result.detail["device"] == "xpu"
 
 
+def test_worker_health_accepts_the_expected_on_demand_idle_state() -> None:
+    probe = CheckResult(
+        "worker_health", STATUS_FAIL, {"error_class": "FileNotFoundError"}
+    )
+
+    result = check_worker_health(
+        probe,
+        worker_state_probe=lambda _profile: ("loaded", "inactive"),
+    )
+
+    assert result.status == STATUS_PASS
+    assert result.detail == {
+        "lifecycle": "on_demand_idle",
+        "profiles": {"nano": "inactive", "sensevoice": "inactive"},
+    }
+
+
+def test_worker_health_rejects_missing_socket_when_any_worker_is_not_idle() -> None:
+    probe = CheckResult(
+        "worker_health", STATUS_FAIL, {"error_class": "FileNotFoundError"}
+    )
+
+    result = check_worker_health(
+        probe,
+        worker_state_probe=lambda profile: (
+            ("loaded", "active") if profile == "nano" else ("loaded", "inactive")
+        ),
+    )
+
+    assert result.status == STATUS_FAIL
+    assert result.detail["error_class"] == "FileNotFoundError"
+
+
 # --- XPU hard gate (reuses preflight report) ---------------------------------
 
 

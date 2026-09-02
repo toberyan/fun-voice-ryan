@@ -55,7 +55,7 @@ def test_daemon_does_not_restart_after_hotkey_grab_failure() -> None:
 
 def test_installer_requires_the_current_xpu_runtime_not_only_a_stale_report() -> None:
     install = (ROOT / "scripts/install-user.sh").read_text(encoding="utf-8")
-    assert "RUNTIME_MODULES=(torch funasr modelscope)" in install
+    assert "RUNTIME_MODULES=(torch funasr modelscope transformers Xlib)" in install
     assert "Nano POC backend is not native_funasr_pytorch" in install
     assert "XPU runtime imports verified" in install
     assert "uv sync --inexact" in install
@@ -63,9 +63,46 @@ def test_installer_requires_the_current_xpu_runtime_not_only_a_stale_report() ->
 
 def test_xpu_environment_uses_native_funasr_without_vllm_runtime() -> None:
     environment = (ROOT / "scripts/create-xpu-env.sh").read_text(encoding="utf-8")
-    assert "install_xpu torch torchaudio" in environment
+    lock = (ROOT / "requirements-xpu.lock").read_text(encoding="utf-8")
     assert "vllm-xpu-kernels" not in environment
     assert "wheels.vllm.ai" not in environment
+    assert "vllm==" not in lock
+    assert "vllm-xpu-kernels==" not in lock
+    assert "cuda-python==" not in lock
+    assert "flashinfer-python==" not in lock
+    assert "torch==2.13.0+xpu" in lock
+    assert "torchaudio==2.11.0+xpu" in lock
+    assert "transformers==5.16.1" in lock
+    assert "python-xlib==" in lock
+
+
+def test_xpu_environment_syncs_the_hashed_lock_before_deployment() -> None:
+    environment = (ROOT / "scripts/create-xpu-env.sh").read_text(encoding="utf-8")
+    lock = (ROOT / "requirements-xpu.lock").read_text(encoding="utf-8")
+    assert 'LOCK_FILE="${ROOT_DIR}/requirements-xpu.lock"' in environment
+    assert 'FUNASR_TARBALL_SHA256="' in environment
+    assert '"${UV}" pip sync' in environment
+    assert "--require-hashes" in environment
+    assert '"${LOCK_FILE}"' in environment
+    assert "--hash=sha256:" in lock
+    assert "funasr @" not in lock
+    assert "--no-deps" in environment
+    assert '"${FUNASR_SRC}"' in environment
+
+
+def test_xpu_environment_rebuilds_funasr_from_the_verified_archive() -> None:
+    environment = (ROOT / "scripts/create-xpu-env.sh").read_text(encoding="utf-8")
+    assert 'FUNASR_DOWNLOAD="$(mktemp' in environment
+    assert 'FUNASR_STAGE="$(mktemp -d' in environment
+    assert 'tar xzf "${FUNASR_TARBALL}" -C "${FUNASR_STAGE}"' in environment
+    assert 'mv "${FUNASR_STAGE}" "${FUNASR_SRC}"' in environment
+
+
+def test_xpu_poc_doc_records_the_verified_native_run() -> None:
+    document = (ROOT / "docs/xpu-poc.md").read_text(encoding="utf-8")
+    assert "状态:**已通过（真实运行）**" in document
+    assert "状态:**需要重新运行**" not in document
+    assert "`nano_decoder_xpu` | pass | `backend=native_funasr_pytorch`" in document
 
 
 def test_installer_defers_daemon_start_until_graphical_session_import() -> None:
