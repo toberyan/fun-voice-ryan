@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 
+from fun_voice import config
 from fun_voice.corrector import (
     DEFAULT_TIMEOUT_SECONDS,
     CorrectionError,
@@ -14,6 +16,39 @@ from fun_voice.corrector import (
     parse_correction_output,
     validate_correction,
 )
+from fun_voice.runtime_selection import RuntimeSelection
+
+
+def _selection(backend: str = "xpu") -> RuntimeSelection:
+    is_cpu = backend == "cpu"
+    return RuntimeSelection(
+        schema_version=1,
+        backend=backend,  # type: ignore[arg-type]
+        python=Path(f"/runtime/{backend}/bin/python"),
+        device="cpu" if is_cpu else f"{backend}:0",
+        dtype="float32" if is_cpu else "bf16",
+        primary_asr_profile="sensevoice" if is_cpu else "nano",
+        fallback_asr_profile=None if is_cpu else "sensevoice",
+        enhanced_enabled=not is_cpu,
+        speaker_enabled=not is_cpu,
+        model_revisions=(
+            {"sensevoice": "master", "vad": "master"}
+            if is_cpu
+            else {
+                "nano": "master",
+                "sensevoice": "master",
+                "vad": "master",
+                "qwen": "master",
+                "campplus": "master",
+            }
+        ),
+        probe_status="pass",
+        selected_at=1,
+    )
+
+
+def _cpu_effective() -> config.EffectiveRuntimeConfig:
+    return config.effective_runtime_config(config.Config(), _selection("cpu"))
 
 
 def test_qwen_on_demand_timeout_has_a_safe_upper_bound() -> None:
@@ -75,7 +110,10 @@ def test_qwen_is_not_started_until_a_correction_is_requested() -> None:
         return '{"status":"ok","text":"[[FINAL]]git commit[[/FINAL]]"}'
 
     corrector = OnDemandQwenCorrector(
-        command=("qwen-corrector",), timeout_seconds=17.0, runner=runner
+        command=("qwen-corrector",),
+        timeout_seconds=17.0,
+        runner=runner,
+        selection=_selection(),
     )
 
     assert calls == []
@@ -90,7 +128,9 @@ def test_qwen_process_failure_is_exposed_for_raw_text_fallback() -> None:
     def runner(_command: Sequence[str], _request: str, _timeout: float) -> str:
         return '{"status":"error","error_code":"correction.oom"}'
 
-    corrector = OnDemandQwenCorrector(command=("qwen-corrector",), runner=runner)
+    corrector = OnDemandQwenCorrector(
+        command=("qwen-corrector",), runner=runner, selection=_selection()
+    )
 
     with pytest.raises(CorrectionError, match="correction.oom"):
         corrector.correct("get commit")
@@ -111,7 +151,9 @@ def test_qwen_parent_preserves_child_rejection_reason_and_stage_timing() -> None
             }
         )
 
-    corrector = OnDemandQwenCorrector(command=("qwen-corrector",), runner=runner)
+    corrector = OnDemandQwenCorrector(
+        command=("qwen-corrector",), runner=runner, selection=_selection()
+    )
 
     with pytest.raises(CorrectionError) as caught:
         corrector.correct("get commit")
@@ -129,6 +171,26 @@ def test_qwen_client_accepts_only_the_final_json_frame_after_engine_logs() -> No
         frame = '{"status":"ok","text":"[[FINAL]]git[[/FINAL]]"}'
         return f"INFO engine started\n{frame}\n"
 
-    corrector = OnDemandQwenCorrector(command=("qwen-corrector",), runner=runner)
+    corrector = OnDemandQwenCorrector(
+        command=("qwen-corrector",), runner=runner, selection=_selection()
+    )
 
     assert corrector.correct("get") == "git"
+
+
+def test_corrector_refuses_cpu_selection_before_subprocess() -> None:
+    runner_calls: list[object] = []
+
+    def runner(_command: Sequence[str], _request: str, _timeout: float) -> str:
+        runner_calls.append(object())
+        return ""
+
+    corrector = OnDemandQwenCorrector(
+        inference=_cpu_effective().enhanced,
+        selection=_selection("cpu"),
+        runner=runner,
+    )
+
+    with pytest.raises(CorrectionError, match="disabled_by_runtime_policy"):
+        corrector.correct("get commit")
+    assert runner_calls == []

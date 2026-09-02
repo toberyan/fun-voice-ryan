@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from fun_voice import config
 from fun_voice import daemon as daemon_mod
 from fun_voice.capture import CaptureConfig, CaptureError
 from fun_voice.config import Config
@@ -59,7 +60,8 @@ from fun_voice.desktop import (
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
 from fun_voice.overlay import OverlayModel
-from fun_voice.scheduler import ModelLifecycle, XpuScheduler
+from fun_voice.runtime_selection import RuntimeSelection
+from fun_voice.scheduler import ModelLifecycle, ModelScheduler
 
 ARTIFACT = CaptureArtifact(
     audio="/proc/self/fd/3", sample_rate=16000, channels=1, format="s16le",
@@ -292,12 +294,12 @@ class Harness:
         fallback_worker: FakeWorker | None = None,
         corrector: FakeCorrector | None = None,
         overlay: FakeOverlay | None = None,
-        xpu_lease: AllowingLease | RejectingLease | None = None,
+        model_lease: AllowingLease | RejectingLease | None = None,
         nano_preloader: Callable[[], PreloadTiming | None] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         capture_config: CaptureConfig | None = None,
-        scheduler: XpuScheduler | None = None,
+        scheduler: ModelScheduler | None = None,
     ) -> None:
         self.guard = guard if guard is not None else FakeGuard()
         self.recorder = recorder if recorder is not None else FakeRecorder()
@@ -331,8 +333,8 @@ class Harness:
             fallback_worker=fallback_worker,
             corrector=self.corrector,
             overlay=self.overlay,
-            xpu_lease=(
-                xpu_lease if xpu_lease is not None else AllowingLease()
+            model_lease=(
+                model_lease if model_lease is not None else AllowingLease()
                 if corrector is not None
                 else None
             ),
@@ -353,6 +355,138 @@ class Harness:
 
 def _started(harness: Harness) -> None:
     assert harness.daemon.start_if_idle() == "started"
+
+
+def _cpu_selection() -> RuntimeSelection:
+    return RuntimeSelection(
+        schema_version=1,
+        backend="cpu",
+        python=Path("/runtime/cpu/bin/python"),
+        device="cpu",
+        dtype="float32",
+        primary_asr_profile="sensevoice",
+        fallback_asr_profile=None,
+        enhanced_enabled=False,
+        speaker_enabled=False,
+        model_revisions={"sensevoice": "master", "vad": "master"},
+        probe_status="pass",
+        selected_at=1,
+    )
+
+
+def _accelerator_selection() -> RuntimeSelection:
+    return RuntimeSelection(
+        schema_version=1,
+        backend="xpu",
+        python=Path("/runtime/xpu/bin/python"),
+        device="xpu:0",
+        dtype="bf16",
+        primary_asr_profile="nano",
+        fallback_asr_profile="sensevoice",
+        enhanced_enabled=True,
+        speaker_enabled=True,
+        model_revisions={
+            "nano": "master",
+            "sensevoice": "master",
+            "vad": "master",
+            "qwen": "master",
+            "campplus": "master",
+        },
+        probe_status="pass",
+        selected_at=1,
+    )
+
+
+class _PolicyWorker(FakeWorker):
+    def preload(self) -> PreloadTiming:
+        return PreloadTiming()
+
+
+def _recording_worker_factory(
+    created_profiles: list[str], worker: _PolicyWorker
+) -> Callable[..., _PolicyWorker]:
+    def factory(*_args: object, **kwargs: object) -> _PolicyWorker:
+        profile = kwargs.get("profile")
+        assert isinstance(profile, str)
+        created_profiles.append(profile)
+        return worker
+
+    return factory
+
+
+def _daemon_dependencies(fcitx: FakeFcitx) -> object:
+    paths = config.RuntimePaths(
+        runtime_dir=Path("/runtime"),
+        worker_socket=Path("/runtime/worker.sock"),
+        daemon_socket=Path("/runtime/daemon.sock"),
+        fcitx_socket=Path("/runtime/fcitx.sock"),
+    )
+    return daemon_mod.DaemonDependencies(
+        paths=paths,
+        guard=FakeGuard(),
+        recorder=FakeRecorder(),
+        fcitx_factory=lambda: fcitx,
+        clipboard=FakeClipboard(),
+        injector=FakeInjector(),
+        notifier=FakeNotifier(),
+        overlay=FakeOverlay(),
+        start_worker_service=lambda _profile: True,
+        stop_worker_service=lambda _profile: True,
+        health_worker_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        capture_config=CaptureConfig(),
+    )
+
+
+def _must_not_construct(*_args: object, **_kwargs: object) -> object:
+    raise AssertionError("Qwen must not be constructed for a CPU runtime")
+
+
+def test_daemon_cpu_registers_only_sensevoice_and_never_constructs_qwen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_profiles: list[str] = []
+    worker = _PolicyWorker()
+    monkeypatch.setattr(
+        daemon_mod,
+        "SocketWorkerClient",
+        _recording_worker_factory(created_profiles, worker),
+    )
+    monkeypatch.setattr(daemon_mod, "OnDemandQwenCorrector", _must_not_construct)
+
+    daemon = daemon_mod.build_voice_daemon(
+        _daemon_dependencies(FakeFcitx()), selection=_cpu_selection()
+    )
+    try:
+        assert created_profiles == ["sensevoice"]
+        assert daemon._fallback_worker is None  # noqa: SLF001 - policy boundary
+        assert daemon._corrector is None  # noqa: SLF001 - policy boundary
+    finally:
+        daemon.shutdown()
+
+
+def test_cpu_asr_commits_raw_text_without_correction_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_profiles: list[str] = []
+    worker = _PolicyWorker(text="get commit")
+    fcitx = FakeFcitx()
+    monkeypatch.setattr(
+        daemon_mod,
+        "SocketWorkerClient",
+        _recording_worker_factory(created_profiles, worker),
+    )
+    monkeypatch.setattr(daemon_mod, "OnDemandQwenCorrector", _must_not_construct)
+
+    daemon = daemon_mod.build_voice_daemon(
+        _daemon_dependencies(fcitx), selection=_cpu_selection()
+    )
+    try:
+        assert daemon.start_if_idle() == "started"
+        daemon.stop()
+        assert fcitx.commits == [("tok-123", "get commit")]
+        assert created_profiles == ["sensevoice"]
+    finally:
+        daemon.shutdown()
 
 
 # --- State machine -----------------------------------------------------------
@@ -393,7 +527,7 @@ def test_start_notifies_recording() -> None:
 def test_cold_start_shows_preparing_until_nano_preload_finishes() -> None:
     preload_started = threading.Event()
     release_preload = threading.Event()
-    scheduler = XpuScheduler(
+    scheduler = ModelScheduler(
         start_profile=lambda _profile: True,
         stop_profile=lambda _profile: True,
         health_profile=lambda _profile: ModelLifecycle.INACTIVE,
@@ -506,7 +640,9 @@ def test_worker_stop_confirms_inactive_before_qwen(
 
     monkeypatch.setattr(daemon_mod.subprocess, "run", run)
 
-    assert daemon_mod.default_stop_worker_service("nano") is True
+    assert daemon_mod.default_stop_worker_service(
+        "nano", selection=_accelerator_selection()
+    ) is True
     assert calls == [
         ["systemctl", "--user", "stop", "fun-voice-worker@nano.service"],
         [
@@ -861,7 +997,7 @@ def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> Non
             corrector_threads.append(threading.current_thread().name)
             return super().correct(raw_text)
 
-    scheduler = XpuScheduler(
+    scheduler = ModelScheduler(
         start_profile=lambda _profile: True,
         stop_profile=lambda _profile: True,
         health_profile=lambda _profile: ModelLifecycle.INACTIVE,
@@ -875,8 +1011,8 @@ def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> Non
         _started(h)
         h.daemon.stop()
 
-        assert worker_threads == ["fun-voice-xpu-scheduler"]
-        assert corrector_threads == ["fun-voice-xpu-scheduler"]
+        assert worker_threads == ["fun-voice-model-scheduler"]
+        assert corrector_threads == ["fun-voice-model-scheduler"]
         assert h.clipboard.writes == ["git commit"]
     finally:
         scheduler.close()
@@ -885,7 +1021,7 @@ def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> Non
 def test_daemon_routes_model_load_fallback_through_scheduler_profile_switch() -> None:
     starts: list[str] = []
     stops: list[str] = []
-    scheduler = XpuScheduler(
+    scheduler = ModelScheduler(
         start_profile=lambda profile: starts.append(profile) or True,
         stop_profile=lambda profile: stops.append(profile) or True,
         health_profile=lambda _profile: ModelLifecycle.INACTIVE,
@@ -927,7 +1063,7 @@ def test_daemon_skips_qwen_and_commits_raw_when_release_is_unconfirmed() -> None
     h = Harness(
         worker=FakeWorker(text="get commit"),
         corrector=corrector,
-        xpu_lease=RejectingLease(),
+        model_lease=RejectingLease(),
     )
 
     _started(h)

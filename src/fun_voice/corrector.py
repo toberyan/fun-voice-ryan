@@ -31,9 +31,9 @@ from typing import Any
 
 from fun_voice import config
 from fun_voice.contracts import CORRECTION_REJECTION_REASONS, CorrectionTiming
+from fun_voice.runtime_selection import RuntimeSelection, load_runtime_selection
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
-DEVICE = "xpu:0"
 MAX_OUTPUT_CHARACTERS = 1536
 DEFAULT_TIMEOUT_SECONDS = 30.0
 _OPEN = "[[FINAL]]"
@@ -205,15 +205,21 @@ def _is_oom(exc: BaseException) -> bool:
 
 
 def generate_enveloped_correction(
-    raw_text: str, *, inference: config.EnhancedInferenceConfig
+    raw_text: str,
+    *,
+    inference: config.EnhancedInferenceConfig,
+    selection: RuntimeSelection,
 ) -> GeneratedCorrection:
-    """Load Qwen on XPU, generate one envelope, then release the model.
+    """Load Qwen on the selected accelerator, then release the model.
 
     vLLM 0.28's Qwen3.5 hybrid-attention XPU path emits corrupt text on the
     Arc Pro 130T.  This dedicated Qwen process therefore uses Transformers'
     native XPU path.  It creates only the request-local generation cache (no
     vLLM KV pool), and process exit remains the release guarantee.
     """
+    policy = selection.policy()
+    if not policy.enhanced_enabled:
+        raise CorrectionError("disabled_by_runtime_policy")
     if not raw_text or len(raw_text) > inference.correction_max_source_characters:
         raise CorrectionError("correction.input_too_large")
     if inference.correction_model != MODEL_ID:
@@ -224,10 +230,13 @@ def generate_enveloped_correction(
         import torch
         from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
-        loaded_model: Any = Qwen3_5ForConditionalGeneration.from_pretrained(
-            str(qwen_snapshot_dir()), torch_dtype=torch.bfloat16
+        torch_dtype = (
+            torch.float32 if selection.dtype == "float32" else torch.bfloat16
         )
-        model = loaded_model.to(DEVICE)
+        loaded_model: Any = Qwen3_5ForConditionalGeneration.from_pretrained(
+            str(qwen_snapshot_dir()), torch_dtype=torch_dtype
+        )
+        model = loaded_model.to(selection.device)
         model.eval()
         processor: Any = AutoProcessor.from_pretrained(  # type: ignore[no-untyped-call]
             str(qwen_snapshot_dir())
@@ -243,7 +252,7 @@ def generate_enveloped_correction(
     validate_started: float | None = None
     try:
         devices = {parameter.device.type for parameter in model.parameters()}
-        if devices != {"xpu"}:
+        if devices != {selection.device.partition(":")[0]}:
             raise CorrectionError("correction.device")
         messages: list[Any] = [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -258,7 +267,7 @@ def generate_enveloped_correction(
             enable_thinking=False,
         )
         model_inputs = {
-            key: value.to(DEVICE) for key, value in inputs.items()
+            key: value.to(selection.device) for key, value in inputs.items()
         }
         input_ids = model_inputs.get("input_ids")
         if input_ids is None:
@@ -311,7 +320,10 @@ def generate_enveloped_correction(
         try:
             import torch
 
-            torch.xpu.empty_cache()
+            device_api = getattr(torch, selection.device.partition(":")[0], None)
+            empty_cache = getattr(device_api, "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
         except Exception:
             pass
 
@@ -421,11 +433,15 @@ class OnDemandQwenCorrector:
         *,
         command: Sequence[str] | None = None,
         inference: config.EnhancedInferenceConfig | None = None,
+        selection: RuntimeSelection,
         timeout_seconds: float | None = None,
         runner: Runner = _default_runner,
     ) -> None:
+        policy = selection.policy()
+        self._selection = selection
         self._inference = config.validate_enhanced_inference_config(
-            inference if inference is not None else config.EnhancedInferenceConfig()
+            inference if inference is not None else config.EnhancedInferenceConfig(),
+            policy,
         )
         self._command = tuple(command or (sys.executable, "-m", "fun_voice.corrector"))
         self._timeout_seconds = (
@@ -438,6 +454,8 @@ class OnDemandQwenCorrector:
 
     def correct(self, raw_text: str) -> str:
         self.last_timing = None
+        if not self._selection.policy().enhanced_enabled:
+            raise CorrectionError("disabled_by_runtime_policy")
         if (
             not raw_text
             or len(raw_text) > self._inference.correction_max_source_characters
@@ -503,8 +521,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="fun-voice-corrector")
     parser.parse_args(argv)
     try:
-        inference = config.load_config().enhanced
-        result = generate_enveloped_correction(_read_request(), inference=inference)
+        selection = load_runtime_selection()
+        effective = config.effective_runtime_config(config.load_config(), selection)
+        result = generate_enveloped_correction(
+            _read_request(), inference=effective.enhanced, selection=selection
+        )
     except CorrectionError as exc:
         print(
             json.dumps(

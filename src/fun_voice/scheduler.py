@@ -1,4 +1,4 @@
-"""Single-owner, priority-ordered scheduler for local XPU model work.
+"""Single-owner, priority-ordered scheduler for local model work.
 
 The scheduler intentionally knows no model API, desktop state or text.  It
 serializes opaque callbacks and makes a completion callback conditional on the
@@ -106,7 +106,7 @@ _PRIORITY = {
 }
 
 
-class XpuScheduler:
+class ModelScheduler:
     """Run exactly one model callback at a time in approved priority order."""
 
     def __init__(
@@ -138,7 +138,7 @@ class XpuScheduler:
         self._running: TaskHandle | None = None
         self._closed = False
         self._thread = threading.Thread(
-            target=self._dispatch, name="fun-voice-xpu-scheduler", daemon=True
+            target=self._dispatch, name="fun-voice-model-scheduler", daemon=True
         )
         self._thread.start()
 

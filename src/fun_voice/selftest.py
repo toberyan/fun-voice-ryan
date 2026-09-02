@@ -1,14 +1,8 @@
-"""Post-install self-test for Fun Voice Ryan.
+"""Post-install self-test for the selected Fun Voice Ryan runtime.
 
-Runs a battery of cheap desktop/runtime checks plus the persisted XPU hard-gate
-report. Every check returns a ``name``/``status``/``detail`` triple; any failing
-check makes the process exit non-zero. JSON output carries no sensitive data:
-no audio paths, no transcription text, no focus tokens, no model cache layout.
-
-The XPU hard gate reuses :func:`fun_voice.preflight.run_preflight`'s persisted
-report (produced by a real run during the POC) and re-checks its nine gates via
-:data:`fun_voice.preflight.CHECK_NAMES`; the worker-health check reuses
-:func:`fun_voice.preflight.probe_worker_health`.
+Every check returns a ``name``/``status``/``detail`` triple; any failing check
+makes the process exit non-zero. JSON output carries no sensitive data: no
+audio paths, no transcription text, no focus tokens, or model cache layout.
 """
 
 from __future__ import annotations
@@ -26,20 +20,20 @@ from typing import Any
 from fun_voice.config import get_xdg_runtime_dir
 from fun_voice.fcitx import FcitxClient, FcitxCommitError, default_socket_path
 from fun_voice.preflight import (
-    CHECK_NAMES,
-    NANO_BACKEND,
     STATUS_FAIL,
     STATUS_PASS,
     CheckResult,
-    PreflightReport,
     probe_worker_health,
 )
+from fun_voice.runtime_selection import (
+    AsrProfile,
+    RuntimeSelection,
+    RuntimeSelectionError,
+    load_runtime_selection,
+)
 
-# The persisted POC report produced by a real ``run_preflight`` run.
-REPORT_RELATIVE_PATH = "fun-voice-ryan/poc-report.json"
 DAEMON_DIAGNOSTICS_TIMEOUT_SECONDS = 1.0
 WORKER_SYSTEMD_TIMEOUT_SECONDS = 1.0
-WORKER_PROFILES: tuple[str, ...] = ("nano", "sensevoice")
 
 # Check names in report order (stable, used by tests and the human view).
 CHECK_NAMES_SELFTEST: tuple[str, ...] = (
@@ -49,7 +43,7 @@ CHECK_NAMES_SELFTEST: tuple[str, ...] = (
     "clipboard",
     "xtest_eligibility",
     "worker_health",
-    "xpu_hard_gate",
+    "runtime_selection",
 )
 
 
@@ -251,7 +245,7 @@ def check_xtest_eligibility(
     return SelfTestResult("xtest_eligibility", STATUS_PASS, {"extension": "xtest"})
 
 
-# --- Worker / XPU checks (reuse preflight) -----------------------------------
+# --- Worker / selected-runtime checks ---------------------------------------
 
 
 def probe_worker_unit_state(profile: str) -> tuple[str, str] | None:
@@ -261,7 +255,7 @@ def probe_worker_unit_state(profile: str) -> tuple[str, str] | None:
     worker units are loaded and inactive.  Do not infer that state from a
     socket error alone: it would hide a missing unit or a worker crash.
     """
-    if profile not in WORKER_PROFILES:
+    if profile not in {"nano", "sensevoice"}:
         raise ValueError(f"unsupported worker profile: {profile}")
     try:
         result = subprocess.run(
@@ -300,6 +294,7 @@ def probe_worker_unit_state(profile: str) -> tuple[str, str] | None:
 def check_worker_health(
     result: CheckResult | None = None,
     *,
+    profiles: tuple[AsrProfile] | tuple[AsrProfile, AsrProfile],
     worker_state_probe: Callable[[str], tuple[str, str] | None] = (
         probe_worker_unit_state
     ),
@@ -312,7 +307,7 @@ def check_worker_health(
     ):
         try:
             states = {
-                profile: worker_state_probe(profile) for profile in WORKER_PROFILES
+                profile: worker_state_probe(profile) for profile in profiles
             }
         except Exception:  # noqa: BLE001 - self-test must fail closed on probe errors
             states = {}
@@ -323,85 +318,31 @@ def check_worker_health(
                 {
                     "lifecycle": "on_demand_idle",
                     "profiles": {
-                        profile: "inactive" for profile in WORKER_PROFILES
+                        profile: "inactive" for profile in profiles
                     },
                 },
             )
     return SelfTestResult("worker_health", probe.status, probe.detail)
 
 
-def check_xpu_hard_gate(report: PreflightReport | None) -> SelfTestResult:
-    """Re-check the nine XPU hard gates from a ``run_preflight`` report.
-
-    ``report`` is the persisted output of a real :func:`run_preflight` (the
-    POC); ``None`` means no report is available and the gate fails.
-    """
-    if report is None:
-        return SelfTestResult(
-            "xpu_hard_gate", STATUS_FAIL, {"reason": "no XPU POC report available"}
-        )
-    gates = {check.name: check.status for check in report.checks}
-    missing = [name for name in CHECK_NAMES if name not in gates]
-    failed = [name for name in CHECK_NAMES if gates.get(name) != STATUS_PASS]
-    detail: dict[str, Any] = {
-        "ready": report.ready,
-        "device": report.device,
-        "gates": gates,
-    }
-    decoder = next(
-        (check for check in report.checks if check.name == "nano_decoder_xpu"), None
-    )
-    backend = decoder.detail.get("backend") if decoder is not None else None
-    detail["backend"] = backend
-    if missing:
-        detail["missing_gates"] = missing
-    ok = report.ready and not missing and not failed and backend == NANO_BACKEND
-    return SelfTestResult(
-        "xpu_hard_gate", STATUS_PASS if ok else STATUS_FAIL, detail
-    )
-
-
-# --- Persisted report loading ------------------------------------------------
-
-
-def default_report_path() -> Path | None:
-    """Return the persisted POC report path, or ``None`` without a runtime dir."""
-    xdg = get_xdg_runtime_dir()
-    if not xdg:
-        return None
-    return Path(xdg) / REPORT_RELATIVE_PATH
-
-
-def load_preflight_report(path: str | Path | None = None) -> PreflightReport | None:
-    """Load and validate the persisted ``run_preflight`` report, else ``None``."""
-    report_path = Path(path) if path is not None else default_report_path()
-    if report_path is None or not report_path.is_file():
-        return None
+def check_runtime_selection(
+    loader: Callable[[], RuntimeSelection] = load_runtime_selection,
+) -> SelfTestResult:
+    """Report the validated runtime that owns this installed service."""
     try:
-        data = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    raw_checks = data.get("checks")
-    if not isinstance(raw_checks, list):
-        return None
-    checks: list[CheckResult] = []
-    for raw in raw_checks:
-        if not isinstance(raw, dict):
-            return None
-        name = raw.get("name")
-        status = raw.get("status")
-        detail = raw.get("detail")
-        if not isinstance(name, str) or not isinstance(status, str):
-            return None
-        if not isinstance(detail, dict):
-            detail = {}
-        checks.append(CheckResult(name=name, status=status, detail=detail))
-    return PreflightReport(
-        device=str(data.get("device") or ""),
-        checks=tuple(checks),
-        ready=bool(data.get("ready")),
+        selection = loader()
+    except RuntimeSelectionError:
+        return SelfTestResult(
+            "runtime_selection", STATUS_FAIL, {"reason": "invalid_or_missing"}
+        )
+    return SelfTestResult(
+        "runtime_selection",
+        STATUS_PASS,
+        {
+            "backend": selection.backend,
+            "primary_profile": selection.primary_asr_profile,
+            "enhanced": selection.enhanced_enabled,
+        },
     )
 
 
@@ -410,23 +351,44 @@ def load_preflight_report(path: str | Path | None = None) -> PreflightReport | N
 
 def run_selftest(
     *,
-    report: PreflightReport | None = None,
     fcitx_client: FcitxClient | None = None,
     worker_probe: Callable[[], CheckResult] = probe_worker_health,
+    worker_state_probe: Callable[[str], tuple[str, str] | None] = (
+        probe_worker_unit_state
+    ),
     which: Callable[[str], str | None] = shutil.which,
     runtime_dir: str | None = None,
     make_display: Callable[[], Any] | None = None,
     hotkey_probe: Callable[[], dict[str, bool] | None] = probe_hotkey_state,
+    selection_loader: Callable[[], RuntimeSelection] = load_runtime_selection,
 ) -> SelfTestReport:
     """Run every self-test check and aggregate the results."""
+    try:
+        selection = selection_loader()
+    except RuntimeSelectionError:
+        selection = None
+    runtime_check = check_runtime_selection(
+        (lambda: selection) if selection is not None else selection_loader
+    )
+    worker_check = (
+        check_worker_health(
+            worker_probe(),
+            profiles=selection.policy().allowed_profiles,
+            worker_state_probe=worker_state_probe,
+        )
+        if selection is not None
+        else SelfTestResult(
+            "worker_health", STATUS_FAIL, {"reason": "invalid_or_missing"}
+        )
+    )
     checks: list[SelfTestResult] = [
         check_x11_hotkey(hotkey_probe),
         check_pipewire(which=which, runtime_dir=runtime_dir),
         check_fcitx_ping(fcitx_client),
         check_clipboard(which=which),
         check_xtest_eligibility(make_display=make_display),
-        check_worker_health(worker_probe()),
-        check_xpu_hard_gate(report),
+        worker_check,
+        runtime_check,
     ]
     return SelfTestReport(tuple(checks))
 
@@ -442,19 +404,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default="human",
         help="output format (default: human-readable lines)",
     )
-    parser.add_argument(
-        "--report",
-        type=Path,
-        default=None,
-        help="override the persisted XPU preflight report path",
-    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    report = load_preflight_report(args.report)
-    result = run_selftest(report=report)
+    result = run_selftest()
     if args.format == "json":
         print(result.to_json())
     else:

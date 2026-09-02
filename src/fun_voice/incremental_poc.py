@@ -419,12 +419,12 @@ def _default_final_tail_probe(
     """
     del runtime, samples
     from fun_voice.contracts import ModelTaskKind, SessionKey
-    from fun_voice.scheduler import ModelLifecycle, XpuScheduler
+    from fun_voice.scheduler import ModelLifecycle, ModelScheduler
 
     blocker_started = threading.Event()
     release_blocker = threading.Event()
     execution_order: list[str] = []
-    scheduler = XpuScheduler(
+    scheduler = ModelScheduler(
         start_profile=lambda _profile: True,
         stop_profile=lambda _profile: True,
         health_profile=lambda _profile: ModelLifecycle.INACTIVE,

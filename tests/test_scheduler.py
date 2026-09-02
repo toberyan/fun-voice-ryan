@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from fun_voice.contracts import ModelTaskKind, SessionKey
-from fun_voice.scheduler import ModelLifecycle, XpuScheduler
+from fun_voice.scheduler import ModelLifecycle, ModelScheduler
 
 
 def _key(generation: int = 1) -> SessionKey:
@@ -15,7 +15,7 @@ def _key(generation: int = 1) -> SessionKey:
 
 
 def test_final_tail_precedes_queued_provisional_tail() -> None:
-    scheduler = XpuScheduler()
+    scheduler = ModelScheduler()
     scheduler.activate(_key())
     started = threading.Event()
     release = threading.Event()
@@ -43,7 +43,7 @@ def test_final_tail_precedes_queued_provisional_tail() -> None:
 
 
 def test_all_model_tasks_run_on_one_dispatcher_without_overlap() -> None:
-    scheduler = XpuScheduler()
+    scheduler = ModelScheduler()
     scheduler.activate(_key())
     first_entered = threading.Event()
     release_first = threading.Event()
@@ -81,7 +81,7 @@ def test_all_model_tasks_run_on_one_dispatcher_without_overlap() -> None:
 
 
 def test_new_generation_cancels_queued_enrichment() -> None:
-    scheduler = XpuScheduler()
+    scheduler = ModelScheduler()
     first = _key(1)
     second = _key(2)
     scheduler.activate(first)
@@ -108,7 +108,7 @@ def test_new_generation_cancels_queued_enrichment() -> None:
 
 
 def test_cancelled_running_task_completes_physically_but_has_no_callback() -> None:
-    scheduler = XpuScheduler()
+    scheduler = ModelScheduler()
     key = _key()
     scheduler.activate(key)
     started = threading.Event()
@@ -141,7 +141,7 @@ def test_cancelled_running_task_completes_physically_but_has_no_callback() -> No
 def test_correction_runs_only_after_producing_asr_is_inactive() -> None:
     stopped: list[str] = []
     ran: list[str] = []
-    scheduler = XpuScheduler(
+    scheduler = ModelScheduler(
         stop_profile=lambda profile: stopped.append(profile) or True,
         health_profile=lambda _profile: ModelLifecycle.INACTIVE,
     )
@@ -164,7 +164,7 @@ def test_correction_runs_only_after_producing_asr_is_inactive() -> None:
 
 
 def test_correction_is_skipped_when_profile_release_is_uncertain() -> None:
-    scheduler = XpuScheduler(
+    scheduler = ModelScheduler(
         stop_profile=lambda _profile: True,
         health_profile=lambda _profile: ModelLifecycle.READY,
     )
@@ -194,7 +194,7 @@ def test_correction_is_denied_when_another_asr_profile_remains_active() -> None:
         stopped.append(profile)
         return profile != "sensevoice"
 
-    scheduler = XpuScheduler(
+    scheduler = ModelScheduler(
         start_profile=lambda _profile: True,
         stop_profile=stop,
         health_profile=lambda _profile: ModelLifecycle.INACTIVE,
@@ -217,7 +217,7 @@ def test_correction_is_denied_when_another_asr_profile_remains_active() -> None:
 
 
 def test_task_handle_returns_value_or_reraises_owner_error() -> None:
-    scheduler = XpuScheduler()
+    scheduler = ModelScheduler()
     key = _key()
     scheduler.activate(key)
 
@@ -247,7 +247,7 @@ def test_asr_profile_is_started_by_scheduler_and_switches_only_after_release() -
         calls.append(("stop", profile))
         return True
 
-    scheduler = XpuScheduler(
+    scheduler = ModelScheduler(
         start_profile=start,
         stop_profile=stop,
         health_profile=lambda _profile: ModelLifecycle.INACTIVE,
