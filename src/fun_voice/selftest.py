@@ -26,6 +26,7 @@ from fun_voice.config import get_xdg_runtime_dir
 from fun_voice.fcitx import FcitxClient, FcitxCommitError, default_socket_path
 from fun_voice.preflight import (
     CHECK_NAMES,
+    NANO_BACKEND,
     STATUS_FAIL,
     STATUS_PASS,
     CheckResult,
@@ -274,9 +275,14 @@ def check_xpu_hard_gate(report: PreflightReport | None) -> SelfTestResult:
         "device": report.device,
         "gates": gates,
     }
+    decoder = next(
+        (check for check in report.checks if check.name == "nano_decoder_xpu"), None
+    )
+    backend = decoder.detail.get("backend") if decoder is not None else None
+    detail["backend"] = backend
     if missing:
         detail["missing_gates"] = missing
-    ok = report.ready and not missing and not failed
+    ok = report.ready and not missing and not failed and backend == NANO_BACKEND
     return SelfTestResult(
         "xpu_hard_gate", STATUS_PASS if ok else STATUS_FAIL, detail
     )

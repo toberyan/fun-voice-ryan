@@ -1,10 +1,8 @@
 """Run the enhanced local-voice XPU proof of capability.
 
-This module deliberately has a file-backed ``__main__`` entry point: vLLM's
-XPU engine starts child processes with Python's ``spawn`` method, which cannot
-re-import a program supplied over standard input.  The shell harness owns model
-download and privacy-preserving runtime paths; this module only loads local
-snapshots and writes the final, metrics-only success report.
+This module has a file-backed ``__main__`` entry point so the shell harness can
+own model download and privacy-preserving runtime paths; this module only loads
+local snapshots and writes the final, metrics-only success report.
 """
 
 from __future__ import annotations
@@ -191,8 +189,17 @@ def run(inputs: PocInputs) -> None:
     nano = load_nano_engine(
         inputs.nano_dir,
         device=DEVICE,
-        gpu_memory_utilization=0.15,
-        max_model_len=1536,
+    )
+    if getattr(nano, "backend", None) != "native_funasr_pytorch":
+        raise RuntimeError("Nano did not use the native FunASR/PyTorch backend")
+    if getattr(nano, "decoder_device_type", None) != "xpu":
+        raise RuntimeError("Nano decoder is not on XPU")
+    gates.append(
+        Gate(
+            "nano_native_decoder_xpu",
+            "pass",
+            {"backend": nano.backend, "decoder_device_type": nano.decoder_device_type},
+        )
     )
     for component_name in ("audio_encoder", "audio_adaptor", "embed_tokens"):
         component = getattr(nano, component_name, None)
@@ -214,9 +221,9 @@ def run(inputs: PocInputs) -> None:
             ),
         )
     )
-    # Nano's vLLM child has no public close method. Drop the parent reference
-    # and release cached XPU blocks before creating the independent Qwen
-    # engine, so this POC never intentionally holds both large decoders.
+    # Drop native Nano references and release cached XPU blocks before creating
+    # the independent Qwen engine, so this POC never intentionally holds both
+    # large decoders.
     del nano
     gc.collect()
     torch.xpu.empty_cache()
@@ -241,7 +248,7 @@ def run(inputs: PocInputs) -> None:
             "qwen35": _snapshot_fingerprint(inputs.qwen_dir),
         },
         "packages": {
-            name: _version(name) for name in ("torch", "vllm", "funasr", "modelscope")
+            name: _version(name) for name in ("torch", "funasr", "modelscope")
         },
         "memory": {
             "allocated": int(torch.xpu.memory_allocated()),

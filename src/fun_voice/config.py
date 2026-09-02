@@ -61,9 +61,11 @@ WORKER_FAILSAFE_IDLE_SECONDS = 1800
 class InferenceConfig:
     """Bounded XPU ASR settings for a transient worker process.
 
-    The vLLM allocation fraction and context length are deliberately capped so
-    a configuration edit cannot recreate the former multi-gibibyte idle KV
-    cache reservation.
+    ``gpu_memory_utilization``, ``max_model_len`` and ``enforce_eager`` are
+    deprecated compatibility fields for prior vLLM-based installations. The
+    native FunASR/PyTorch Nano backend has no vLLM KV cache and ignores them;
+    bounded validation keeps existing configuration files loadable until the
+    next configuration schema migration.
     """
 
     device: str = XPU_DEVICE
@@ -289,7 +291,7 @@ def _protected_terms(value: object) -> tuple[str, ...]:
 
 
 def validate_inference_config(inference: InferenceConfig) -> InferenceConfig:
-    """Validate the only inference settings compatible with this XPU-only app."""
+    """Validate XPU-only settings and bounded legacy Nano compatibility keys."""
     if inference.device != XPU_DEVICE:
         raise ConfigError(f"inference.device must be {XPU_DEVICE!r}")
     if not 0.10 <= inference.gpu_memory_utilization <= 0.20:

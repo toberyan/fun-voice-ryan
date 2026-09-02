@@ -21,14 +21,16 @@ allow_x11_paste_fallback = true
 # Worker 推理配置；device 只接受 xpu:0，禁止 CPU 回退。
 device = "xpu:0"
 dtype = "bf16"
-# Nano 的 vLLM KV Cache 上限；范围固定为 0.10..0.20，默认 0.15。
+# 已废弃的 vLLM 兼容键：原生 FunASR/PyTorch Nano 没有预分配 KV Cache，
+# 因而忽略本值。保留它只是让既有配置能平滑迁移；不要将其当作内存调优项。
 gpu_memory_utilization = 0.15
-# Nano 单次解码的最大上下文；范围固定为 1024..1536。
+# 已废弃的 vLLM 兼容键：原生 Nano 忽略本值。
 max_model_len = 1536
 # 模型 worker 的最终防泄漏兜底；活跃会话由 daemon 显式控制停止，固定 1800 秒。
 worker_failsafe_idle_seconds = 1800
 # 仅 Nano 无法加载或 XPU OOM 时才改用 SenseVoiceSmall；普通结果不降级。
 allow_sensevoice_fallback = true
+# 已废弃的 vLLM 兼容键：原生 Nano 忽略本值。
 enforce_eager = true
 
 [active_session]

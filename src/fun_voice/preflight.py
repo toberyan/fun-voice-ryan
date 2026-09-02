@@ -3,7 +3,7 @@
 The desktop service may only be installed or started after every hard gate in
 this module passes. Each check is pure and takes its dependencies (``torch``,
 the loaded Nano engine, sample paths) as parameters so the whole gate is
-unit-testable with fakes and never imports ``torch`` / ``vllm`` / ``funasr`` at
+unit-testable with fakes and never imports ``torch`` / ``funasr`` at
 module import time.
 
 Privacy: check details and the JSON report carry only check names, statuses,
@@ -31,6 +31,7 @@ from fun_voice.nano_runtime import (
     ModelOutputError,
     _load_audio_samples,
     _slice_windows,
+    load_native_nano_engine,
 )
 
 STATUS_PASS = "pass"
@@ -39,12 +40,13 @@ STATUS_FAIL = "fail"
 EXPECTED_DEVICE_TYPE = "xpu"
 DEVICE = "xpu:0"
 SAMPLE_RATE = 16000
+NANO_BACKEND = "native_funasr_pytorch"
 
 
 # The nine hard gates, in canonical order.
 CHECK_NAMES: tuple[str, ...] = (
     "xpu_visible",
-    "vllm_xpu_decoder",
+    "nano_decoder_xpu",
     "nano_encoder_xpu",
     "nano_adaptor_xpu",
     "prompt_embeddings_xpu",
@@ -115,38 +117,20 @@ def _normalize_device_type(value: object) -> str | None:
 
 
 def get_decoder_device_type(engine: Any) -> str | None:
-    """Best-effort extraction of the vLLM decoder device type."""
-    vllm_engine = getattr(engine, "vllm_engine", None)
-    for obj in (vllm_engine, engine):
-        if obj is None:
-            continue
-        for attr in ("decoder_device_type", "device_type"):
-            value = getattr(obj, attr, None)
-            if isinstance(value, str):
-                return _normalize_device_type(value)
-        for holder in (obj, getattr(obj, "llm_engine", None)):
-            if holder is None:
-                continue
-            model_config = getattr(holder, "model_config", None)
-            device = getattr(model_config, "device", None)
-            if device is not None:
-                return _normalize_device_type(device)
-    try:
-        from vllm.platforms import current_platform
+    """Best-effort extraction of the primary Nano decoder device type.
 
-        return _normalize_device_type(getattr(current_platform, "device_type", None))
-    except Exception:
-        return None
+    Native FunASR adapters expose ``decoder_device_type`` directly. The active
+    preflight deliberately has no vLLM inspection or fallback path.
+    """
+    return _normalize_device_type(getattr(engine, "decoder_device_type", None))
 
 
 def detect_cpu_fallback(engine: Any) -> str | None:
     """Return a reason string when the decoder fell back to CPU, else ``None``.
 
-    vLLM 0.28.0 exposes no dedicated "CPU fallback" engine attribute, so only the
-    resolved decoder device type is consulted (``get_decoder_device_type`` reads
-    the engine's device_type / model_config.device / current_platform.device_type).
-    Engine log keywords are not inspected here: they are written to the process
-    logger and are not programmatically reachable from this call site.
+    The native adapter proves all Nano parameters during loading, then exposes
+    its decoder device type.  Only that resolved device is used here; process
+    log keywords are deliberately not parsed.
     """
     if get_decoder_device_type(engine) == "cpu":
         return "decoder device type is cpu"
@@ -191,15 +175,19 @@ def check_xpu_visible(torch: Any) -> CheckResult:
     )
 
 
-def check_vllm_xpu_decoder(
+def check_nano_xpu_decoder(
     engine: Any, torch: Any, *, device: str = DEVICE
 ) -> CheckResult:
-    """Verify the vLLM decoder runs on XPU and record device + memory metrics."""
+    """Verify the native Nano decoder runs on XPU and record XPU metrics.
+
+    ``detail.backend`` makes a stale proof from any former backend fail closed.
+    """
     device_type = get_decoder_device_type(engine)
     detail: dict[str, Any] = {
         "expected": EXPECTED_DEVICE_TYPE,
         "decoder_device_type": device_type,
         "configured_device": device,
+        "backend": getattr(engine, "backend", None),
     }
     detail["memory_before"] = _xpu_memory_stats(torch)
     probe = "ok"
@@ -212,9 +200,13 @@ def check_vllm_xpu_decoder(
     del tensor
     detail["alloc_probe"] = probe
     detail["total_memory"] = _total_memory(torch)
-    ok = device_type == EXPECTED_DEVICE_TYPE and probe == "ok"
+    ok = (
+        device_type == EXPECTED_DEVICE_TYPE
+        and probe == "ok"
+        and detail["backend"] == NANO_BACKEND
+    )
     return CheckResult(
-        "vllm_xpu_decoder", STATUS_PASS if ok else STATUS_FAIL, detail
+        "nano_decoder_xpu", STATUS_PASS if ok else STATUS_FAIL, detail
     )
 
 
@@ -399,17 +391,20 @@ def _attempt_oom_allocations(
 
 
 def check_oom_survives(
-    engine: Any, torch: Any, short_sample: str | Path, *, device: str = DEVICE
+    engine: Any,
+    vad: Any,
+    torch: Any,
+    short_sample: str | Path,
+    *,
+    device: str = DEVICE,
 ) -> CheckResult:
     """Induce OOM, then prove the worker still serves a short decode.
 
     Never switches to CPU; a CPU fallback here is a failure.
 
     OOM is induced with a direct allocator probe (allocate past total device
-    memory). The former "oversized decode request" probe was removed: vLLM
-    0.28.0 does not reject max_tokens > max_model_len (it clamps instead), and
-    a large max_tokens makes the V1 scheduler hang reserving KV cache blocks
-    when it follows a long decode.
+    memory), rather than trying to manufacture a pathological decode request.
+    This keeps the recovery test backend-independent and bounded.
     """
     detail: dict[str, Any] = {"total_memory": _total_memory(torch)}
 
@@ -423,18 +418,22 @@ def check_oom_survives(
             "oom_survives", STATUS_FAIL, {**detail, "reason": "no OOM induced"}
         )
 
-    # Prove the worker still serves a short decode.
+    # Prove the worker still serves a short decode through the same in-memory
+    # VAD-segmented path as native Nano. Passing an audio pathname straight to
+    # the engine was only valid for the retired vLLM adapter.
     try:
-        results = engine.generate([str(short_sample)], max_new_tokens=RECOVERY_TOKENS)
+        samples = _load_audio_samples(str(short_sample), SAMPLE_RATE)
+        text, regions = _transcribe_segmented(
+            engine, vad, samples, max_new_tokens=RECOVERY_TOKENS
+        )
     except Exception as exc:
         return CheckResult(
             "oom_survives",
             STATUS_FAIL,
             {**detail, "recovery_error": type(exc).__name__},
         )
-    first = results[0] if results else None
-    text = first.get("text", "") if isinstance(first, dict) else ""
     detail["recovery_text_length"] = len(text)
+    detail["recovery_segment_count"] = len(regions)
     return CheckResult(
         "oom_survives", STATUS_PASS if text else STATUS_FAIL, detail
     )
@@ -458,7 +457,7 @@ def run_preflight(
     """
     checks: list[CheckResult] = [
         check_xpu_visible(torch),
-        check_vllm_xpu_decoder(engine, torch, device=device),
+        check_nano_xpu_decoder(engine, torch, device=device),
         check_module_on_device("nano_encoder_xpu", engine.audio_encoder),
         check_module_on_device("nano_adaptor_xpu", engine.audio_adaptor),
         check_module_on_device("prompt_embeddings_xpu", engine.embed_tokens),
@@ -474,7 +473,7 @@ def run_preflight(
             min_segments=MIN_SEGMENTS_60S,
         ),
         check_no_cpu_fallback(engine),
-        check_oom_survives(engine, torch, short_sample, device=device),
+        check_oom_survives(engine, vad, torch, short_sample, device=device),
     ]
     ready = all(check.status == STATUS_PASS for check in checks)
     if worker_health is not None:
@@ -491,33 +490,9 @@ def load_nano_engine(
     model_dir: str | Path,
     *,
     device: str = DEVICE,
-    dtype: str = "bf16",
-    tensor_parallel_size: int = 1,
-    gpu_memory_utilization: float = 0.15,
-    max_model_len: int = 1536,
-    enforce_eager: bool = True,
-    attention_backend: str = "TRITON_ATTN",
 ) -> Any:
-    """Load Fun-ASR-Nano via FunASR's official vLLM calling convention on XPU.
-
-    ``attention_backend`` defaults to ``TRITON_ATTN``: vllm-xpu-kernels 0.1.14.1
-    ships CUTLASS FlashAttention kernels only for XE2/XE3 architectures, which
-    raises ``Only XE2/XE3 cutlass kernel is supported currently`` on the Xe-LPG+
-    iGPU (Arc 130T/140T, device_id 0x7D51). Triton attention runs on the Intel
-    XPU triton backend (triton==3.7.2+xpu shim) and covers this device."""
-    from funasr.models.fun_asr_nano.inference_vllm import FunASRNanoVLLM
-
-    return FunASRNanoVLLM.from_pretrained(
-        model=str(model_dir),
-        hub="ms",
-        device=device,
-        dtype=dtype,
-        tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=max_model_len,
-        enforce_eager=enforce_eager,
-        vllm_kwargs={"attention_backend": attention_backend},
-    )
+    """Load the worker's native FunASR/PyTorch Nano backend on XPU only."""
+    return load_native_nano_engine(device, model_dir=str(model_dir))
 
 
 def load_vad(device: str = DEVICE) -> FsmnVadSegmenter:
@@ -557,9 +532,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--report", required=True, help="JSON report output path")
     parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--dtype", default="bf16")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.15)
-    parser.add_argument("--max-model-len", type=int, default=1536)
     parser.add_argument(
         "--require-live-worker",
         action="store_true",
@@ -579,9 +551,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         engine = load_nano_engine(
             args.model_dir,
             device=args.device,
-            dtype=args.dtype,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            max_model_len=args.max_model_len,
         )
         vad = load_vad(device=args.device)
         report = run_preflight(

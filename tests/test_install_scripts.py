@@ -55,9 +55,17 @@ def test_daemon_does_not_restart_after_hotkey_grab_failure() -> None:
 
 def test_installer_requires_the_current_xpu_runtime_not_only_a_stale_report() -> None:
     install = (ROOT / "scripts/install-user.sh").read_text(encoding="utf-8")
-    assert "RUNTIME_MODULES=(torch vllm funasr modelscope)" in install
+    assert "RUNTIME_MODULES=(torch funasr modelscope)" in install
+    assert "Nano POC backend is not native_funasr_pytorch" in install
     assert "XPU runtime imports verified" in install
     assert "uv sync --inexact" in install
+
+
+def test_xpu_environment_uses_native_funasr_without_vllm_runtime() -> None:
+    environment = (ROOT / "scripts/create-xpu-env.sh").read_text(encoding="utf-8")
+    assert "install_xpu torch torchaudio" in environment
+    assert "vllm-xpu-kernels" not in environment
+    assert "wheels.vllm.ai" not in environment
 
 
 def test_installer_defers_daemon_start_until_graphical_session_import() -> None:

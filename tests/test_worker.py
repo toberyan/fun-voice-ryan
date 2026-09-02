@@ -1,7 +1,7 @@
 """Unit tests for the Nano runtime orchestration and worker message dispatch.
 
 These tests use fake VAD and fake Nano (ASR) runtime components; they never
-import torch / vllm / funasr, so they run in milliseconds.
+import torch / funasr, so they run in milliseconds.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ import numpy as np
 import pytest
 
 from fun_voice import nano_runtime as nano_mod
-from fun_voice import preflight
 from fun_voice.contracts import ErrorCode, Segment, Transcription, WorkerHealth
 from fun_voice.nano_runtime import (
     MAX_LIVE_PCM_BYTES,
@@ -34,6 +33,7 @@ from fun_voice.nano_runtime import (
     ModelOutputError,
     NanoRuntime,
     NanoRuntimeError,
+    NativeNanoEngine,
     OomError,
     VllmError,
     _slice_windows,
@@ -112,6 +112,28 @@ class SlowEngine:
     ) -> list[dict[str, Any]]:
         time.sleep(self.delay)
         return [{"key": "sample_0", "text": self.text}]
+
+
+class FakeNativeNanoModel:
+    """Fake native FunASR wrapper used without importing model dependencies."""
+
+    def __init__(self) -> None:
+        module = SimpleNamespace(device=SimpleNamespace(type="xpu"))
+        parameter = SimpleNamespace(device=SimpleNamespace(type="xpu"))
+        module.parameters = lambda: iter([parameter])
+        llm_model = SimpleNamespace(get_input_embeddings=lambda: module)
+        llm_model.parameters = lambda: iter([parameter])
+        self.model = SimpleNamespace(
+            audio_encoder=module,
+            audio_adaptor=module,
+            llm=SimpleNamespace(model=llm_model),
+        )
+        self.parameters = lambda: iter([parameter])
+        self.calls: list[dict[str, Any]] = []
+
+    def generate(self, **kwargs: Any) -> list[dict[str, str]]:
+        self.calls.append(kwargs)
+        return [{"key": "sample_0", "text": "native"}]
 
 
 class FlakyRuntime:
@@ -227,6 +249,68 @@ def test_nano_warmup_generates_synthetic_audio_without_vad() -> None:
     assert inputs[0].dtype == np.float32
     assert max_new_tokens == 512
     assert vad.detect_calls == []
+
+
+def test_native_nano_engine_adapts_repeated_in_memory_slices_without_vllm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native = FakeNativeNanoModel()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(from_numpy=lambda samples: samples),
+    )
+
+    engine = NativeNanoEngine(native)
+    samples = np.zeros(160, dtype=np.float32)
+    result = engine.generate([samples], max_new_tokens=123)
+    repeated = engine.generate([samples], max_new_tokens=123)
+
+    assert result == [{"key": "sample_0", "text": "native"}]
+    assert repeated == result
+    assert native.calls == [
+        {
+            "input": [samples],
+            "cache": {},
+            "batch_size_s": 1,
+            "max_length": 123,
+            "llm_kwargs": {"do_sample": False},
+        },
+        {
+            "input": [samples],
+            "cache": {},
+            "batch_size_s": 1,
+            "max_length": 123,
+            "llm_kwargs": {"do_sample": False},
+        },
+    ]
+    check_engine_devices(engine)
+    assert engine.backend == "native_funasr_pytorch"
+    assert engine.decoder_device_type == "xpu"
+
+
+def test_native_nano_loader_uses_only_local_snapshot_and_xpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native = FakeNativeNanoModel()
+    captured: dict[str, Any] = {}
+
+    def _auto_model(**kwargs: Any) -> FakeNativeNanoModel:
+        captured.update(kwargs)
+        return native
+
+    monkeypatch.setitem(sys.modules, "funasr", SimpleNamespace(AutoModel=_auto_model))
+
+    engine = nano_mod.load_native_nano_engine("xpu:0", model_dir="/local/nano")
+
+    assert isinstance(engine, NativeNanoEngine)
+    assert captured == {
+        "model": "/local/nano",
+        "trust_remote_code": True,
+        "device": "xpu:0",
+        "disable_update": True,
+    }
+    assert engine.decoder_device_type == "xpu"
 
 
 def test_runtime_live_fd_vad_and_window_preserve_source_offsets() -> None:
@@ -396,7 +480,7 @@ def test_vad_loader_rejects_a_non_xpu_model(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_nano_loader_rejects_a_non_xpu_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        preflight, "load_nano_engine", lambda *_args, **_kwargs: _engine_on("cpu")
+        nano_mod, "load_native_nano_engine", lambda _device: _engine_on("cpu")
     )
     monkeypatch.setattr(nano_mod, "_load_vad", lambda _device: FakeVad([(0, 100)]))
 

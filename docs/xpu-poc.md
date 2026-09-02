@@ -3,6 +3,11 @@
 本 POC 是桌面服务上线的**硬门**:九项检查全部通过之前,不得安装或启动任何桌面服务;
 任一失败即停止部署,绝不静默退回 CPU 或切换后端。
 
+当前 Nano 运行时固定为 `native_funasr_pytorch`：通过本地 FunASR
+`AutoModel(..., device="xpu:0")` 调用 PyTorch XPU。此前的 vLLM XPU
+prompt-embedding 路径在本机连续第二次请求会卡死，已不再是可部署后端；旧报告不能作为
+当前版本的放行证据。
+
 > 失败后,**只有人工**可以决定是否研究 llama.cpp / Vulkan 替代路线。脚本与自动化不得
 > 在 POC 失败时自行改走 CPU 或其他后端。
 
@@ -13,7 +18,7 @@
 | 检查 | 断言 |
 | --- | --- |
 | `xpu_visible` | `torch.xpu.is_available()` 为真 |
-| `vllm_xpu_decoder` | vLLM 解码器设备类型为 `xpu`,且能完成一次 XPU 显存分配 |
+| `nano_decoder_xpu` | 原生 FunASR/PyTorch Nano 解码器设备类型为 `xpu`、`backend == "native_funasr_pytorch"`，且能完成一次 XPU 显存分配 |
 | `nano_encoder_xpu` | `next(audio_encoder.parameters()).device.type == "xpu"` |
 | `nano_adaptor_xpu` | `next(audio_adaptor.parameters()).device.type == "xpu"` |
 | `prompt_embeddings_xpu` | `next(embed_tokens.parameters()).device.type == "xpu"` |
@@ -22,11 +27,11 @@
 | `no_cpu_decoder_fallback` | 引擎无 CPU 回退标志,解码器设备类型不是 `cpu` |
 | `oom_survives` | 触发 OOM 后再次解码短样本成功,worker 进程仍可服务 |
 
-加载约定沿用 FunASR 官方 `funasr/models/fun_asr_nano/inference_vllm.py`
-(`FunASRNanoVLLM.from_pretrained`):`device="xpu:0"`、`dtype="bf16"`、
-`tensor_parallel_size=1`、`gpu_memory_utilization=0.15`、`max_model_len=1536`、
-`enforce_eager=True`。音频 encoder、adaptor、prompt embedding 由 FunASR 显式移动到
-`xpu:0`。
+加载约定为本地 FunASR `AutoModel`：`model=<本地 Nano snapshot>`、
+`device="xpu:0"`、`trust_remote_code=True`、`disable_update=True`。加载器必须检查完整
+Nano 参数、audio encoder、adaptor 和 prompt embedding 均位于 XPU；任何 CPU 参数直接
+失败。原生路径没有 vLLM KV cache；旧配置中的 `gpu_memory_utilization`、`max_model_len`
+与 `enforce_eager` 只为兼容旧配置保留，运行时明确忽略，不能用于内存调优。
 
 ## 成功证据格式
 
@@ -39,8 +44,8 @@ detail 指标与样本构成(来源 URL、语言与时长),以 `0600` 权限保�
   "ready": true,
   "checks": [
     {"name": "xpu_visible", "status": "pass", "detail": {"available": true}},
-    {"name": "vllm_xpu_decoder", "status": "pass", "detail": {
-      "decoder_device_type": "xpu", "alloc_probe": "ok",
+    {"name": "nano_decoder_xpu", "status": "pass", "detail": {
+      "backend": "native_funasr_pytorch", "decoder_device_type": "xpu", "alloc_probe": "ok",
       "memory_before": {"allocated": 0, "reserved": 0},
       "memory_after": {"allocated": 1048576, "reserved": 67108864},
       "total_memory": 8589934592}},
@@ -65,7 +70,7 @@ detail 指标与样本构成(来源 URL、语言与时长),以 `0600` 权限保�
 ## 解码路径:VAD 分段 → 时间序拼接
 
 `decode_10s` 与 `decode_60s` 不再对整段音频调用一次 `engine.generate()`,而是复用
-`nano_runtime.FsmnVadSegmenter`(CPU FSMN-VAD)走与 worker 一致的分段路径:
+`nano_runtime.FsmnVadSegmenter`(XPU FSMN-VAD)走与 worker 一致的分段路径:
 
 1. 16 kHz 单声道音频加载为 float32 样本;
 2. FSMN-VAD 输出语音段 `(start_ms, end_ms)` 列表;
@@ -89,10 +94,10 @@ detail 指标与样本构成(来源 URL、语言与时长),以 `0600` 权限保�
 | 失败检查 | 含义 | 排查方向 |
 | --- | --- | --- |
 | `xpu_visible` | `torch.xpu` 不可用 | Intel 驱动/Level Zero 未装或版本过旧;torch 是 CUDA/CPU 变体而非 `+xpu` |
-| `vllm_xpu_decoder` | vLLM 未落到 XPU | `vllm-xpu-kernels` 未装;Python 非 3.12;平台自动检测失败 |
+| `nano_decoder_xpu` | 原生 Nano 未完整落到 XPU，或报告来自过期后端 | 检查本地 snapshot、FunASR/PyTorch XPU 安装及完整参数设备；重新运行当前 POC |
 | `nano_encoder_xpu` / `nano_adaptor_xpu` / `prompt_embeddings_xpu` | FunASR 音频组件不在 xpu | `device` 传参错误;组件加载后未 `.to("xpu:0")` |
-| `decode_10s` / `decode_60s` | 推理失败 | 模型不完整、tokenizer/权重缺失、KV cache OOM |
-| `no_cpu_decoder_fallback` | 检测到 CPU 回退 | **禁止**;vLLM 平台检测回退到 CPU,需修复环境,不得接受 |
+| `decode_10s` / `decode_60s` | 推理失败 | 模型不完整、tokenizer/权重缺失或 XPU OOM |
+| `no_cpu_decoder_fallback` | 检测到 CPU 回退 | **禁止**;修复 FunASR/PyTorch XPU 环境,不得接受 |
 | `oom_survives` | OOM 后进程无法继续服务 | worker 未捕获 OOM 或显存未释放;不得改走 CPU 规避 |
 
 ## Intel 驱动 / Level Zero 核验命令
@@ -123,7 +128,7 @@ vainfo 2>/dev/null | head -5 || true
 clinfo 2>/dev/null | grep -iE 'device name|version' | head -5 || true
 ```
 
-Level Zero 是 torch-xpu / vLLM XPU 的底层运行时;若 `torch.xpu.is_available()` 为
+Level Zero 是 torch-xpu 的底层运行时;若 `torch.xpu.is_available()` 为
 `False`,优先核验 `libze-intel-gpu1` 与内核 i915 驱动是否就绪。
 
 ## 失败后的处置边界
@@ -133,16 +138,16 @@ Level Zero 是 torch-xpu / vLLM XPU 的底层运行时;若 `torch.xpu.is_availab
 
 ## POC 结果
 
-状态:**DONE** —— 九项硬门全部通过(`ready=true`,退出码 0),Fun-ASR-Nano 在
-Intel Arc(Arc 130T/140T,Arrow Lake-P iGPU)上通过 vLLM XPU 后端完成真实解码。
-**未**退回 CPU,未更换后端。
+状态:**需要重新运行** —— 下方记录的是已废弃 vLLM 路径的历史证据，不可用于安装。
+当前原生 FunASR/PyTorch 路径已验证连续请求、XPU 参数设备和 10 秒本地样本可用；仍须运行
+本节末的完整九项硬门，获得 `backend="native_funasr_pytorch"` 的新报告后才可放行。
 
 ### 九项硬门结果
 
 | 检查 | 结果 | 证据 |
 | --- | --- | --- |
 | `xpu_visible` | pass | `torch.xpu.is_available() == True` |
-| `vllm_xpu_decoder` | pass | decoder_device_type=xpu,alloc_probe=ok |
+| `nano_decoder_xpu` | 待重跑 | 必须为 backend=native_funasr_pytorch、decoder_device_type=xpu、alloc_probe=ok |
 | `nano_encoder_xpu` | pass | audio_encoder 参数在 xpu |
 | `nano_adaptor_xpu` | pass | audio_adaptor 参数在 xpu |
 | `prompt_embeddings_xpu` | pass | embed_tokens 参数在 xpu |
@@ -163,45 +168,11 @@ Intel Arc(Arc 130T/140T,Arrow Lake-P iGPU)上通过 vLLM XPU 后端完成真实�
 文本长度可能随模型采样而变化，以最新 JSON 报告为准。
 
 
-### 环境版本
-
-```
-torch==2.13.0+xpu   torchaudio==2.11.0+xpu   torchvision==0.28.0+xpu
-vllm==0.28.0        vllm-xpu-kernels==0.1.14.1
-triton==3.7.2+xpu   triton-xpu==3.7.2        oneccl==2022.0.0
-funasr==1.4.11 (git@8cd758c0ced576516b05a749194e6a94cdd38f99)   modelscope==1.39.1
-```
-
-### 应用的兼容修复(create-xpu-env.sh 内,幂等)
-
-1. **安装 `vllm-xpu-kernels==0.1.14.1`**:vLLM 0.28.0 通用 wheel 不声明该依赖。
-2. **oneCCL 单卡 warm-up 修复(vllm#52386 / PR#52389)**:仅多卡才 warm-up。
-3. **显存探测回退**:驱动 25.18(< 26.18)`getMemoryInfo` 返回 0,回退为
-   `total - reserved`。
-4. **triton XPU shim 固定**:卸载 PyPI `triton==3.8.0`(NVIDIA-only,由 xgrammar
-   的 `Requires-Dist: triton` 拉入),改装 wheels.vllm.ai/xpu 的
-   `triton==3.7.2+xpu` shim(Requires-Dist `triton-xpu==3.7.2`),透明解析到真正
-   的 Intel XPU 实现。
-5. **Level Zero 头文件 + 链接软链**:triton-xpu Intel 后端 JIT 编译 driver.c 需要
-   `<level_zero/ze_api.h>` 与 `libze_loader.so`(由 level-zero-dev 提供,本机无且
-   不能 sudo);从 oneapi-src/level-zero v1.21.9(匹配 libze1 1.21.9)下载头文件
-   并入 `.venv/include/level_zero/`,并软链 `.venv/lib/libze_loader.so`。
-
-### preflight 内的两项适配(src/fun_voice/preflight.py)
-
-- **`attention_backend=TRITON_ATTN`**:vllm-xpu-kernels 0.1.14.1 的 CUTLASS
-  FlashAttention 只有 XE2/XE3 内核,Arc 130T/140T(device_id 0x7D51,Xe-LPG+)
-  报 `Only XE2/XE3 cutlass kernel is supported currently`;改用 Triton 注意力
-  后端(依赖第 4/5 项修复的 triton Intel 后端)。
-- **OOM 探测改为分配器 OOM**:vLLM 0.28.0 不拒绝 `max_tokens > max_model_len`(只
-  截断),大 `max_tokens` 在长解码后会令 V1 调度器挂起;`oom_survives` 改用
-  `torch.empty` 超总量触发 `OutOfMemoryError` 作为可靠 OOM,再验证恢复解码。
-
 ### 复现
 
 ```bash
-./scripts/create-xpu-env.sh          # 建环境(含五项兼容修复)
+./scripts/create-xpu-env.sh          # 建原生 FunASR/PyTorch XPU 环境
 ./scripts/run-nano-xpu-poc.sh        # 下载样本/模型,跑九项硬门,输出 poc-report.json
 ```
 
-单测(9 项硬门逻辑,假 torch/vLLM/Nano):`.venv/bin/pytest tests/test_preflight.py -q`。
+单测(9 项硬门逻辑,假 torch/原生 Nano):`.venv/bin/pytest tests/test_preflight.py -q`。

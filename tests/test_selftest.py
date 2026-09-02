@@ -66,7 +66,16 @@ class _FakeDisplay:
 
 
 def _pass_report() -> PreflightReport:
-    checks = tuple(CheckResult(name, STATUS_PASS, {}) for name in CHECK_NAMES)
+    checks = tuple(
+        CheckResult(
+            name,
+            STATUS_PASS,
+            {"backend": "native_funasr_pytorch"}
+            if name == "nano_decoder_xpu"
+            else {},
+        )
+        for name in CHECK_NAMES
+    )
     return PreflightReport(device="xpu:0", checks=checks, ready=True)
 
 
@@ -269,6 +278,16 @@ def test_xpu_hard_gate_fail_when_not_ready() -> None:
     result = check_xpu_hard_gate(report)
     assert result.status == STATUS_FAIL
     assert result.detail["ready"] is False
+
+
+def test_xpu_hard_gate_rejects_a_legacy_non_native_decoder_report() -> None:
+    checks = tuple(CheckResult(name, STATUS_PASS, {}) for name in CHECK_NAMES)
+    report = PreflightReport(device="xpu:0", checks=checks, ready=True)
+
+    result = check_xpu_hard_gate(report)
+
+    assert result.status == STATUS_FAIL
+    assert result.detail["backend"] is None
 
 
 # --- Report / aggregation ----------------------------------------------------

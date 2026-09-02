@@ -20,6 +20,7 @@ from fun_voice.incremental_poc import (
     run_local_incremental_poc,
     write_poc_report,
 )
+from fun_voice.nano_runtime import EmptySpeechError
 
 
 def _passing_report(*, created_at: int = 100) -> IncrementalPocReport:
@@ -196,6 +197,101 @@ def test_local_poc_runner_uses_fake_runtime_and_keeps_text_out_of_report(
     assert "#" not in json.dumps(report.to_dict())
 
 
+def test_local_poc_skips_silent_incremental_windows(tmp_path: Path) -> None:
+    (tmp_path / "sample.pcm").touch()
+
+    class FakeRuntime:
+        device = DEVICE
+
+        def __init__(self) -> None:
+            self.window_calls = 0
+
+        def health(self) -> WorkerHealth:
+            return WorkerHealth(
+                version="test", xpu_ready=True, model_ready=True, device=DEVICE
+            )
+
+        def device_evidence(self) -> tuple[str, str]:
+            return DEVICE, DEVICE
+
+        def transcribe(self, _audio: str, *, sample_rate: int) -> Transcription:
+            return Transcription("#", segments=(Segment(0, 100, "#"),))
+
+        def transcribe_samples(
+            self, _samples: list[int], *, sample_rate: int
+        ) -> Transcription:
+            self.window_calls += 1
+            if self.window_calls == 2:
+                raise EmptySpeechError("silent window")
+            return Transcription("#", segments=(Segment(0, 100, "#"),))
+
+        def close(self) -> None:
+            pass
+
+    probe_inputs: list[list[int]] = []
+    report = run_local_incremental_poc(
+        tmp_path,
+        model_revision="master",
+        runtime_factory=FakeRuntime,
+        audio_loader=lambda _path, _rate: [0] * (16000 * 3),
+        peak_memory_bytes=lambda: 4096,
+        final_tail_probe=lambda _runtime, samples: probe_inputs.append(samples)
+        or (True, False, False),
+        clock=lambda: 200,
+    )
+
+    assert report.ready is True
+    assert report.incremental_window_count == 2
+    assert report.incremental_segment_count == 2
+    assert [len(samples) for samples in probe_inputs] == [24_000]
+    assert "#" not in json.dumps(report.to_dict())
+
+
+def test_local_poc_skips_whole_utterances_without_speech(tmp_path: Path) -> None:
+    (tmp_path / "silent.pcm").touch()
+
+    class FakeRuntime:
+        device = DEVICE
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def health(self) -> WorkerHealth:
+            return WorkerHealth(
+                version="test", xpu_ready=True, model_ready=True, device=DEVICE
+            )
+
+        def device_evidence(self) -> tuple[str, str]:
+            return DEVICE, DEVICE
+
+        def transcribe(self, _audio: str, *, sample_rate: int) -> Transcription:
+            raise EmptySpeechError("silent utterance")
+
+        def transcribe_samples(
+            self, _samples: list[int], *, sample_rate: int
+        ) -> Transcription:
+            raise AssertionError("silent utterance must not reach incremental decoding")
+
+        def close(self) -> None:
+            self.closed = True
+
+    runtime = FakeRuntime()
+    report = run_local_incremental_poc(
+        tmp_path,
+        model_revision="master",
+        runtime_factory=lambda: runtime,
+        audio_loader=lambda _path, _rate: [0] * 16_000,
+        peak_memory_bytes=lambda: 4096,
+        final_tail_probe=lambda _runtime, _samples: (True, False, False),
+        clock=lambda: 200,
+    )
+
+    assert report.ready is False
+    assert report.full_segment_count == 0
+    assert report.incremental_window_count == 0
+    assert runtime.closed is True
+
+
 def test_local_poc_runner_rejects_unverified_vad_device_evidence(
     tmp_path: Path,
 ) -> None:
@@ -265,15 +361,13 @@ def test_poc_main_publishes_the_injected_local_runner_aggregate(
 
 def test_final_tail_probe_runs_final_before_queued_provisional_window() -> None:
     class FakeRuntime:
-        def __init__(self) -> None:
-            self.order: list[int] = []
+        calls = 0
 
-        def transcribe_samples(self, samples: list[int], *, sample_rate: int) -> None:
-            assert sample_rate == 16000
-            self.order.append(samples[0])
+        def transcribe_samples(self, _samples: list[int], *, sample_rate: int) -> None:
+            self.calls += 1
+            raise AssertionError("scheduler probe must not decode user audio")
 
     runtime = FakeRuntime()
-    samples = [1] * 24000 + [2] * 24000
 
-    assert _default_final_tail_probe(runtime, samples) == (True, False, False)
-    assert runtime.order == [2, 1]
+    assert _default_final_tail_probe(runtime, [0] * 16_000) == (True, False, False)
+    assert runtime.calls == 0

@@ -36,7 +36,7 @@ CONSOLE_SCRIPTS=(
 SYSTEMD_UNITS=(fun-voice-worker@.service fun-voice-daemon.service)
 
 POC_REPORT="${XDG_RUNTIME_DIR:-}/fun-voice-ryan/poc-report.json"
-RUNTIME_MODULES=(torch vllm funasr modelscope)
+RUNTIME_MODULES=(torch funasr modelscope)
 
 # Source artifacts (validated up front so a missing file fails before any write).
 FCITX_SO="${ROOT}/build/fcitx/fcitx5-fun-voice.so"
@@ -119,15 +119,21 @@ POC_CHECK="$(python3 - "${POC_REPORT}" <<'PYEOF' || true
 import json, sys
 report = json.load(open(sys.argv[1]))
 required = {
-    "xpu_visible", "vllm_xpu_decoder", "nano_encoder_xpu",
+    "xpu_visible", "nano_decoder_xpu", "nano_encoder_xpu",
     "nano_adaptor_xpu", "prompt_embeddings_xpu", "decode_10s",
     "decode_60s", "no_cpu_decoder_fallback", "oom_survives",
 }
 checks = {c["name"]: c.get("status") for c in report.get("checks", [])}
+decoder = next(
+    (c for c in report.get("checks", []) if c.get("name") == "nano_decoder_xpu"),
+    {},
+)
 if report.get("ready") is not True:
     print("report ready is not True")
 elif set(checks) != required:
     print(f"gate set mismatch: missing={sorted(required - set(checks))} extra={sorted(set(checks) - required)}")
+elif decoder.get("detail", {}).get("backend") != "native_funasr_pytorch":
+    print("Nano POC backend is not native_funasr_pytorch")
 elif any(s != "pass" for s in checks.values()):
     print("not all gates pass: " + ", ".join(f"{n}={s}" for n, s in checks.items() if s != "pass"))
 else:

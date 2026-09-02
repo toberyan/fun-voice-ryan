@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from fun_voice.nano_runtime import EmptySpeechError
+
 DEVICE = "xpu:0"
 NANO_MODEL_ID = "FunAudioLLM/Fun-ASR-Nano-2512"
 POC_REPORT_NAME = "incremental-poc-report.json"
@@ -247,23 +249,43 @@ def run_local_incremental_poc(
         deadlocked = False
 
         for audio_path in inputs:
-            whole = runtime.transcribe(str(audio_path), sample_rate=POC_SAMPLE_RATE)
+            try:
+                whole = runtime.transcribe(str(audio_path), sample_rate=POC_SAMPLE_RATE)
+            except EmptySpeechError:
+                # A corpus item with no VAD speech cannot exercise either the
+                # complete or incremental path.  Skip it without retaining its
+                # identity; the report remains fail-closed if no valid item
+                # contributes positive segment/window evidence.
+                continue
             full_segment_count += len(whole.segments)
             samples = audio_loader(str(audio_path), POC_SAMPLE_RATE)
             window_texts: list[str] = []
+            probe_window: Any | None = None
             for window in _incremental_windows(samples):
-                incremental = runtime.transcribe_samples(
-                    window, sample_rate=POC_SAMPLE_RATE
-                )
+                try:
+                    incremental = runtime.transcribe_samples(
+                        window, sample_rate=POC_SAMPLE_RATE
+                    )
+                except EmptySpeechError:
+                    # A fixed audio window may be entirely silent.  It has no
+                    # text to reconcile and is not an XPU inference failure.
+                    continue
                 window_texts.append(incremental.text)
                 incremental_segment_count += len(incremental.segments)
                 incremental_window_count += 1
+                if probe_window is None:
+                    probe_window = window
             merged, reconciled = _merge_incremental_texts(window_texts)
             reconciled_duplicate_boundary_count += reconciled
             final_text_equal = final_text_equal and merged == whole.text
             total_distance += _edit_distance(whole.text, merged)
             total_reference_characters += len(whole.text)
-            passed, saw_timeout, saw_deadlock = final_tail_probe(runtime, samples)
+            if probe_window is None:
+                passed, saw_timeout, saw_deadlock = False, False, False
+            else:
+                passed, saw_timeout, saw_deadlock = final_tail_probe(
+                    runtime, probe_window
+                )
             final_tail_preemption_passed = final_tail_preemption_passed and passed
             timed_out = timed_out or saw_timeout
             deadlocked = deadlocked or saw_deadlock
@@ -383,13 +405,19 @@ def _peak_xpu_memory_bytes() -> int:
 def _default_final_tail_probe(
     runtime: _PocRuntime, samples: Any
 ) -> tuple[bool, bool, bool]:
-    """Verify final tail priority ahead of an already-queued provisional window."""
+    """Verify final-tail priority independently from the audio decoder.
+
+    The main POC loop already runs real consecutive Nano calls over full and
+    incremental audio.  Keeping the scheduler assertion opaque prevents a
+    silent VAD slice from being misclassified as a priority failure.
+    """
+    del runtime, samples
     from fun_voice.contracts import ModelTaskKind, SessionKey
     from fun_voice.scheduler import ModelLifecycle, XpuScheduler
 
-    windows = _incremental_windows(samples)
     blocker_started = threading.Event()
     release_blocker = threading.Event()
+    execution_order: list[str] = []
     scheduler = XpuScheduler(
         start_profile=lambda _profile: True,
         stop_profile=lambda _profile: True,
@@ -412,17 +440,13 @@ def _default_final_tail_probe(
         provisional = scheduler.run_asr(
             key,
             "nano",
-            lambda: runtime.transcribe_samples(
-                windows[0], sample_rate=POC_SAMPLE_RATE
-            ),
+            lambda: execution_order.append("provisional"),
             kind=ModelTaskKind.PROVISIONAL_TAIL,
         )
         final = scheduler.run_asr(
             key,
             "nano",
-            lambda: runtime.transcribe_samples(
-                windows[-1], sample_rate=POC_SAMPLE_RATE
-            ),
+            lambda: execution_order.append("final"),
             kind=ModelTaskKind.FINAL_TAIL,
         )
         release_blocker.set()
@@ -437,7 +461,7 @@ def _default_final_tail_probe(
     finally:
         release_blocker.set()
         scheduler.close()
-    return True, False, False
+    return execution_order == ["final", "provisional"], False, False
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

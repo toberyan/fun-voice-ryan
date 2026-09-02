@@ -1,4 +1,4 @@
-"""Unit tests for the XPU hard-gate preflight (fake torch / vLLM / Nano)."""
+"""Unit tests for the XPU hard-gate preflight (fake torch / native Nano)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,8 @@ from fun_voice.preflight import (
     PreflightReport,
     _transcribe_segmented,
     check_decode,
-    check_vllm_xpu_decoder,
+    check_nano_xpu_decoder,
+    check_oom_survives,
     check_worker_health,
     detect_cpu_fallback,
     load_nano_engine,
@@ -92,11 +93,6 @@ class _FakeTorch:
         return _FakeTensor()
 
 
-class _FakeVLLMEngine:
-    def __init__(self, device_type: str = "xpu") -> None:
-        self.device_type = device_type
-
-
 class _FakeNanoEngine:
     def __init__(
         self,
@@ -110,12 +106,15 @@ class _FakeNanoEngine:
         self.audio_encoder = _FakeModule(encoder_type)
         self.audio_adaptor = _FakeModule(adaptor_type)
         self.embed_tokens = _FakeModule(embed_type)
-        self.vllm_engine = _FakeVLLMEngine(device_type)
+        self.decoder_device_type = device_type
+        self.backend = "native_funasr_pytorch"
         self._fail_tokens = fail_tokens or set()
+        self.input_batches: list[list[Any]] = []
 
     def generate(
         self, inputs: list[Any], max_new_tokens: int = 512, **kwargs: Any
     ) -> list[dict[str, str]]:
+        self.input_batches.append(list(inputs))
         if max_new_tokens in self._fail_tokens:
             raise RuntimeError("fake decode failure")
         return [
@@ -194,7 +193,7 @@ def _stub_audio_loader(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_check_names_are_the_nine_hard_gates() -> None:
     assert CHECK_NAMES == (
         "xpu_visible",
-        "vllm_xpu_decoder",
+        "nano_decoder_xpu",
         "nano_encoder_xpu",
         "nano_adaptor_xpu",
         "prompt_embeddings_xpu",
@@ -209,7 +208,7 @@ def test_check_names_are_the_nine_hard_gates() -> None:
     [
         ("xpu_visible", _FakeTorch(available=False), _FakeNanoEngine()),
         (
-            "vllm_xpu_decoder",
+            "nano_decoder_xpu",
             _FakeTorch(),
             _FakeNanoEngine(device_type="cuda"),
         ),
@@ -243,7 +242,7 @@ def test_check_names_are_the_nine_hard_gates() -> None:
     ],
     ids=[
         "xpu_visible",
-        "vllm_xpu_decoder",
+        "nano_decoder_xpu",
         "nano_encoder_xpu",
         "nano_adaptor_xpu",
         "prompt_embeddings_xpu",
@@ -275,18 +274,29 @@ def test_oom_check_records_recovery_length_not_text() -> None:
     report = _run()
     oom = next(c for c in report.checks if c.name == "oom_survives")
     assert oom.status == STATUS_PASS
-    assert oom.detail["recovery_text_length"] == len("hello world")
+    assert oom.detail["recovery_text_length"] == 2 * len("hello world")
+    assert oom.detail["recovery_segment_count"] == 2
     assert "hello world" not in report.to_json()
 
 
-def test_vllm_xpu_decoder_alloc_probe_failure() -> None:
+def test_oom_recovery_uses_the_native_in_memory_segmented_path() -> None:
+    engine = _FakeNanoEngine()
+    result = check_oom_survives(engine, _FakeVad([(0, 100)]), _FakeTorch(), "short")
+
+    assert result.status == STATUS_PASS
+    recovery_input = engine.input_batches[-1][0]
+    assert isinstance(recovery_input, np.ndarray)
+    assert recovery_input.dtype == np.float32
+
+
+def test_nano_xpu_decoder_alloc_probe_failure() -> None:
     """A failing allocation probe marks the decoder check as fail."""
 
     class _FailingAllocTorch(_FakeTorch):
         def empty(self, size: int, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("alloc boom")
 
-    result = check_vllm_xpu_decoder(_FakeNanoEngine(), _FailingAllocTorch())
+    result = check_nano_xpu_decoder(_FakeNanoEngine(), _FailingAllocTorch())
     assert result.status == STATUS_FAIL
     assert result.detail["alloc_probe"] == "failed:RuntimeError"
     assert result.detail["decoder_device_type"] == "xpu"
@@ -300,39 +310,24 @@ def test_detect_cpu_fallback_cpu_device() -> None:
     assert detect_cpu_fallback(_FakeNanoEngine()) is None
 
 
-def test_load_nano_engine_passes_triton_attn_backend(
+def test_load_nano_engine_uses_native_funasr_xpu_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """load_nano_engine forwards attention_backend=TRITON_ATTN via vllm_kwargs."""
-    import sys
-    import types
-
+    """Preflight must share the worker's native Nano loader, never vLLM."""
     captured: dict[str, Any] = {}
 
-    class _FakeFunASRNanoVLLM:
-        @classmethod
-        def from_pretrained(cls, **kwargs: Any) -> object:
-            captured.update(kwargs)
-            return object()
+    expected = object()
 
-    leaf = types.ModuleType("funasr.models.fun_asr_nano.inference_vllm")
-    # types.ModuleType has no declared attribute; setattr avoids a mypy
-    # attr-defined error on this dynamically-built fake module.
-    setattr(leaf, "FunASRNanoVLLM", _FakeFunASRNanoVLLM)  # noqa: B010
-    for pkg_name in ("funasr", "funasr.models", "funasr.models.fun_asr_nano"):
-        monkeypatch.setitem(sys.modules, pkg_name, types.ModuleType(pkg_name))
-    monkeypatch.setitem(
-        sys.modules, "funasr.models.fun_asr_nano.inference_vllm", leaf
-    )
+    def _load(device: str, *, model_dir: str) -> object:
+        captured.update({"device": device, "model_dir": model_dir})
+        return expected
+
+    monkeypatch.setattr("fun_voice.preflight.load_native_nano_engine", _load)
 
     engine = load_nano_engine("/fake/model-dir")
-    assert engine is not None
-    assert captured["model"] == "/fake/model-dir"
-    assert captured["gpu_memory_utilization"] == 0.15
-    assert captured["max_model_len"] == 1536
+    assert engine is expected
+    assert captured["model_dir"] == "/fake/model-dir"
     assert captured["device"] == "xpu:0"
-    assert captured["dtype"] == "bf16"
-    assert captured["vllm_kwargs"] == {"attention_backend": "TRITON_ATTN"}
 
 
 def test_check_worker_health_pass() -> None:

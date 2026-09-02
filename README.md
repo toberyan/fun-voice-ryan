@@ -9,7 +9,7 @@ Fun Voice Ryan 是一个运行在 Deepin DDE X11 上的本地语音输入助手�
 > [!WARNING]
 > **未通过 Intel XPU POC 之前，禁止安装或启动桌面服务。**
 >
-> 本项目推理依赖 Intel Arc XPU。安装前必须先跑通 `fun-voice-preflight` 的全部硬门检查：`torch.xpu` 可用、vLLM 能在 XPU 加载 Qwen 解码、Fun-ASR-Nano 的 encoder / adaptor / prompt embeddings 都运行在 `xpu:0`、10 秒与 60 秒中英混合样本通过，且日志证明没有静默 CPU 解码回退。任一检查失败即停止部署，**不得**静默退回 CPU 或切换其他后端。
+> 本项目推理依赖 Intel Arc XPU。安装前必须先跑通 `fun-voice-preflight` 的全部硬门检查：`torch.xpu` 可用、Fun-ASR-Nano 的原生 FunASR/PyTorch 解码器及 encoder / adaptor / prompt embeddings 都运行在 `xpu:0`、10 秒与 60 秒中英混合样本通过，且没有静默 CPU 解码回退。任一检查失败即停止部署，**不得**静默退回 CPU 或切换其他后端。
 
 ## 开发前提
 

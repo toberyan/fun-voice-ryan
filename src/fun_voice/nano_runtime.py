@@ -4,7 +4,7 @@ The runtime loads the Nano engine and the FSMN-VAD model exactly once and keeps
 them warm for the worker's lifetime. Each request reuses both models:
 
 1. audio is loaded to a float32 16 kHz mono array (WAV or raw s16le),
-2. the CPU FSMN-VAD segments speech, returning ``[start_ms, end_ms]`` regions,
+2. the XPU FSMN-VAD segments speech, returning ``[start_ms, end_ms]`` regions,
 3. a fixed small overlap is added to each region boundary when slicing audio,
 4. the Nano engine transcribes the slices in original-audio-time order, and
 5. the per-segment texts are concatenated verbatim (no character is inserted or
@@ -13,7 +13,7 @@ them warm for the worker's lifetime. Each request reuses both models:
 Privacy: this module never logs audio paths or transcription text; only counts,
 lengths, and durations are logged.
 
-This module does not import ``torch`` / ``vllm`` / ``funasr`` at import time so
+This module does not import ``torch`` / ``funasr`` at import time so
 the orchestration logic stays unit-testable with fakes.
 """
 
@@ -107,7 +107,12 @@ class OomError(NanoRuntimeError):
 
 
 class VllmError(NanoRuntimeError):
-    """The vLLM engine raised an error during inference."""
+    """An ASR engine raised an inference error.
+
+    ``worker.vllm`` is retained as the stable wire error code for already
+    installed clients.  The Nano implementation is native FunASR/PyTorch, not
+    vLLM; new callers must treat this as a backend-neutral inference failure.
+    """
 
     error_code: ErrorCode = ErrorCode("worker", "vllm")
 
@@ -149,6 +154,60 @@ class VadSegmenter(Protocol):
     def detect(
         self, samples: np.ndarray, sample_rate: int
     ) -> list[tuple[int, int]]: ...
+
+
+class NativeNanoEngine:
+    """Adapt the local FunASR/PyTorch Nano model to the runtime engine seam.
+
+    The installed vLLM 0.28.0 XPU stack stalls after its first prompt-embedding
+    request on the supported Arc platform.  This adapter keeps the same local
+    Nano checkpoint and XPU-only execution while delegating decoding to the
+    stable native FunASR/PyTorch path.
+    """
+
+    def __init__(self, model: Any) -> None:
+        native = getattr(model, "model", None)
+        llm = getattr(native, "llm", None)
+        llm_model = getattr(llm, "model", None)
+        get_embeddings = getattr(llm_model, "get_input_embeddings", None)
+        if native is None or not callable(get_embeddings):
+            raise ModelLoadError("native Nano model has no inspectable decoder")
+        self._model = model
+        self.backend = "native_funasr_pytorch"
+        self.audio_encoder = getattr(native, "audio_encoder", None)
+        self.audio_adaptor = getattr(native, "audio_adaptor", None)
+        self.embed_tokens = get_embeddings()
+        if any(
+            module is None
+            for module in (self.audio_encoder, self.audio_adaptor, self.embed_tokens)
+        ):
+            raise ModelLoadError("native Nano model has incomplete audio components")
+        self.decoder_device_type = _module_device_type(llm) or _module_device_type(
+            llm_model
+        )
+
+    def generate(
+        self, inputs: list[np.ndarray], max_new_tokens: int
+    ) -> list[dict[str, Any]]:
+        """Decode in-memory float32 slices without a vLLM process or cache."""
+        if not inputs:
+            return []
+        import torch
+
+        samples = [
+            torch.from_numpy(np.ascontiguousarray(value, dtype=np.float32))
+            for value in inputs
+        ]
+        results = self._model.generate(
+            input=samples,
+            cache={},
+            batch_size_s=1,
+            max_length=max_new_tokens,
+            llm_kwargs={"do_sample": False},
+        )
+        if not isinstance(results, list):
+            raise ModelOutputError("native Nano returned a malformed result list")
+        return results
 
 
 # --- Device helpers ---------------------------------------------------------
@@ -245,7 +304,7 @@ def _load_pcm_fd(fd: int) -> np.ndarray:
 
 
 class FsmnVadSegmenter:
-    """CPU FSMN-VAD adapter.
+    """XPU FSMN-VAD adapter.
 
     FunASR ``fsmn-vad`` returns ``[{"key": str, "value": [[start_ms, end_ms], ...]}]``
     where ``value`` is a list of ``[start_ms, end_ms]`` integer pairs in
@@ -359,7 +418,7 @@ class NanoRuntime:
         return DEVICE, DEVICE
 
     def close(self) -> None:
-        """Mark the runtime closed (offline vLLM has no explicit close API)."""
+        """Mark the runtime closed; the worker process owns native model release."""
         self._closed = True
 
     def _xpu_ready(self) -> bool:
@@ -535,9 +594,9 @@ class NanoRuntime:
     def _run_asr(self, slices: list[np.ndarray], timeout: float | None) -> list[str]:
         """Run one batch through the engine, mapping failures to typed errors.
 
-        Timeout is a design trade-off: vLLM's offline ``generate`` cannot be
-        safely interrupted mid-decode, so a timed-out call keeps running on a
-        daemon thread. ``_generate_lock`` serializes engine access, which both
+        A native ``generate`` cannot be safely interrupted mid-decode, so a
+        timed-out call keeps running on a daemon thread. ``_generate_lock``
+        serializes engine access, which both
         prevents concurrent ``generate`` calls from corrupting the engine and
         guarantees the lock is released once the straggler finishes — a
         subsequent (short) request then proceeds normally.
@@ -549,7 +608,7 @@ class NanoRuntime:
         holder: dict[str, Any] = {}
 
         def _generate() -> None:
-            # Serialize vLLM generate: the engine is not re-entrant, and a
+            # Serialize generate: the engine is not re-entrant, and a
             # timed-out call may still be finishing on a background thread.
             with self._generate_lock:
                 try:
@@ -626,27 +685,55 @@ def load_nano_runtime(
     max_model_len: int = 1536,
     default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> NanoRuntime:
-    """Load the Fun-ASR-Nano engine and FSMN-VAD once, on XPU."""
+    """Load native Fun-ASR-Nano and FSMN-VAD once, on XPU.
+
+    vLLM-specific sizing options remain accepted for configuration/API
+    compatibility, but the native backend owns neither a KV cache nor a vLLM
+    engine process.
+    """
     if device != DEVICE:
         raise DeviceMismatchError("Nano runtime requires xpu:0")
+    if dtype != "bf16":
+        raise ModelLoadError("native Nano requires bf16")
+    if (
+        gpu_memory_utilization != 0.15
+        or not enforce_eager
+        or max_model_len != 1536
+    ):
+        logger.warning(
+            "native Nano ignores deprecated vLLM-only KV/cache settings; "
+            "it allocates no persistent vLLM KV cache"
+        )
     # Reuse the already-downloaded FSMN-VAD instead of re-downloading it.
     os.environ.setdefault("MODELSCOPE_CACHE", str(models_root()))
 
-    from fun_voice.preflight import load_nano_engine
-
-    engine = load_nano_engine(
-        nano_model_dir(),
-        device=device,
-        dtype=dtype,
-        gpu_memory_utilization=gpu_memory_utilization,
-        enforce_eager=enforce_eager,
-        max_model_len=max_model_len,
-    )
+    engine = load_native_nano_engine(device)
     check_engine_devices(engine)
     vad = _load_vad(device)
     return NanoRuntime(
         engine=engine, vad=vad, device=device, default_timeout=default_timeout
     )
+
+
+def load_native_nano_engine(
+    device: str, *, model_dir: str | Path | None = None
+) -> NativeNanoEngine:
+    """Load a local native Nano checkpoint and prove it is entirely on XPU.
+
+    ``model_dir`` is only a local snapshot path.  Supplying it lets preflight
+    load exactly the same native backend as the worker without downloading or
+    using the unstable vLLM prompt-embedding route.
+    """
+    from funasr import AutoModel
+
+    model = AutoModel(
+        model=str(nano_model_dir() if model_dir is None else model_dir),
+        trust_remote_code=True,
+        device=device,
+        disable_update=True,
+    )
+    _assert_funasr_model_xpu(model, name="Fun-ASR-Nano")
+    return NativeNanoEngine(model)
 
 
 def _load_vad(device: str) -> FsmnVadSegmenter:
