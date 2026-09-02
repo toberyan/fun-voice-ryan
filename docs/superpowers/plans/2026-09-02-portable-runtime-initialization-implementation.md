@@ -661,6 +661,8 @@
 
   Assert accelerator probe commands contain only `nano`, `sensevoice`, `vad`, `qwen`, and `campplus`; CPU contains exactly `sensevoice` and `vad`; no CPU command argv, environment, or model request includes `Qwen`, `qwen`, `campplus`, or `CAM++`. Test `--dry-run` returns candidate order and performs no venv/model/probe subprocess.
 
+  Add a `DesktopPrerequisites` fake which supplies X11/DDE session values, an owned `XDG_RUNTIME_DIR`, executable paths, and writable data root. Assert each missing prerequisite (`DISPLAY`, DDE X11 session, `XDG_RUNTIME_DIR`, `uv`, `pw-cli`/PipeWire socket, `fcitx5-remote`, `cmake`, `pkg-config`, writable data root) causes `run_initialization()` to raise `InitializationError("desktop_prerequisite")` before the fake runner records an environment or probe command. The `--dry-run` path is the sole exception: it returns candidate order without desktop checks or subprocesses.
+
   Create `tests/test_backend_probe.py` with fake `torch`, snapshot downloader, WAV downloader, and `load_nano_runtime`/`load_sensevoice_runtime` seams. Assert CUDA follows BF16 then FP16 when BF16 tensor operation fails, XPU only permits BF16, CPU only permits float32 and SenseVoice. Assert each passing probe calls both a device tensor reduction and exactly one local `transcribe()` against the temporary public sample; result JSON omits sample path and transcript.
 
 - [ ] **Step 2: Run bootstrap/probe tests and confirm the new modules are absent**
@@ -767,6 +769,8 @@
   ```
 
   `run_initialization` first loads an existing manifest only to determine whether a successful new selection must replace it; it must not delete, stop services, or modify that manifest. On normal invocation with an existing valid selection and no `--force-reselect`, print a fixed `already_selected` diagnostic and return it without changing environments. With `--dry-run`, print JSON containing only ordered candidate names and exit `0` before any subprocess.
+
+  Before examining an existing selection or creating a candidate, call `validate_desktop_prerequisites(options, environment=os.environ, which=shutil.which)`. It must reject a missing `DISPLAY`; `XDG_SESSION_TYPE` other than `x11` when that variable is present; an `XDG_CURRENT_DESKTOP` value that does not contain `DDE` case-insensitively when that variable is present; an unset, missing, non-owned, or group/world-accessible `XDG_RUNTIME_DIR`; a missing `uv`, `cmake`, or `pkg-config`; no `pw-cli` executable and no owned `${XDG_RUNTIME_DIR}/pipewire-0` socket; missing `fcitx5-remote`; or a data-root parent that cannot create and remove one exact owner-only temporary file. Return only fixed prerequisite category names, never the rejected path or variable value. The subsequent `scripts/install-user.sh` remains responsible for checking the project-built Fcitx and DTK artifacts before it writes desktop files.
 
   For each candidate call `scripts/create-runtime-env.sh` through an argv list, then call the new interpreter as `python -m fun_voice.backend_probe --backend <candidate> --models-root <root/models> --json`. Pass `PYTHONPATH=<project_root>/src`, `MODELSCOPE_CACHE=<root/models>`, and no user audio/text environment values. Parse only the closed `ProbeResult` JSON schema. In `auto`, record a fixed category and proceed on any failed candidate. In explicit mode, raise `InitializationError("selected backend failed")` after its one failure.
 
