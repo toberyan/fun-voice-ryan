@@ -27,3 +27,20 @@ target_link_libraries(overlay_protocol_test PRIVATE
     Qt6::Core
 )
 add_test(NAME overlay_protocol_test COMMAND overlay_protocol_test)
+
+add_executable(overlay_window_test
+    tests/window_test.cpp
+    src/overlay_window.cpp
+    src/overlay_window.h
+)
+target_link_libraries(overlay_window_test PRIVATE
+    fun-voice-overlay-protocol
+    Qt6::Gui
+    Qt6::Widgets
+    Dtk6::Gui
+    Dtk6::Widget
+)
+add_test(NAME overlay_window_test COMMAND overlay_window_test)
+set_tests_properties(overlay_window_test PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
