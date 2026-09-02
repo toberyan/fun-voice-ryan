@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Literal, Protocol
 
+from fun_voice.config import OverlayConfig
 from fun_voice.contracts import DaemonState
 
 OVERLAY_MAX_FRAME_BYTES = 64 * 1024
@@ -125,11 +126,13 @@ class DtkOverlayController:
         self,
         *,
         executable: Path | None = None,
+        layout: OverlayConfig | None = None,
         popen: OverlayPopen = _default_popen,
     ) -> None:
         self._executable = (
             default_overlay_executable() if executable is None else executable
         )
+        self._layout = OverlayConfig() if layout is None else layout
         self._popen = popen
         self._process: _OverlayProcess | None = None
         self._closed = False
@@ -178,7 +181,7 @@ class DtkOverlayController:
             return process
         self._process = None
         try:
-            process = self._popen([str(self._executable)])
+            process = self._popen(self._argv())
         except (OSError, RuntimeError):
             return None
         self._process = process
@@ -191,6 +194,17 @@ class DtkOverlayController:
                 daemon=True,
             ).start()
         return process
+
+    def _argv(self) -> list[str]:
+        return [
+            str(self._executable),
+            "--vertical-center-ratio",
+            str(self._layout.vertical_center_ratio),
+            "--width-px",
+            str(self._layout.width_px),
+            "--font-scale",
+            str(self._layout.font_scale),
+        ]
 
     def _write_or_discard_locked(self, process: _OverlayProcess, frame: bytes) -> None:
         if not self._write_frame(process, frame):

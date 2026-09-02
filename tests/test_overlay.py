@@ -6,6 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from fun_voice.config import OverlayConfig
 from fun_voice.contracts import DaemonState
 from fun_voice.overlay import (
     DtkOverlayController,
@@ -91,6 +92,31 @@ def test_dtk_controller_starts_lazily_and_writes_one_bounded_show_frame() -> Non
             "stable_text": "",
         }
     ]
+
+
+def test_dtk_controller_passes_validated_layout_without_transcript_in_argv() -> None:
+    argv: list[str] = []
+    process = FakeProcess()
+    controller = DtkOverlayController(
+        executable=Path("/native/fun-voice-overlay"),
+        layout=OverlayConfig(0.70, 680, 1.25),
+        popen=lambda value: argv.extend(value) or process,
+    )
+
+    controller.show(
+        OverlayModel(phase=DaemonState.RECORDING, stable_text="私密文本")
+    )
+
+    assert argv == [
+        "/native/fun-voice-overlay",
+        "--vertical-center-ratio",
+        "0.7",
+        "--width-px",
+        "680",
+        "--font-scale",
+        "1.25",
+    ]
+    assert "私密文本" not in argv
 
 
 def test_dtk_controller_clear_replaces_transient_text_with_a_text_free_command(

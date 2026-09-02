@@ -20,11 +20,13 @@ from fun_voice.config import (
     Config,
     ConfigError,
     InferenceConfig,
+    OverlayConfig,
     ResourcePolicy,
     build_runtime_paths,
     load_config,
     resolve_runtime_dir,
     validate_active_session_config,
+    validate_overlay_config,
 )
 
 
@@ -89,6 +91,7 @@ def test_config_defaults() -> None:
     assert cfg.inference.worker_failsafe_idle_seconds == 1800
     assert cfg.inference.allow_sensevoice_fallback is True
     assert cfg.active_session == ActiveSessionConfig()
+    assert cfg.overlay == OverlayConfig()
 
 
 def test_load_config_defaults_when_missing(tmp_path: Path) -> None:
@@ -149,6 +152,56 @@ def test_load_config_rejects_non_xpu_inference_device(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text('[inference]\ndevice = "cpu"\n', encoding="utf-8")
     with pytest.raises(ConfigError, match="xpu:0"):
+        load_config(path)
+
+
+def test_load_config_parses_overlay_layout(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[overlay]\nvertical_center_ratio = 0.85\nwidth_px = 900\nfont_scale = 1.2\n",
+        encoding="utf-8",
+    )
+
+    assert load_config(path).overlay == OverlayConfig(
+        vertical_center_ratio=0.85,
+        width_px=900,
+        font_scale=1.2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (OverlayConfig(vertical_center_ratio=0.49), "overlay.vertical_center_ratio"),
+        (OverlayConfig(vertical_center_ratio=0.86), "overlay.vertical_center_ratio"),
+        (OverlayConfig(width_px=419), "overlay.width_px"),
+        (OverlayConfig(width_px=1001), "overlay.width_px"),
+        (OverlayConfig(font_scale=0.79), "overlay.font_scale"),
+        (OverlayConfig(font_scale=1.81), "overlay.font_scale"),
+    ],
+)
+def test_overlay_config_rejects_out_of_range_values(
+    value: OverlayConfig, message: str
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        validate_overlay_config(value)
+
+
+@pytest.mark.parametrize(
+    ("toml", "message"),
+    [
+        ("width_px = true", "overlay.width_px"),
+        ('vertical_center_ratio = "low"', "overlay.vertical_center_ratio"),
+        ("font_scale = nan", "overlay.font_scale"),
+    ],
+)
+def test_load_config_rejects_invalid_overlay_field_types(
+    tmp_path: Path, toml: str, message: str
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(f"[overlay]\n{toml}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=message):
         load_config(path)
 
 

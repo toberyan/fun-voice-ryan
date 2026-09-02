@@ -1764,7 +1764,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     guard = X11FocusGuard()
     overlay: OverlayController = DtkOverlayController(
-        executable=default_overlay_executable()
+        executable=default_overlay_executable(),
+        layout=cfg.overlay,
     )
     nano_worker = SocketWorkerClient(
         paths.worker_socket,

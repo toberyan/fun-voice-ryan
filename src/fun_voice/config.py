@@ -8,6 +8,7 @@ current user, otherwise the caller must refuse to start.
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from collections.abc import Mapping
@@ -133,6 +134,15 @@ class EnhancedInferenceConfig:
 
 
 @dataclass(frozen=True)
+class OverlayConfig:
+    """Validated geometry and typography for the transient native overlay."""
+
+    vertical_center_ratio: float = 0.70
+    width_px: int = 680
+    font_scale: float = 1.0
+
+
+@dataclass(frozen=True)
 class Config:
     """Typed application configuration with safe defaults.
 
@@ -149,6 +159,7 @@ class Config:
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     active_session: ActiveSessionConfig = field(default_factory=ActiveSessionConfig)
     enhanced: EnhancedInferenceConfig = field(default_factory=EnhancedInferenceConfig)
+    overlay: OverlayConfig = field(default_factory=OverlayConfig)
 
 
 @dataclass(frozen=True)
@@ -258,6 +269,18 @@ def _float(value: object, default: float) -> float:
     return default
 
 
+def _finite_float(value: object, *, key: str, default: float) -> float:
+    """Return one configured finite float, rejecting malformed known keys."""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{key} must be a finite number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ConfigError(f"{key} must be a finite number")
+    return parsed
+
+
 def _positive_int(value: object, *, key: str, default: int) -> int:
     """Return a configured positive integer, rejecting invalid known keys."""
     if value is None:
@@ -358,6 +381,19 @@ def validate_enhanced_inference_config(
     return replace(value, correction_protected_terms=protected_terms)
 
 
+def validate_overlay_config(value: OverlayConfig) -> OverlayConfig:
+    """Reject layouts that can obscure the desktop or make text unreadable."""
+    if not 0.50 <= value.vertical_center_ratio <= 0.85:
+        raise ConfigError(
+            "overlay.vertical_center_ratio must be in [0.50, 0.85]"
+        )
+    if not 420 <= value.width_px <= 1000:
+        raise ConfigError("overlay.width_px must be in [420, 1000]")
+    if not math.isfinite(value.font_scale) or not 0.80 <= value.font_scale <= 1.80:
+        raise ConfigError("overlay.font_scale must be in [0.80, 1.80]")
+    return value
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Load the single TOML configuration, or return the safe defaults.
 
@@ -384,6 +420,7 @@ def load_config(path: str | Path | None = None) -> Config:
     enhanced = _table(raw.get("enhanced"))
     correction = _table(raw.get("correction"))
     speaker_identity = _table(raw.get("speaker_identity"))
+    overlay = _table(raw.get("overlay"))
 
     configured_failsafe = inference.get("worker_failsafe_idle_seconds")
     if configured_failsafe is None and "idle_unload_seconds" in inference:
@@ -480,6 +517,25 @@ def load_config(path: str | Path | None = None) -> Config:
             identity_device=_str(speaker_identity.get("device"), XPU_DEVICE),
         )
     )
+    overlay_config = validate_overlay_config(
+        OverlayConfig(
+            vertical_center_ratio=_finite_float(
+                overlay.get("vertical_center_ratio"),
+                key="overlay.vertical_center_ratio",
+                default=0.70,
+            ),
+            width_px=_positive_int(
+                overlay.get("width_px"),
+                key="overlay.width_px",
+                default=680,
+            ),
+            font_scale=_finite_float(
+                overlay.get("font_scale"),
+                key="overlay.font_scale",
+                default=1.0,
+            ),
+        )
+    )
     return Config(
         audio_source=_str(audio.get("source"), "default"),
         fcitx_commit_timeout_ms=_positive_int(
@@ -493,4 +549,5 @@ def load_config(path: str | Path | None = None) -> Config:
         inference=inference_config,
         active_session=active_config,
         enhanced=enhanced_config,
+        overlay=overlay_config,
     )
