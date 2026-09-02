@@ -34,6 +34,8 @@ from fun_voice.runtime_selection import (
 
 DAEMON_DIAGNOSTICS_TIMEOUT_SECONDS = 1.0
 WORKER_SYSTEMD_TIMEOUT_SECONDS = 1.0
+WORKER_HEALTH_TIMEOUT_SECONDS = 5.0
+WORKER_HEALTH_MAX_BYTES = 64 * 1024
 
 # Check names in report order (stable, used by tests and the human view).
 CHECK_NAMES_SELFTEST: tuple[str, ...] = (
@@ -248,6 +250,69 @@ def check_xtest_eligibility(
 # --- Worker / selected-runtime checks ---------------------------------------
 
 
+def _selected_worker_socket_path(
+    profile: AsrProfile, *, runtime_dir: str | None = None
+) -> Path | None:
+    """Return the selected profile's socket below the private runtime root."""
+    xdg = runtime_dir if runtime_dir is not None else get_xdg_runtime_dir()
+    if not xdg:
+        return None
+    socket_name = "worker.sock" if profile == "nano" else "worker-sensevoice.sock"
+    return Path(xdg) / "fun-voice-ryan" / socket_name
+
+
+def probe_selected_worker_health(
+    socket_path: Path | None,
+    *,
+    timeout: float = WORKER_HEALTH_TIMEOUT_SECONDS,
+) -> CheckResult:
+    """Probe one selected worker without imposing the XPU POC health gate."""
+    if socket_path is None:
+        return CheckResult(
+            "worker_health", STATUS_FAIL, {"reason": "runtime unavailable"}
+        )
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(str(socket_path))
+            conn.sendall(b'{"op":"health"}\n')
+            data = bytearray()
+            while b"\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > WORKER_HEALTH_MAX_BYTES:
+                    raise RuntimeError("worker health response too large")
+        line, _separator, _rest = bytes(data).partition(b"\n")
+        response = json.loads(line.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - health failures are self-test data
+        return CheckResult(
+            "worker_health", STATUS_FAIL, {"error_class": type(exc).__name__}
+        )
+    if not isinstance(response, dict):
+        return CheckResult(
+            "worker_health", STATUS_FAIL, {"error_class": "ProtocolError"}
+        )
+    lifecycle_value = response.get("lifecycle")
+    lifecycle = (
+        lifecycle_value
+        if lifecycle_value in {"loading", "ready", "inactive", "failed"}
+        else "unknown"
+    )
+    model_ready = response.get("model_ready") is True
+    ok = (
+        response.get("status") == "ok"
+        and model_ready
+        and lifecycle == "ready"
+    )
+    return CheckResult(
+        "worker_health",
+        STATUS_PASS if ok else STATUS_FAIL,
+        {"model_ready": model_ready, "lifecycle": lifecycle},
+    )
+
+
 def probe_worker_unit_state(profile: str) -> tuple[str, str] | None:
     """Return the loaded systemd unit's ``(LoadState, ActiveState)``.
 
@@ -325,6 +390,44 @@ def check_worker_health(
     return SelfTestResult("worker_health", probe.status, probe.detail)
 
 
+def _check_selected_worker_health(
+    results: dict[AsrProfile, CheckResult],
+    *,
+    profiles: tuple[AsrProfile] | tuple[AsrProfile, AsrProfile],
+    worker_state_probe: Callable[[str], tuple[str, str] | None],
+) -> SelfTestResult:
+    """Require each selected profile to be ready or explicitly on-demand idle."""
+    statuses: dict[AsrProfile, str] = {}
+    missing_profiles: list[AsrProfile] = []
+    for profile in profiles:
+        result = results[profile]
+        if result.status == STATUS_PASS:
+            statuses[profile] = "ready"
+        elif result.detail.get("error_class") == "FileNotFoundError":
+            missing_profiles.append(profile)
+        else:
+            statuses[profile] = "unavailable"
+
+    for profile in missing_profiles:
+        try:
+            state = worker_state_probe(profile)
+        except Exception:  # noqa: BLE001 - self-test must fail closed on probe errors
+            state = None
+        statuses[profile] = (
+            "inactive" if state == ("loaded", "inactive") else "unavailable"
+        )
+
+    return SelfTestResult(
+        "worker_health",
+        (
+            STATUS_PASS
+            if all(value != "unavailable" for value in statuses.values())
+            else STATUS_FAIL
+        ),
+        {"profiles": statuses},
+    )
+
+
 def check_runtime_selection(
     loader: Callable[[], RuntimeSelection] = load_runtime_selection,
 ) -> SelfTestResult:
@@ -352,7 +455,7 @@ def check_runtime_selection(
 def run_selftest(
     *,
     fcitx_client: FcitxClient | None = None,
-    worker_probe: Callable[[], CheckResult] = probe_worker_health,
+    worker_probe: Callable[[Path | None], CheckResult] = probe_selected_worker_health,
     worker_state_probe: Callable[[str], tuple[str, str] | None] = (
         probe_worker_unit_state
     ),
@@ -370,17 +473,25 @@ def run_selftest(
     runtime_check = check_runtime_selection(
         (lambda: selection) if selection is not None else selection_loader
     )
-    worker_check = (
-        check_worker_health(
-            worker_probe(),
-            profiles=selection.policy().allowed_profiles,
-            worker_state_probe=worker_state_probe,
-        )
-        if selection is not None
-        else SelfTestResult(
+    if selection is None:
+        worker_check = SelfTestResult(
             "worker_health", STATUS_FAIL, {"reason": "invalid_or_missing"}
         )
-    )
+    else:
+        profiles = selection.policy().allowed_profiles
+        results: dict[AsrProfile, CheckResult] = {}
+        for profile in profiles:
+            try:
+                results[profile] = worker_probe(
+                    _selected_worker_socket_path(profile, runtime_dir=runtime_dir)
+                )
+            except Exception as exc:  # noqa: BLE001 - injectable probes fail closed
+                results[profile] = CheckResult(
+                    "worker_health", STATUS_FAIL, {"error_class": type(exc).__name__}
+                )
+        worker_check = _check_selected_worker_health(
+            results, profiles=profiles, worker_state_probe=worker_state_probe
+        )
     checks: list[SelfTestResult] = [
         check_x11_hotkey(hotkey_probe),
         check_pipewire(which=which, runtime_dir=runtime_dir),

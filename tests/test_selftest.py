@@ -300,7 +300,7 @@ def test_cpu_selftest_requests_health_for_sensevoice_only() -> None:
 
     report = run_selftest(
         fcitx_client=_FakeFcitx(pong=True),  # type: ignore[arg-type]
-        worker_probe=lambda: missing_socket,
+        worker_probe=lambda _path: missing_socket,
         worker_state_probe=lambda profile: observed_profiles.append(profile)
         or ("loaded", "inactive"),
         which=lambda name: "/usr/bin/" + name,
@@ -322,6 +322,99 @@ def test_cpu_selftest_requests_health_for_sensevoice_only() -> None:
     }
 
 
+def test_cpu_selftest_passes_an_active_sensevoice_socket_only(tmp_path: Path) -> None:
+    observed_paths: list[Path] = []
+
+    def worker_probe(socket_path: Path) -> CheckResult:
+        observed_paths.append(socket_path)
+        return CheckResult(
+            "worker_health", STATUS_PASS, {"model_ready": True, "lifecycle": "ready"}
+        )
+
+    report = run_selftest(
+        fcitx_client=_FakeFcitx(pong=True),  # type: ignore[arg-type]
+        worker_probe=worker_probe,
+        which=lambda name: "/usr/bin/" + name,
+        runtime_dir=str(tmp_path),
+        make_display=lambda: _FakeDisplay(present=1),
+        hotkey_probe=lambda: {"hotkey_registered": True, "hotkey_press_seen": True},
+        selection_loader=lambda: _selection("cpu"),
+    )
+
+    worker = next(check for check in report.checks if check.name == "worker_health")
+    assert worker.status == STATUS_PASS
+    assert observed_paths == [
+        tmp_path / "fun-voice-ryan" / "worker-sensevoice.sock"
+    ]
+
+
+def test_selected_worker_health_accepts_cpu_ready_without_an_xpu_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = json.dumps(
+        {
+            "status": "ok",
+            "model_ready": True,
+            "xpu_ready": False,
+            "lifecycle": "ready",
+        }
+    ).encode("utf-8") + b"\n"
+
+    class _FakeSocket:
+        def __enter__(self) -> _FakeSocket:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def settimeout(self, timeout: float) -> None:
+            return None
+
+        def connect(self, path: str) -> None:
+            return None
+
+        def sendall(self, data: bytes) -> None:
+            assert data == b'{"op":"health"}\n'
+
+        def recv(self, size: int) -> bytes:
+            return payload
+
+    monkeypatch.setattr(selftest.socket, "socket", lambda *_args: _FakeSocket())
+
+    result = selftest.probe_selected_worker_health(Path("/runtime/sense.sock"))
+
+    assert result.status == STATUS_PASS
+    assert result.detail == {"model_ready": True, "lifecycle": "ready"}
+
+
+def test_cpu_selftest_does_not_accept_a_stale_nano_socket(tmp_path: Path) -> None:
+    observed_paths: list[Path] = []
+
+    def worker_probe(socket_path: Path) -> CheckResult:
+        observed_paths.append(socket_path)
+        return CheckResult(
+            "worker_health",
+            STATUS_PASS if socket_path.name == "worker.sock" else STATUS_FAIL,
+            {"model_ready": socket_path.name == "worker.sock"},
+        )
+
+    report = run_selftest(
+        fcitx_client=_FakeFcitx(pong=True),  # type: ignore[arg-type]
+        worker_probe=worker_probe,
+        which=lambda name: "/usr/bin/" + name,
+        runtime_dir=str(tmp_path),
+        make_display=lambda: _FakeDisplay(present=1),
+        hotkey_probe=lambda: {"hotkey_registered": True, "hotkey_press_seen": True},
+        selection_loader=lambda: _selection("cpu"),
+    )
+
+    worker = next(check for check in report.checks if check.name == "worker_health")
+    assert worker.status == STATUS_FAIL
+    assert observed_paths == [
+        tmp_path / "fun-voice-ryan" / "worker-sensevoice.sock"
+    ]
+
+
 def test_invalid_runtime_manifest_fails_runtime_selection_not_xpu_gate() -> None:
     result = check_runtime_selection(
         lambda: (_ for _ in ()).throw(RuntimeSelectionError("unsafe manifest"))
@@ -339,7 +432,7 @@ def test_invalid_runtime_manifest_fails_runtime_selection_not_xpu_gate() -> None
 def _all_pass_report() -> SelfTestReport:
     return run_selftest(
         fcitx_client=_FakeFcitx(pong=True),  # type: ignore[arg-type]
-        worker_probe=lambda: CheckResult("worker_health", STATUS_PASS, {}),
+        worker_probe=lambda _path: CheckResult("worker_health", STATUS_PASS, {}),
         which=lambda name: "/usr/bin/" + name,
         runtime_dir=None,
         make_display=lambda: _FakeDisplay(present=1),
@@ -355,7 +448,7 @@ def test_report_ok_when_all_pass() -> None:
 def test_report_not_ok_when_x11_hotkey_not_seen() -> None:
     report = run_selftest(
         fcitx_client=_FakeFcitx(pong=True),  # type: ignore[arg-type]
-        worker_probe=lambda: CheckResult("worker_health", STATUS_PASS, {}),
+        worker_probe=lambda _path: CheckResult("worker_health", STATUS_PASS, {}),
         which=lambda name: "/usr/bin/" + name,
         runtime_dir=None,
         make_display=lambda: _FakeDisplay(present=1),

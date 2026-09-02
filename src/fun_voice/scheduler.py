@@ -29,6 +29,7 @@ class ModelLifecycle(StrEnum):
     READY = "ready"
     INACTIVE = "inactive"
     FAILED = "failed"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +126,7 @@ class ModelScheduler:
         self._health_profile = (
             health_profile
             if health_profile is not None
-            else lambda _p: ModelLifecycle.FAILED
+            else lambda _p: ModelLifecycle.UNKNOWN
         )
         self._condition = threading.Condition()
         self._pending: list[_PendingTask] = []
@@ -192,11 +193,11 @@ class ModelScheduler:
             for candidate in (profile, other):
                 # Always ask the producing profile to release: its process can
                 # have outlived our local state. A second profile is released
-                # whenever the scheduler has observed it load or become ready.
+                # whenever the scheduler has observed anything other than a
+                # confirmed inactive state.
                 needs_release = (
                     candidate == profile
-                    or self._profile_states[candidate]
-                    in {ModelLifecycle.LOADING, ModelLifecycle.READY}
+                    or self._profile_states[candidate] is not ModelLifecycle.INACTIVE
                 )
                 try:
                     if needs_release:

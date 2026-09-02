@@ -942,7 +942,8 @@ def test_worker_client_fails_closed_for_an_unknown_health_lifecycle(
         },
     )
     try:
-        assert SocketWorkerClient(path, timeout=1.0).health().lifecycle == "failed"
+        with pytest.raises(WorkerError):
+            SocketWorkerClient(path, timeout=1.0).health()
     finally:
         server.close()
 

@@ -10,6 +10,7 @@ on every path.
 from __future__ import annotations
 
 import signal
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -31,6 +32,7 @@ from fun_voice.contracts import (
     ErrorCode,
     FocusSnapshot,
     PreloadTiming,
+    SessionKey,
     Transcription,
     WorkerHealth,
 )
@@ -403,12 +405,14 @@ class _PolicyWorker(FakeWorker):
 
 
 def _recording_worker_factory(
-    created_profiles: list[str], worker: _PolicyWorker
+    created_workers: list[tuple[str, Path]], worker: _PolicyWorker
 ) -> Callable[..., _PolicyWorker]:
     def factory(*_args: object, **kwargs: object) -> _PolicyWorker:
         profile = kwargs.get("profile")
+        socket_path = kwargs.get("socket_path")
         assert isinstance(profile, str)
-        created_profiles.append(profile)
+        assert isinstance(socket_path, Path)
+        created_workers.append((profile, socket_path))
         return worker
 
     return factory
@@ -444,12 +448,12 @@ def _must_not_construct(*_args: object, **_kwargs: object) -> object:
 def test_daemon_cpu_registers_only_sensevoice_and_never_constructs_qwen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created_profiles: list[str] = []
+    created_workers: list[tuple[str, Path]] = []
     worker = _PolicyWorker()
     monkeypatch.setattr(
         daemon_mod,
         "SocketWorkerClient",
-        _recording_worker_factory(created_profiles, worker),
+        _recording_worker_factory(created_workers, worker),
     )
     monkeypatch.setattr(daemon_mod, "OnDemandQwenCorrector", _must_not_construct)
 
@@ -457,7 +461,9 @@ def test_daemon_cpu_registers_only_sensevoice_and_never_constructs_qwen(
         _daemon_dependencies(FakeFcitx()), selection=_cpu_selection()
     )
     try:
-        assert created_profiles == ["sensevoice"]
+        assert created_workers == [
+            ("sensevoice", Path("/runtime/worker-sensevoice.sock"))
+        ]
         assert daemon._fallback_worker is None  # noqa: SLF001 - policy boundary
         assert daemon._corrector is None  # noqa: SLF001 - policy boundary
     finally:
@@ -467,13 +473,13 @@ def test_daemon_cpu_registers_only_sensevoice_and_never_constructs_qwen(
 def test_cpu_asr_commits_raw_text_without_correction_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created_profiles: list[str] = []
+    created_workers: list[tuple[str, Path]] = []
     worker = _PolicyWorker(text="get commit")
     fcitx = FakeFcitx()
     monkeypatch.setattr(
         daemon_mod,
         "SocketWorkerClient",
-        _recording_worker_factory(created_profiles, worker),
+        _recording_worker_factory(created_workers, worker),
     )
     monkeypatch.setattr(daemon_mod, "OnDemandQwenCorrector", _must_not_construct)
 
@@ -484,7 +490,29 @@ def test_cpu_asr_commits_raw_text_without_correction_spawn(
         assert daemon.start_if_idle() == "started"
         daemon.stop()
         assert fcitx.commits == [("tok-123", "get commit")]
-        assert created_profiles == ["sensevoice"]
+        assert [profile for profile, _path in created_workers] == ["sensevoice"]
+    finally:
+        daemon.shutdown()
+
+
+def test_daemon_accelerator_uses_distinct_nano_and_sensevoice_sockets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_workers: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        daemon_mod,
+        "SocketWorkerClient",
+        _recording_worker_factory(created_workers, _PolicyWorker()),
+    )
+
+    daemon = daemon_mod.build_voice_daemon(
+        _daemon_dependencies(FakeFcitx()), selection=_accelerator_selection()
+    )
+    try:
+        assert created_workers == [
+            ("nano", Path("/runtime/worker.sock")),
+            ("sensevoice", Path("/runtime/worker-sensevoice.sock")),
+        ]
     finally:
         daemon.shutdown()
 
@@ -654,6 +682,66 @@ def test_worker_stop_confirms_inactive_before_qwen(
             "fun-voice-worker@nano.service",
         ],
     ]
+
+
+@pytest.mark.parametrize("health_failure", ["timeout", "nonzero", "unknown"])
+def test_uncertain_worker_health_denies_qwen_after_asr_release(
+    monkeypatch: pytest.MonkeyPatch, health_failure: str
+) -> None:
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        if health_failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 5.0)
+        if health_failure == "nonzero":
+            return SimpleNamespace(returncode=1, stdout="")
+        return SimpleNamespace(returncode=0, stdout="unrecognized\n")
+
+    monkeypatch.setattr(daemon_mod.subprocess, "run", run)
+    scheduler = ModelScheduler(
+        stop_profile=lambda _profile: True,
+        health_profile=lambda profile: daemon_mod.default_health_worker_profile(
+            profile, selection=_accelerator_selection()
+        ),
+    )
+    key = SessionKey(session_id="health-uncertain", generation=1)
+    scheduler.activate(key)
+    qwen_calls: list[str] = []
+    try:
+        task = scheduler.run_correction(
+            key, "nano", lambda: qwen_calls.append("qwen")
+        )
+        assert task.wait(timeout=1.0)
+        assert qwen_calls == []
+        assert getattr(task.result(), "permitted", None) is False
+    finally:
+        scheduler.close()
+
+
+def test_confirmed_failed_worker_allows_qwen_after_asr_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        daemon_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="failed\n"),
+    )
+    scheduler = ModelScheduler(
+        stop_profile=lambda _profile: True,
+        health_profile=lambda profile: daemon_mod.default_health_worker_profile(
+            profile, selection=_accelerator_selection()
+        ),
+    )
+    key = SessionKey(session_id="health-confirmed-failed", generation=1)
+    scheduler.activate(key)
+    qwen_calls: list[str] = []
+    try:
+        task = scheduler.run_correction(
+            key, "nano", lambda: qwen_calls.append("qwen")
+        )
+        assert task.wait(timeout=1.0)
+        assert qwen_calls == ["qwen"]
+        assert getattr(task.result(), "permitted", None) is True
+    finally:
+        scheduler.close()
 
 
 def test_systemd_profile_supervisor_confirms_worker_health_after_stop() -> None:

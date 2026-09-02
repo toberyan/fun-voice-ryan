@@ -224,15 +224,19 @@ def generate_enveloped_correction(
         raise CorrectionError("correction.input_too_large")
     if inference.correction_model != MODEL_ID:
         raise CorrectionError("correction.model_load")
+    if selection.dtype not in {"float32", "bf16", "fp16"}:
+        raise CorrectionError("correction.device")
     model: Any | None = None
     model_load_started = time.perf_counter()
     try:
         import torch
         from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
-        torch_dtype = (
-            torch.float32 if selection.dtype == "float32" else torch.bfloat16
-        )
+        torch_dtype = {
+            "float32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }[selection.dtype]
         loaded_model: Any = Qwen3_5ForConditionalGeneration.from_pretrained(
             str(qwen_snapshot_dir()), torch_dtype=torch_dtype
         )

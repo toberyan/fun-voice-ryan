@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,20 +16,21 @@ from fun_voice.corrector import (
     DEFAULT_TIMEOUT_SECONDS,
     CorrectionError,
     OnDemandQwenCorrector,
+    generate_enveloped_correction,
     parse_correction_output,
     validate_correction,
 )
 from fun_voice.runtime_selection import RuntimeSelection
 
 
-def _selection(backend: str = "xpu") -> RuntimeSelection:
+def _selection(backend: str = "xpu", *, dtype: str | None = None) -> RuntimeSelection:
     is_cpu = backend == "cpu"
     return RuntimeSelection(
         schema_version=1,
         backend=backend,  # type: ignore[arg-type]
         python=Path(f"/runtime/{backend}/bin/python"),
         device="cpu" if is_cpu else f"{backend}:0",
-        dtype="float32" if is_cpu else "bf16",
+        dtype=dtype if dtype is not None else "float32" if is_cpu else "bf16",
         primary_asr_profile="sensevoice" if is_cpu else "nano",
         fallback_asr_profile=None if is_cpu else "sensevoice",
         enhanced_enabled=not is_cpu,
@@ -194,3 +198,70 @@ def test_corrector_refuses_cpu_selection_before_subprocess() -> None:
     with pytest.raises(CorrectionError, match="disabled_by_runtime_policy"):
         corrector.correct("get commit")
     assert runner_calls == []
+
+
+@pytest.mark.parametrize(
+    ("dtype", "torch_dtype_name"),
+    [("float32", "float32"), ("bf16", "bfloat16"), ("fp16", "float16")],
+)
+def test_generate_maps_selected_dtype_before_model_load(
+    monkeypatch: pytest.MonkeyPatch, dtype: str, torch_dtype_name: str
+) -> None:
+    observed_dtypes: list[object] = []
+    fake_torch = SimpleNamespace(
+        float32=object(), bfloat16=object(), float16=object()
+    )
+
+    class _FakeQwen:
+        @staticmethod
+        def from_pretrained(_path: str, *, torch_dtype: object) -> object:
+            observed_dtypes.append(torch_dtype)
+            raise RuntimeError("model unavailable")
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoProcessor=object, Qwen3_5ForConditionalGeneration=_FakeQwen
+        ),
+    )
+
+    with pytest.raises(CorrectionError, match="correction.model_load"):
+        generate_enveloped_correction(
+            "get commit",
+            inference=config.EnhancedInferenceConfig(),
+            selection=_selection("cuda", dtype=dtype),
+        )
+
+    assert observed_dtypes == [getattr(fake_torch, torch_dtype_name)]
+
+
+def test_generate_rejects_unknown_selection_dtype_before_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_loads: list[object] = []
+
+    class _FakeQwen:
+        @staticmethod
+        def from_pretrained(*_args: object, **_kwargs: object) -> object:
+            model_loads.append(object())
+            raise RuntimeError("model unavailable")
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16=object()))
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoProcessor=object, Qwen3_5ForConditionalGeneration=_FakeQwen
+        ),
+    )
+
+    with pytest.raises(CorrectionError, match="correction.device"):
+        generate_enveloped_correction(
+            "get commit",
+            inference=config.EnhancedInferenceConfig(),
+            selection=replace(_selection("cuda"), dtype="float64"),
+        )
+
+    assert model_loads == []

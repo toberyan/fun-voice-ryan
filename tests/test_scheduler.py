@@ -216,6 +216,34 @@ def test_correction_is_denied_when_another_asr_profile_remains_active() -> None:
     scheduler.close()
 
 
+def test_correction_rechecks_an_observed_failed_asr_profile() -> None:
+    stopped: list[str] = []
+    ran: list[str] = []
+    scheduler = ModelScheduler(
+        start_profile=lambda _profile: True,
+        stop_profile=lambda profile: stopped.append(profile) or True,
+        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    failed_asr = scheduler.run_asr(
+        key, "nano", lambda: (_ for _ in ()).throw(RuntimeError("ASR failed"))
+    )
+    assert failed_asr.wait(timeout=1.0)
+    with pytest.raises(RuntimeError, match="ASR failed"):
+        failed_asr.result()
+
+    correction = scheduler.run_correction(
+        key, "sensevoice", lambda: ran.append("qwen")
+    )
+
+    assert correction.wait(timeout=1.0)
+    assert stopped == ["sensevoice", "nano"]
+    assert ran == ["qwen"]
+    scheduler.close()
+
+
 def test_task_handle_returns_value_or_reraises_owner_error() -> None:
     scheduler = ModelScheduler()
     key = _key()

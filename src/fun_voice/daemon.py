@@ -306,7 +306,7 @@ class SystemdModelProfileSupervisor:
             return (
                 ModelLifecycle.INACTIVE
                 if self._confirmed_inactive[profile]
-                else ModelLifecycle.FAILED
+                else ModelLifecycle.UNKNOWN
             )
         try:
             lifecycle = ModelLifecycle(worker.health().lifecycle)
@@ -314,7 +314,7 @@ class SystemdModelProfileSupervisor:
             return (
                 ModelLifecycle.INACTIVE
                 if self._confirmed_inactive[profile]
-                else ModelLifecycle.FAILED
+                else ModelLifecycle.UNKNOWN
             )
         if lifecycle in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
             self._confirmed_inactive[profile] = True
@@ -524,9 +524,9 @@ def default_health_worker_profile(
             text=True,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return ModelLifecycle.FAILED
+        return ModelLifecycle.UNKNOWN
     if result.returncode != 0:
-        return ModelLifecycle.FAILED
+        return ModelLifecycle.UNKNOWN
     state = result.stdout.strip()
     if state == "inactive":
         return ModelLifecycle.INACTIVE
@@ -536,7 +536,7 @@ def default_health_worker_profile(
         return ModelLifecycle.READY
     if state in {"activating", "deactivating"}:
         return ModelLifecycle.LOADING
-    return ModelLifecycle.FAILED
+    return ModelLifecycle.UNKNOWN
 
 
 class SocketWorkerClient:
@@ -613,10 +613,10 @@ class SocketWorkerClient:
         if response.get("status") != "ok":
             raise WorkerError(_parse_error_code(response.get("error_code")))
         lifecycle_value = response.get("lifecycle")
-        lifecycle: Literal["loading", "ready", "inactive", "failed"] = (
-            lifecycle_value
-            if lifecycle_value in {"loading", "ready", "inactive", "failed"}
-            else "failed"
+        if lifecycle_value not in {"loading", "ready", "inactive", "failed"}:
+            raise WorkerError(ErrorCode("worker", "protocol"))
+        lifecycle: Literal["loading", "ready", "inactive", "failed"] = cast(
+            Literal["loading", "ready", "inactive", "failed"], lifecycle_value
         )
         device = response.get("device")
         error_value = response.get("last_error")
@@ -1818,14 +1818,18 @@ def build_voice_daemon(
     effective = config.effective_runtime_config(user, selection)
     primary = SocketWorkerClient(
         profile=effective.primary_asr_profile,
-        socket_path=dependencies.paths.worker_socket,
+        socket_path=_worker_socket_path(
+            dependencies.paths, effective.primary_asr_profile
+        ),
         start_service=dependencies.start_worker_service,
         stop_service=dependencies.stop_worker_service,
     )
     fallback = (
         SocketWorkerClient(
             profile=effective.fallback_asr_profile,
-            socket_path=dependencies.paths.worker_socket,
+            socket_path=_worker_socket_path(
+                dependencies.paths, effective.fallback_asr_profile
+            ),
             start_service=dependencies.start_worker_service,
             stop_service=dependencies.stop_worker_service,
         )
@@ -1860,6 +1864,15 @@ def build_voice_daemon(
         auto_stop_event=dependencies.auto_stop_event,
         capture_config=dependencies.capture_config,
     )
+
+
+def _worker_socket_path(
+    paths: config.RuntimePaths, profile: AsrProfile
+) -> Path:
+    """Return the private socket owned by one selected ASR profile."""
+    if profile == "nano":
+        return paths.worker_socket
+    return paths.runtime_dir / "worker-sensevoice.sock"
 
 
 # --- CLI ---------------------------------------------------------------------
