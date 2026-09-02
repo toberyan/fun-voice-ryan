@@ -160,6 +160,14 @@ def _stat(path: Path) -> os.stat_result:
         raise RuntimeSelectionError("cannot inspect runtime selection") from exc
 
 
+def _lstat(path: Path) -> os.stat_result:
+    """Inspect one path without following an unsafe symlink."""
+    try:
+        return path.lstat()
+    except OSError as exc:
+        raise RuntimeSelectionError("selected interpreter is unsafe") from exc
+
+
 def _check_private_directory(path: Path) -> None:
     if path.is_symlink():
         raise RuntimeSelectionError("runtime selection directory is unsafe")
@@ -215,15 +223,48 @@ def _validate_python_path(selection: RuntimeSelection, root: Path) -> None:
         raise RuntimeSelectionError("selected interpreter is unsafe") from exc
 
     if (
-        resolved_python in (resolved_root, allowed_root)
+        selection.python != resolved_python
+        or resolved_python in (resolved_root, allowed_root)
         or not resolved_python.is_relative_to(allowed_root)
-        or not resolved_python.is_file()
-        or not os.access(resolved_python, os.X_OK)
+    ):
+        raise RuntimeSelectionError("selected interpreter is unsafe")
+
+    relative_path = resolved_python.relative_to(allowed_root)
+    components = [allowed_root]
+    components.extend(
+        allowed_root.joinpath(*relative_path.parts[:index])
+        for index in range(1, len(relative_path.parts) + 1)
+    )
+    for component in components[:-1]:
+        _validate_runtime_directory(component)
+    _validate_runtime_interpreter(components[-1])
+
+
+def _validate_runtime_directory(path: Path) -> None:
+    details = _lstat(path)
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != _current_uid()
+        or details.st_mode & 0o022
     ):
         raise RuntimeSelectionError("selected interpreter is unsafe")
 
 
-def _validate_common_fields(selection: RuntimeSelection) -> None:
+def _validate_runtime_interpreter(path: Path) -> None:
+    details = _lstat(path)
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISREG(details.st_mode)
+        or details.st_uid != _current_uid()
+        or details.st_mode & 0o022
+        or not details.st_mode & 0o111
+        or not os.access(path, os.X_OK)
+    ):
+        raise RuntimeSelectionError("selected interpreter is unsafe")
+
+
+def _validate_common_fields(selection: RuntimeSelection) -> frozenset[str]:
     if (
         type(selection.schema_version) is not int
         or selection.schema_version != SELECTION_SCHEMA_VERSION
@@ -235,27 +276,41 @@ def _validate_common_fields(selection: RuntimeSelection) -> None:
     if (
         type(selection.enhanced_enabled) is not bool
         or type(selection.speaker_enabled) is not bool
+        or not isinstance(selection.backend, str)
         or selection.backend not in {"cuda", "xpu", "cpu"}
         or not isinstance(selection.device, str)
         or not isinstance(selection.dtype, str)
+        or not isinstance(selection.primary_asr_profile, str)
         or selection.primary_asr_profile not in {"nano", "sensevoice"}
-        or selection.fallback_asr_profile not in {None, "nano", "sensevoice"}
+        or not (
+            selection.fallback_asr_profile is None
+            or (
+                isinstance(selection.fallback_asr_profile, str)
+                and selection.fallback_asr_profile in {"nano", "sensevoice"}
+            )
+        )
     ):
         raise RuntimeSelectionError("invalid runtime selection schema")
 
     revisions = selection.model_revisions
+    if not isinstance(revisions, Mapping):
+        raise RuntimeSelectionError("invalid runtime model revisions")
+    try:
+        items = tuple(revisions.items())
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeSelectionError("invalid runtime model revisions") from exc
     if not all(
         isinstance(name, str) and _safe_revision(revision)
-        for name, revision in revisions.items()
+        for name, revision in items
     ):
         raise RuntimeSelectionError("invalid runtime model revisions")
+    return frozenset(name for name, _ in items)
 
 
 def _validate_selection(selection: RuntimeSelection, root: Path) -> None:
     """Reject all selection states outside the fixed deployment policy."""
-    _validate_common_fields(selection)
+    model_names = _validate_common_fields(selection)
     _validate_python_path(selection, root)
-    model_names = frozenset(selection.model_revisions)
 
     if selection.backend == "cpu":
         if (

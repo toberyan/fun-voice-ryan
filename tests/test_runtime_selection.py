@@ -25,6 +25,8 @@ from fun_voice.runtime_selection import (
 def _selection(root: Path, backend: str = "cpu") -> RuntimeSelection:
     python = root / "runtimes" / backend / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
+    for component in (root / "runtimes", root / "runtimes" / backend, python.parent):
+        component.chmod(0o755)
     python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     python.chmod(0o700)
     if backend == "cpu":
@@ -122,6 +124,116 @@ def test_selection_rejects_unsafe_interpreter_or_cpu_policy(
 
     with pytest.raises(RuntimeSelectionError):
         write_runtime_selection(mutate(_selection(root), root), root)
+
+
+@pytest.mark.parametrize(
+    ("unsafe_path", "mode"),
+    [
+        ("runtimes/cpu/bin", 0o775),
+        ("runtimes/cpu/bin/python", 0o722),
+        ("runtimes/cpu/bin/python", 0o600),
+    ],
+)
+def test_selection_rejects_unsafe_runtime_path_modes_without_leaking_paths(
+    tmp_path: Path, unsafe_path: str, mode: int
+) -> None:
+    root = tmp_path / "data"
+    selection = _selection(root)
+    _write_valid_selection(root)
+    (root / unsafe_path).chmod(mode)
+
+    with pytest.raises(RuntimeSelectionError) as error:
+        write_runtime_selection(selection, root)
+
+    assert str(root) not in str(error.value)
+    with pytest.raises(RuntimeSelectionError) as error:
+        load_runtime_selection(root)
+
+    assert str(root) not in str(error.value)
+
+
+def test_selection_rejects_unowned_interpreter_without_leaking_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    selection = _selection(root)
+    _write_valid_selection(root)
+    original_lstat = Path.lstat
+
+    def _unowned_lstat(path: Path) -> os.stat_result:
+        details = original_lstat(path)
+        if path == selection.python:
+            return os.stat_result(
+                (
+                    details.st_mode,
+                    details.st_ino,
+                    details.st_dev,
+                    details.st_nlink,
+                    details.st_uid + 1,
+                    details.st_gid,
+                    details.st_size,
+                    details.st_atime,
+                    details.st_mtime,
+                    details.st_ctime,
+                )
+            )
+        return details
+
+    monkeypatch.setattr(Path, "lstat", _unowned_lstat)
+
+    with pytest.raises(RuntimeSelectionError) as error:
+        write_runtime_selection(selection, root)
+
+    assert str(root) not in str(error.value)
+    with pytest.raises(RuntimeSelectionError) as error:
+        load_runtime_selection(root)
+
+    assert str(root) not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("backend", []),
+        ("primary_asr_profile", []),
+        ("fallback_asr_profile", []),
+    ],
+)
+def test_malformed_selection_values_raise_runtime_selection_error_on_write_and_load(
+    tmp_path: Path, field: str, invalid: object
+) -> None:
+    root = tmp_path / "data"
+    selection = dataclasses.replace(_selection(root), **{field: invalid})
+
+    with pytest.raises(RuntimeSelectionError):
+        write_runtime_selection(selection, root)
+
+    path = _write_valid_selection(root)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw[field] = invalid
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(RuntimeSelectionError):
+        load_runtime_selection(root)
+
+
+def test_malformed_model_map_raises_runtime_selection_error_on_write_and_load(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    selection = _selection(root)
+    object.__setattr__(selection, "model_revisions", [])
+
+    with pytest.raises(RuntimeSelectionError):
+        write_runtime_selection(selection, root)
+
+    path = _write_valid_selection(root)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["model_revisions"] = []
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(RuntimeSelectionError):
+        load_runtime_selection(root)
 
 
 def test_invalid_replacement_keeps_previous_valid_selection(tmp_path: Path) -> None:
