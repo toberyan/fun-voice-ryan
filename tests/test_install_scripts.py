@@ -3,10 +3,13 @@
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
 import pytest
+
+from fun_voice.runtime_selection import RuntimeSelection, write_runtime_selection
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -80,7 +83,8 @@ def test_installer_requires_and_validates_the_selected_runtime() -> None:
 def test_installer_writes_all_launchers_through_one_closed_function() -> None:
     install = (ROOT / "scripts/install-user.sh").read_text(encoding="utf-8")
     assert "install_launcher()" in install
-    assert 'exec \\"${ROOT}/scripts/run-selected-runtime.sh\\"' in install
+    assert "RUNTIME_DATA_ROOT" in install
+    assert "SELECTION_PYTHON" in install
     assert install.count('install_launcher "${script}"') == 1
     assert 'src="${ROOT}/.venv/bin/${script}"' not in install
 
@@ -88,10 +92,163 @@ def test_installer_writes_all_launchers_through_one_closed_function() -> None:
 def test_selected_runtime_adapter_only_delegates_to_closed_python_launcher() -> None:
     adapter = (ROOT / "scripts/run-selected-runtime.sh").read_text(encoding="utf-8")
     assert "set -euo pipefail" in adapter
-    assert 'python3 -P -m fun_voice.runtime_launcher "$@"' in adapter
+    assert '"${SELECTED_PYTHON}" -P -m fun_voice.runtime_launcher' in adapter
+    assert "exec python3" not in adapter
     assert "selection.json" not in adapter
     assert "load_runtime_selection" not in adapter
     assert "torch" not in adapter
+
+
+def _portable_install_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, dict[str, str]]:
+    project = tmp_path / "project"
+    shutil.copytree(ROOT / "src", project / "src")
+    for directory in ("scripts", "systemd", "native/fcitx5-fun-voice"):
+        (project / directory).mkdir(parents=True, exist_ok=True)
+    for relative in (
+        "scripts/install-user.sh",
+        "scripts/run-selected-runtime.sh",
+        "systemd/fun-voice-worker@.service",
+        "systemd/fun-voice-daemon.service",
+        "systemd/fun-voice-session.desktop",
+        "native/fcitx5-fun-voice/fcitx5-fun-voice.conf",
+    ):
+        shutil.copy2(ROOT / relative, project / relative)
+    for relative in (
+        "build/fcitx/fcitx5-fun-voice.so",
+        "build/dtk-overlay/fun-voice-overlay",
+    ):
+        artifact = project / relative
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text("test artifact", encoding="utf-8")
+        artifact.chmod(0o700)
+
+    data_root = tmp_path / "non-default-data/fun-voice-ryan"
+    runtime = data_root / "runtimes/cpu-0123456789abcdef0123456789abcdef"
+    python = runtime / "bin/python"
+    python.parent.mkdir(parents=True, mode=0o700)
+    for directory in (data_root, data_root / "runtimes", runtime, python.parent):
+        directory.chmod(0o700)
+    capture = tmp_path / "selected-process.env"
+    python.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ \"${1:-}\" == '-P' && \"${2:-}\" == '-c' ]]; then exit 0; fi\n"
+        "if [[ \"${1:-}\" == '-P' && \"${2:-}\" == '-m' "
+        "&& \"${3:-}\" == 'fun_voice.runtime_launcher' ]]; then\n"
+        f"  exec {sys.executable} \"$@\"\n"
+        "fi\n"
+        "if [[ \"${1:-}\" == '-P' && \"${2:-}\" == '-m' "
+        "&& \"${3:-}\" == 'fun_voice.worker' ]]; then\n"
+        "  {\n"
+        "    printf 'PYTHONPATH=%s\\n' \"${PYTHONPATH-}\"\n"
+        "    printf 'PYTHONHOME=%s\\n' \"${PYTHONHOME-}\"\n"
+        "    printf 'XDG_DATA_HOME=%s\\n' \"${XDG_DATA_HOME-}\"\n"
+        "    printf 'MODELSCOPE_CACHE=%s\\n' \"${MODELSCOPE_CACHE-}\"\n"
+        "    printf 'FUN_VOICE_MODELS_ROOT=%s\\n' \"${FUN_VOICE_MODELS_ROOT-}\"\n"
+        "    printf 'ARGV=%s\\n' \"$*\"\n"
+        "  } > \"${FAKE_SELECTED_CAPTURE}\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 91\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o700)
+    selection = RuntimeSelection(
+        schema_version=1,
+        backend="cpu",
+        python=python,
+        device="cpu",
+        dtype="float32",
+        primary_asr_profile="sensevoice",
+        fallback_asr_profile=None,
+        enhanced_enabled=False,
+        speaker_enabled=False,
+        model_revisions={"sensevoice": "master", "vad": "master"},
+        probe_status="pass",
+        selected_at=1,
+    )
+    manifest = write_runtime_selection(selection, data_root)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir(mode=0o700)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    systemctl.chmod(0o700)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(tmp_path / "ambient-wrong-data"),
+            "XDG_RUNTIME_DIR": str(runtime_dir),
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "FAKE_SELECTED_CAPTURE": str(capture),
+        }
+    )
+    return project, manifest, capture, environment
+
+
+def test_install_to_launcher_to_worker_uses_verified_non_default_data_root(
+    tmp_path: Path,
+) -> None:
+    project, manifest, capture, environment = _portable_install_fixture(tmp_path)
+    installed = subprocess.run(
+        [
+            str(project / "scripts/install-user.sh"),
+            "--runtime-selection",
+            str(manifest),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    launch_environment = environment.copy()
+    launch_environment.update(
+        {
+            "PYTHONPATH": "/tmp/malicious-development-package",
+            "PYTHONHOME": "/tmp/malicious-python-home",
+            "XDG_DATA_HOME": "/tmp/malicious-data-home",
+            "MODELSCOPE_CACHE": "/tmp/malicious-model-cache",
+            "FUN_VOICE_MODELS_ROOT": "/tmp/malicious-model-root",
+        }
+    )
+    launched = subprocess.run(
+        [
+            str(Path(environment["HOME"]) / ".local/bin/fun-voice-worker"),
+            "--profile",
+            "sensevoice",
+        ],
+        env=launch_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert launched.returncode == 0, launched.stderr
+
+    values = dict(
+        line.split("=", 1)
+        for line in capture.read_text(encoding="utf-8").splitlines()
+    )
+    data_root = manifest.parent.parent
+    assert values["PYTHONPATH"] == str(project / "src")
+    assert values["PYTHONHOME"] == ""
+    assert values["XDG_DATA_HOME"] == str(data_root.parent)
+    assert values["MODELSCOPE_CACHE"] == str(data_root / "models")
+    assert values["FUN_VOICE_MODELS_ROOT"] == str(data_root / "models")
+    assert values["ARGV"] == "-P -m fun_voice.worker --profile sensevoice"
+    installed_worker_unit = Path(environment["HOME"]) / (
+        ".config/systemd/user/fun-voice-worker@.service"
+    )
+    unit_text = installed_worker_unit.read_text(encoding="utf-8")
+    assert "%h/.local/share/fun-voice-ryan/models" not in unit_text
 
 
 def test_uninstaller_preserves_portable_runtime_and_model_state() -> None:
@@ -101,6 +258,86 @@ def test_uninstaller_preserves_portable_runtime_and_model_state() -> None:
     assert 'rm -rf "${MODELS_DIR}"' not in uninstall
     assert "/runtimes" not in uninstall
     assert "/selection.json" not in uninstall
+
+
+@pytest.mark.parametrize(
+    "unsafe_kind",
+    (
+        "shared-xdg",
+        "symlink-xdg",
+        "dangling-symlink-xdg",
+        "symlink-runtime",
+        "symlink-capture",
+    ),
+)
+def test_uninstaller_rejects_unsafe_runtime_tree_before_any_deletion(
+    tmp_path: Path, unsafe_kind: str
+) -> None:
+    home = tmp_path / "home"
+    launcher = home / ".local/bin/fun-voice-daemon"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("owned launcher", encoding="utf-8")
+
+    real_xdg = tmp_path / "real-runtime"
+    real_xdg.mkdir(mode=0o700)
+    xdg_runtime = real_xdg
+    if unsafe_kind == "shared-xdg":
+        real_xdg.chmod(0o755)
+    elif unsafe_kind == "symlink-xdg":
+        xdg_runtime = tmp_path / "runtime-link"
+        xdg_runtime.symlink_to(real_xdg, target_is_directory=True)
+    elif unsafe_kind == "dangling-symlink-xdg":
+        xdg_runtime = tmp_path / "runtime-link"
+        xdg_runtime.symlink_to(tmp_path / "missing-runtime", target_is_directory=True)
+
+    real_app = real_xdg / "fun-voice-ryan-real"
+    app_runtime = real_xdg / "fun-voice-ryan"
+    if unsafe_kind == "symlink-runtime":
+        real_app.mkdir(mode=0o700)
+        app_runtime.symlink_to(real_app, target_is_directory=True)
+    else:
+        app_runtime.mkdir(mode=0o700)
+        real_app = app_runtime
+
+    real_capture = tmp_path / "capture-real"
+    capture = real_app / "capture"
+    if unsafe_kind == "symlink-capture":
+        real_capture.mkdir(mode=0o700)
+        capture.symlink_to(real_capture, target_is_directory=True)
+    else:
+        capture.mkdir(mode=0o700)
+        real_capture = capture
+    shard = real_capture / "keep.pcm"
+    shard.write_text("not application-authorized for deletion", encoding="utf-8")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    systemctl.chmod(0o700)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_RUNTIME_DIR": str(xdg_runtime),
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+        }
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts/uninstall-user.sh")],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "ERROR(runtime-safety)" in completed.stderr
+    assert launcher.read_text(encoding="utf-8") == "owned launcher"
+    assert shard.read_text(encoding="utf-8") == (
+        "not application-authorized for deletion"
+    )
 
 
 def test_installer_rejects_an_invalid_selection_before_user_writes(

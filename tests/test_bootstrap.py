@@ -377,6 +377,64 @@ def test_install_failure_restores_exact_previous_manifest(
     assert not any(call[0][0] == "systemctl" for call in runner.calls)
 
 
+def test_accelerator_to_cpu_reselection_stops_both_workers_before_daemon(
+    desktop_prerequisites: Path,
+) -> None:
+    _write_selection(desktop_prerequisites, "xpu")
+    worker_units = {
+        "fun-voice-worker@nano.service",
+        "fun-voice-worker@sensevoice.service",
+    }
+
+    class WorkerTransitionRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.active_workers = set(worker_units)
+            self.active_at_daemon_restart: set[str] | None = None
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if argv[:3] == ("systemctl", "--user", "stop") and len(argv) == 4:
+                self.active_workers.discard(argv[3])
+            elif argv[:3] == ("systemctl", "--user", "show"):
+                unit = argv[-1]
+                state = "active" if unit in self.active_workers else "inactive"
+                return CommandResult(0, state + "\n")
+            elif argv == (
+                "systemctl",
+                "--user",
+                "restart",
+                "fun-voice-daemon.service",
+            ):
+                self.active_at_daemon_restart = set(self.active_workers)
+            return result
+
+    runner = WorkerTransitionRunner()
+    selected = run_initialization(
+        _options("cpu", force=True, root=desktop_prerequisites), runner
+    )
+
+    assert selected.backend == "cpu"
+    assert runner.active_at_daemon_restart == set()
+    commands = [argv for argv, _ in runner.calls]
+    restart_index = commands.index(
+        ("systemctl", "--user", "restart", "fun-voice-daemon.service")
+    )
+    for unit in sorted(worker_units):
+        stop = ("systemctl", "--user", "stop", unit)
+        confirm = (
+            "systemctl",
+            "--user",
+            "show",
+            "--property=ActiveState",
+            "--value",
+            unit,
+        )
+        assert commands.index(stop) < commands.index(confirm) < restart_index
+
+
 def test_successful_candidate_is_atomically_promoted_to_immutable_generation(
     desktop_prerequisites: Path,
 ) -> None:

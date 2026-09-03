@@ -56,6 +56,10 @@ _MODEL_POLICY = {
     "cuda": frozenset({"nano", "sensevoice", "vad", "qwen", "campplus"}),
     "xpu": frozenset({"nano", "sensevoice", "vad", "qwen", "campplus"}),
 }
+_ASR_WORKER_UNITS = (
+    "fun-voice-worker@nano.service",
+    "fun-voice-worker@sensevoice.service",
+)
 
 
 class InitializationError(RuntimeError):
@@ -345,6 +349,27 @@ def _discard_candidate(candidate: Path) -> None:
         pass
 
 
+def _stop_accelerator_workers(runner: CommandRunner) -> None:
+    """Stop both accelerator-era workers and prove neither remains active."""
+    for unit in _ASR_WORKER_UNITS:
+        stopped = runner.run(("systemctl", "--user", "stop", unit))
+        if stopped.returncode != 0:
+            raise InitializationError("install")
+    for unit in _ASR_WORKER_UNITS:
+        state = runner.run(
+            (
+                "systemctl",
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--value",
+                unit,
+            )
+        )
+        if state.returncode != 0 or state.stdout.strip() not in {"inactive", "failed"}:
+            raise InitializationError("install")
+
+
 @contextmanager
 def _initialization_lock(root: Path) -> Iterator[None]:
     lock_path = root / ".initialize.lock"
@@ -507,6 +532,12 @@ def _run_locked_initialization(
         )
         if install.returncode != 0:
             raise InitializationError("install")
+        if (
+            previous is not None
+            and previous.backend in {"cuda", "xpu"}
+            and successful.backend == "cpu"
+        ):
+            _stop_accelerator_workers(runner)
         reload_result = runner.run(("systemctl", "--user", "daemon-reload"))
         if reload_result.returncode != 0:
             raise InitializationError("install")

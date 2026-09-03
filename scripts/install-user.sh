@@ -120,27 +120,44 @@ install_file() {
 if [[ ! -e "${RUNTIME_SELECTION}" && ! -L "${RUNTIME_SELECTION}" ]]; then
     die "runtime_selection_invalid" "portable runtime selection is unavailable"
 fi
-SELECTION_PYTHON="$(PYTHONPATH="${ROOT}/src" python3 -P -c '
+SELECTION_BINDING="$(PYTHONPATH="${ROOT}/src" python3 -P -c '
 from pathlib import Path
 import sys
-from fun_voice.runtime_selection import RuntimeSelectionError, load_runtime_selection, selection_path
+from fun_voice.runtime_selection import APP_DATA_DIR_NAME, RuntimeSelectionError, load_runtime_selection, selection_path
 manifest = Path(sys.argv[1])
 if not manifest.is_absolute() or manifest.name != "selection.json" or manifest.parent.name != "runtime":
     raise SystemExit(2)
 root = manifest.parent.parent
-if selection_path(root) != manifest:
+if root.name != APP_DATA_DIR_NAME or selection_path(root) != manifest:
     raise SystemExit(2)
 try:
     selection = load_runtime_selection(root)
 except RuntimeSelectionError:
     raise SystemExit(2) from None
+if any(character in str(selection.python) + str(root) for character in "\r\n"):
+    raise SystemExit(2)
 print(selection.python)
+print(root)
 ' "${RUNTIME_SELECTION}" 2>/dev/null)" \
     || die "runtime_selection_invalid" "portable runtime selection is invalid"
+mapfile -t SELECTION_VALUES <<< "${SELECTION_BINDING}"
+if [[ "${#SELECTION_VALUES[@]}" -ne 2 || -z "${SELECTION_VALUES[0]}" \
+    || -z "${SELECTION_VALUES[1]}" ]]; then
+    die "runtime_selection_invalid" "portable runtime selection is invalid"
+fi
+SELECTION_PYTHON="${SELECTION_VALUES[0]}"
+RUNTIME_DATA_ROOT="${SELECTION_VALUES[1]}"
+RUNTIME_SELECTION="${RUNTIME_DATA_ROOT}/runtime/selection.json"
 
 RUNTIME_IMPORT_CHECK='from pathlib import Path; import sys; from fun_voice.runtime_selection import load_runtime_selection; manifest = Path(sys.argv[1]); selection = load_runtime_selection(manifest.parent.parent); assert Path(sys.executable).resolve() == selection.python.resolve(); import torch, funasr, modelscope, transformers, Xlib'
-if ! PYTHONPATH="${ROOT}/src" "${SELECTION_PYTHON}" -P -c \
-    "${RUNTIME_IMPORT_CHECK}" "${RUNTIME_SELECTION}" >/dev/null 2>&1; then
+if ! (
+    unset PYTHONHOME PYTHONUSERBASE PYTHONSTARTUP PYTHONINSPECT PYTHONWARNINGS
+    unset PYTHONBREAKPOINT PYTHONEXECUTABLE PYTHONPLATLIBDIR VIRTUAL_ENV CONDA_PREFIX
+    unset _PYTHON_SYSCONFIGDATA_NAME __PYVENV_LAUNCHER__
+    export PYTHONPATH="${ROOT}/src" PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1
+    "${SELECTION_PYTHON}" -P -c "${RUNTIME_IMPORT_CHECK}" \
+        "${RUNTIME_SELECTION}" >/dev/null 2>&1
+); then
     die "runtime_import_failed" "selected runtime imports are unavailable"
 fi
 log "portable runtime selection and imports verified"
@@ -168,11 +185,16 @@ log "all source artifacts present"
 install_launcher() {
     local name="$1"
     local target="${BIN_DIR}/${name}"
+    local adapter_quoted python_quoted selection_quoted name_quoted
     install -d -m 700 "${BIN_DIR}"
     umask 077
     rm -f "${target}.tmp"
+    printf -v adapter_quoted '%q' "${ROOT}/scripts/run-selected-runtime.sh"
+    printf -v python_quoted '%q' "${SELECTION_PYTHON}"
+    printf -v selection_quoted '%q' "${RUNTIME_SELECTION}"
+    printf -v name_quoted '%q' "${name}"
     printf '%s\n' '#!/usr/bin/env bash' \
-        "exec \"${ROOT}/scripts/run-selected-runtime.sh\" \"${name}\" \"\$@\"" \
+        "exec ${adapter_quoted} --python ${python_quoted} --runtime-selection ${selection_quoted} ${name_quoted} \"\$@\"" \
         > "${target}.tmp"
     chmod 700 "${target}.tmp"
     mv -f "${target}.tmp" "${target}"
