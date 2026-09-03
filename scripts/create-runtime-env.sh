@@ -58,10 +58,19 @@ private_current_group() {
         fi
     done < <(getent passwd)
 }
+safe_external_permissions() {
+    local path="$1" owner group mode permissions
+    read -r owner group mode < <(stat -c '%u %g %a' -- "${path}") || return 1
+    permissions=$((8#${mode}))
+    [[ "${owner}" == "0" || "${owner}" == "${CURRENT_UID}" ]] || return 1
+    (( (permissions & 0002) == 0 )) || return 1
+    if (( (permissions & 0020) != 0 )); then
+        [[ "${owner}" == "${CURRENT_UID}" ]] || return 1
+        private_current_group "${group}" || return 1
+    fi
+}
 valid_runtime_environment() {
-    local runtime="$1" python config link_owner target target_owner target_group
-    local target_mode
-    local target_permissions
+    local runtime="$1" python config link_owner target ancestor identity
     python="${runtime}/bin/python"
     config="${runtime}/pyvenv.cfg"
     secure_directory "${runtime}" || return 1
@@ -79,19 +88,18 @@ valid_runtime_environment() {
     [[ "${link_owner}" == "${CURRENT_UID}" ]] || return 1
     target="$(readlink -f -- "${python}")" || return 1
     [[ -f "${target}" && ! -L "${target}" && -x "${target}" ]] || return 1
-    read -r target_owner target_group target_mode < <(stat -c '%u %g %a' -- "${target}") \
-        || return 1
-    target_permissions=$((8#${target_mode}))
-    [[ "${target_owner}" == "0" || "${target_owner}" == "${CURRENT_UID}" ]] \
-        || return 1
-    (( (target_permissions & 0002) == 0 )) || return 1
-    if (( (target_permissions & 0020) != 0 )); then
-        [[ "${target_owner}" == "${CURRENT_UID}" ]] || return 1
-        private_current_group "${target_group}" || return 1
-    fi
-    "${python}" -I -c \
-        'import os, sys; expected = os.path.realpath(sys.argv[1]); raise SystemExit(0 if sys.version_info[:2] == (3, 12) and os.path.realpath(sys.prefix) == expected and sys.base_prefix != sys.prefix else 1)' \
-        "${runtime}" >/dev/null 2>&1
+    safe_external_permissions "${target}" || return 1
+    ancestor="$(dirname -- "${target}")"
+    while true; do
+        [[ -d "${ancestor}" && ! -L "${ancestor}" ]] || return 1
+        safe_external_permissions "${ancestor}" || return 1
+        [[ "${ancestor}" == "/" ]] && break
+        ancestor="$(dirname -- "${ancestor}")"
+    done
+    identity="$("${python}" -I -c \
+        'import os, sys; expected = os.path.realpath(sys.argv[1]); valid = sys.version_info[:2] == (3, 12) and os.path.realpath(sys.prefix) == expected and sys.base_prefix != sys.prefix; print("fun_voice_python_3_12_venv") if valid else sys.exit(1)' \
+        "${runtime}" 2>/dev/null)" || return 1
+    [[ "${identity}" == "fun_voice_python_3_12_venv" ]]
 }
 cleanup() {
     if [[ -n "${FUNASR_DOWNLOAD}" && -f "${FUNASR_DOWNLOAD}" ]]; then

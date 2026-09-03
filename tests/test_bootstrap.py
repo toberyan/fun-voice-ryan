@@ -399,6 +399,42 @@ def test_successful_candidate_is_atomically_promoted_to_immutable_generation(
     assert load_runtime_selection(desktop_prerequisites) == selected
 
 
+@pytest.mark.parametrize(
+    ("dtype", "models"),
+    [
+        ("bf16", {"sensevoice": "master", "vad": "master"}),
+        (
+            "float32",
+            {"sensevoice": "master", "vad": "master", "qwen": "master"},
+        ),
+    ],
+    ids=("bad-dtype", "bad-model-policy"),
+)
+def test_schema_valid_policy_failure_is_not_promoted(
+    desktop_prerequisites: Path,
+    dtype: str,
+    models: dict[str, str],
+) -> None:
+    result = ProbeResult(
+        backend="cpu",
+        status="pass",
+        error_category=None,
+        dtype=dtype,
+        models=models,
+        tensor_ms=1,
+        asr_ms=1,
+    )
+    runner = FakeRunner({"cpu": result})
+
+    with pytest.raises(InitializationError, match="^selected backend failed$"):
+        run_initialization(_options("cpu", root=desktop_prerequisites), runner)
+
+    runtimes = desktop_prerequisites / "runtimes"
+    assert runtimes.is_dir()
+    assert list(runtimes.iterdir()) == []
+    assert not selection_path(desktop_prerequisites).exists()
+
+
 def test_failed_same_backend_reselection_never_mutates_working_runtime(
     desktop_prerequisites: Path,
 ) -> None:

@@ -267,8 +267,8 @@ def _validate_runtime_directory(path: Path) -> None:
         raise RuntimeSelectionError("selected interpreter is unsafe")
 
 
-def _target_permissions_are_safe(details: os.stat_result) -> bool:
-    if details.st_mode & 0o002 or not details.st_mode & 0o111:
+def _owner_write_permissions_are_safe(details: os.stat_result) -> bool:
+    if details.st_uid not in {0, _current_uid()} or details.st_mode & 0o002:
         return False
     if not details.st_mode & 0o020:
         return True
@@ -285,6 +285,15 @@ def _target_permissions_are_safe(details: os.stat_result) -> bool:
     except KeyError:
         return False
     return group.gr_mem in ([], [current_name]) and primary_users == {current_name}
+
+
+def _validate_external_target_ancestors(target: Path) -> None:
+    for ancestor in target.parents:
+        details = _lstat(ancestor)
+        if not stat.S_ISDIR(details.st_mode) or not _owner_write_permissions_are_safe(
+            details
+        ):
+            raise RuntimeSelectionError("selected interpreter is unsafe")
 
 
 def _validate_runtime_interpreter(path: Path) -> None:
@@ -305,10 +314,11 @@ def _validate_runtime_interpreter(path: Path) -> None:
         raise RuntimeSelectionError("selected interpreter is unsafe") from exc
     if (
         not stat.S_ISREG(target_details.st_mode)
-        or target_details.st_uid not in {0, _current_uid()}
-        or not _target_permissions_are_safe(target_details)
+        or not target_details.st_mode & 0o111
+        or not _owner_write_permissions_are_safe(target_details)
     ):
         raise RuntimeSelectionError("selected interpreter is unsafe")
+    _validate_external_target_ancestors(target)
 
     config = path.parent.parent / "pyvenv.cfg"
     config_details = _lstat(config)

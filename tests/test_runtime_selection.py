@@ -113,6 +113,34 @@ def test_real_uv_venv_interpreter_symlink_is_a_valid_selection(
     assert load_runtime_selection(root) == selection
 
 
+def test_selection_rejects_uv_symlink_target_in_world_writable_parent(
+    tmp_path: Path,
+) -> None:
+    python312 = shutil.which("python3.12")
+    if python312 is None:
+        pytest.skip("Python 3.12 is required for the symlink regression")
+    root = tmp_path / "data"
+    selection = _selection(root)
+    selection.python.unlink()
+    (selection.python.parent.parent / "pyvenv.cfg").write_text(
+        "implementation = CPython\n"
+        "version_info = 3.12.0\n"
+        "include-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    (selection.python.parent.parent / "pyvenv.cfg").chmod(0o600)
+    replaceable = tmp_path / "replaceable"
+    replaceable.mkdir(mode=0o777)
+    replaceable.chmod(0o777)
+    external_python = replaceable / "python3.12"
+    shutil.copy2(Path(python312).resolve(), external_python)
+    external_python.chmod(0o755)
+    selection.python.symlink_to(external_python)
+
+    with pytest.raises(RuntimeSelectionError, match="selected interpreter"):
+        write_runtime_selection(selection, root)
+
+
 def test_selection_fingerprint_is_a_canonical_manifest_digest(tmp_path: Path) -> None:
     selection = _selection(tmp_path / "data")
     reordered = dataclasses.replace(

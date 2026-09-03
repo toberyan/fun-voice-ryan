@@ -476,12 +476,13 @@ def _run_locked_initialization(
         try:
             parsed = _parse_probe(probe_result.stdout, backend)
             if probe_result.returncode == 0 and parsed.status == "pass":
+                pending = _selection_from_probe(backend, runtime, parsed)
                 try:
                     os.replace(candidate, runtime)
                 except OSError:
                     category = "environment"
                 else:
-                    successful = _selection_from_probe(backend, runtime, parsed)
+                    successful = pending
                     break
             else:
                 category = parsed.error_category or "internal"

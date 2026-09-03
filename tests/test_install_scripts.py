@@ -532,9 +532,35 @@ def test_runtime_builder_rejects_forged_python_executable_before_sync(
     runtime = tmp_path / "data/fun-voice-ryan/runtimes/cpu"
     _make_runtime_parent_private(runtime)
     (runtime / "bin").mkdir(parents=True, mode=0o700)
+    runtime.chmod(0o700)
     forged = runtime / "bin/python"
     forged.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     forged.chmod(0o700)
+    (runtime / "pyvenv.cfg").write_text(
+        "implementation = CPython\n"
+        "version_info = 3.12.0\n"
+        "include-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    (runtime / "pyvenv.cfg").chmod(0o600)
+
+    completed, uv_marker = _run_builder_against_existing_runtime(
+        tmp_path, runtime
+    )
+
+    assert completed.returncode != 0
+    assert "secure Python 3.12 virtual environment" in completed.stderr
+    assert not uv_marker.exists()
+
+
+def test_runtime_builder_rejects_zero_exit_non_python_symlink_before_sync(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "data/fun-voice-ryan/runtimes/cpu"
+    _make_runtime_parent_private(runtime)
+    (runtime / "bin").mkdir(parents=True, mode=0o700)
+    runtime.chmod(0o700)
+    (runtime / "bin/python").symlink_to("/bin/true")
     (runtime / "pyvenv.cfg").write_text(
         "implementation = CPython\n"
         "version_info = 3.12.0\n"
@@ -559,6 +585,7 @@ def test_runtime_builder_rejects_non_venv_path_before_sync(tmp_path: Path) -> No
     runtime = tmp_path / "data/fun-voice-ryan/runtimes/cpu"
     _make_runtime_parent_private(runtime)
     (runtime / "bin").mkdir(parents=True, mode=0o700)
+    runtime.chmod(0o700)
     (runtime / "bin/python").symlink_to(python312)
 
     completed, uv_marker = _run_builder_against_existing_runtime(
@@ -593,6 +620,42 @@ def test_runtime_builder_rejects_group_writable_external_interpreter(
     shutil.copy2(Path(python312).resolve(), external_python)
     os.chown(external_python, -1, alternate_groups[0])
     external_python.chmod(0o770)
+    (runtime / "bin/python").unlink()
+    (runtime / "bin/python").symlink_to(external_python)
+
+    completed, uv_marker = _run_builder_against_existing_runtime(
+        tmp_path, runtime
+    )
+
+    assert completed.returncode != 0
+    assert "secure Python 3.12 virtual environment" in completed.stderr
+    assert not uv_marker.exists()
+
+
+def test_runtime_builder_rejects_interpreter_under_world_writable_parent(
+    tmp_path: Path,
+) -> None:
+    uv = shutil.which("uv")
+    python312 = shutil.which("python3.12")
+    if uv is None or python312 is None:
+        pytest.skip("uv and Python 3.12 are required for the symlink regression")
+    runtime = tmp_path / "data/fun-voice-ryan/runtimes/cpu"
+    _make_runtime_parent_private(runtime)
+    subprocess.run(
+        [uv, "venv", str(runtime), "--python", python312],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    runtime.chmod(0o700)
+    (runtime / "bin").chmod(0o700)
+    (runtime / "pyvenv.cfg").chmod(0o600)
+    replaceable = tmp_path / "replaceable"
+    replaceable.mkdir(mode=0o777)
+    replaceable.chmod(0o777)
+    external_python = replaceable / "python3.12"
+    shutil.copy2(Path(python312).resolve(), external_python)
+    external_python.chmod(0o755)
     (runtime / "bin/python").unlink()
     (runtime / "bin/python").symlink_to(external_python)
 
