@@ -349,8 +349,27 @@ def _discard_candidate(candidate: Path) -> None:
         pass
 
 
+def _stop_service(runner: CommandRunner, unit: str) -> None:
+    stopped = runner.run(("systemctl", "--user", "stop", unit))
+    if stopped.returncode != 0:
+        raise InitializationError("install")
+    state = runner.run(
+        (
+            "systemctl",
+            "--user",
+            "show",
+            "--property=ActiveState",
+            "--value",
+            unit,
+        )
+    )
+    if state.returncode != 0 or state.stdout.strip() not in {"inactive", "failed"}:
+        raise InitializationError("install")
+
+
 def _stop_accelerator_workers(runner: CommandRunner) -> None:
-    """Stop both accelerator-era workers and prove neither remains active."""
+    """Quiesce the old daemon, then prove both workers have exited."""
+    _stop_service(runner, "fun-voice-daemon.service")
     for unit in _ASR_WORKER_UNITS:
         stopped = runner.run(("systemctl", "--user", "stop", unit))
         if stopped.returncode != 0:

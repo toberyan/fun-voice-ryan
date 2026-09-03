@@ -390,17 +390,27 @@ def test_accelerator_to_cpu_reselection_stops_both_workers_before_daemon(
         def __init__(self) -> None:
             super().__init__({"cpu": passed("cpu", "float32")})
             self.active_workers = set(worker_units)
+            self.daemon_active = True
             self.active_at_daemon_restart: set[str] | None = None
+            self.daemon_was_quiesced = False
 
         def run(
             self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
         ) -> CommandResult:
             result = super().run(argv, env=env)
             if argv[:3] == ("systemctl", "--user", "stop") and len(argv) == 4:
-                self.active_workers.discard(argv[3])
+                if argv[3] == "fun-voice-daemon.service":
+                    self.daemon_active = False
+                else:
+                    self.active_workers.discard(argv[3])
             elif argv[:3] == ("systemctl", "--user", "show"):
                 unit = argv[-1]
-                state = "active" if unit in self.active_workers else "inactive"
+                active = (
+                    self.daemon_active
+                    if unit == "fun-voice-daemon.service"
+                    else unit in self.active_workers
+                )
+                state = "active" if active else "inactive"
                 return CommandResult(0, state + "\n")
             elif argv == (
                 "systemctl",
@@ -409,6 +419,8 @@ def test_accelerator_to_cpu_reselection_stops_both_workers_before_daemon(
                 "fun-voice-daemon.service",
             ):
                 self.active_at_daemon_restart = set(self.active_workers)
+                self.daemon_was_quiesced = not self.daemon_active
+                self.daemon_active = True
             return result
 
     runner = WorkerTransitionRunner()
@@ -418,10 +430,26 @@ def test_accelerator_to_cpu_reselection_stops_both_workers_before_daemon(
 
     assert selected.backend == "cpu"
     assert runner.active_at_daemon_restart == set()
+    assert runner.daemon_was_quiesced
     commands = [argv for argv, _ in runner.calls]
     restart_index = commands.index(
         ("systemctl", "--user", "restart", "fun-voice-daemon.service")
     )
+    daemon_stop = (
+        "systemctl",
+        "--user",
+        "stop",
+        "fun-voice-daemon.service",
+    )
+    daemon_confirm = (
+        "systemctl",
+        "--user",
+        "show",
+        "--property=ActiveState",
+        "--value",
+        "fun-voice-daemon.service",
+    )
+    assert commands.index(daemon_stop) < commands.index(daemon_confirm)
     for unit in sorted(worker_units):
         stop = ("systemctl", "--user", "stop", unit)
         confirm = (
@@ -432,7 +460,12 @@ def test_accelerator_to_cpu_reselection_stops_both_workers_before_daemon(
             "--value",
             unit,
         )
-        assert commands.index(stop) < commands.index(confirm) < restart_index
+        assert (
+            commands.index(daemon_confirm)
+            < commands.index(stop)
+            < commands.index(confirm)
+            < restart_index
+        )
 
 
 def test_successful_candidate_is_atomically_promoted_to_immutable_generation(
