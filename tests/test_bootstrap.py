@@ -245,6 +245,40 @@ def test_existing_selection_is_returned_without_subprocess(
     assert runner.calls == []
 
 
+def test_historical_group_writable_app_root_is_migrated_before_lock(
+    desktop_prerequisites: Path,
+) -> None:
+    expected = _write_selection(desktop_prerequisites, "cpu")
+    desktop_prerequisites.chmod(0o775)
+    runner = FakeRunner.all_fail()
+
+    selected = run_initialization(
+        _options("auto", root=desktop_prerequisites), runner=runner
+    )
+
+    assert selected == expected
+    assert desktop_prerequisites.stat().st_mode & 0o777 == 0o700
+    assert runner.calls == []
+
+
+def test_data_root_permission_migration_never_follows_a_symlink(
+    desktop_prerequisites: Path,
+) -> None:
+    outside = desktop_prerequisites.parent / "outside-data"
+    outside.mkdir(parents=True, mode=0o775)
+    outside.chmod(0o775)
+    desktop_prerequisites.symlink_to(outside, target_is_directory=True)
+    runner = FakeRunner.all_fail()
+
+    with pytest.raises(InitializationError, match="^lock$"):
+        run_initialization(
+            _options("auto", root=desktop_prerequisites), runner=runner
+        )
+
+    assert outside.stat().st_mode & 0o777 == 0o775
+    assert runner.calls == []
+
+
 def test_accelerator_and_cpu_probe_model_policies(
     desktop_prerequisites: Path,
 ) -> None:
@@ -769,6 +803,87 @@ def test_failed_upgrade_restores_active_enabled_legacy_worker(
     assert runner.legacy_active is True
 
 
+@pytest.mark.parametrize(
+    "original_state",
+    ["enabled", "enabled-runtime", "linked", "linked-runtime", "disabled"],
+)
+def test_failed_install_restores_exact_raw_daemon_enablement_state(
+    desktop_prerequisites: Path,
+    tmp_path: Path,
+    original_state: str,
+) -> None:
+    _write_selection(desktop_prerequisites, "xpu")
+    unit = "fun-voice-daemon.service"
+    fragment = tmp_path / "unit-source" / unit
+    fragment.parent.mkdir(mode=0o700)
+    fragment.write_text("[Unit]\n", encoding="utf-8")
+
+    class RawEnablementRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.states = {
+                unit: original_state,
+                "fun-voice-worker.service": "disabled",
+            }
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if argv[:3] == ("systemctl", "--user", "is-enabled"):
+                state = self.states[argv[-1]]
+                return CommandResult(
+                    0 if state in {"enabled", "enabled-runtime"} else 1,
+                    state + "\n",
+                )
+            if argv[:3] == ("systemctl", "--user", "show"):
+                if "--property=FragmentPath" in argv:
+                    return CommandResult(0, str(fragment) + "\n")
+                return CommandResult(0, "inactive\n")
+            if "install-user.sh" in argv[0]:
+                self.states[unit] = "disabled"
+                return CommandResult(1, "")
+            if argv[:3] == ("systemctl", "--user", "enable"):
+                self.states[argv[-1]] = (
+                    "enabled-runtime" if "--runtime" in argv else "enabled"
+                )
+            if argv[:3] == ("systemctl", "--user", "link"):
+                self.states[unit] = (
+                    "linked-runtime" if "--runtime" in argv else "linked"
+                )
+            return result
+
+    runner = RawEnablementRunner()
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert runner.states[unit] == original_state
+    commands = [argv for argv, _ in runner.calls]
+    if original_state == "enabled-runtime":
+        assert ("systemctl", "--user", "enable", "--runtime", unit) in commands
+        assert ("systemctl", "--user", "enable", unit) not in commands
+    elif original_state == "linked":
+        assert ("systemctl", "--user", "link", str(fragment)) in commands
+        assert not any(
+            argv[:3] == ("systemctl", "--user", "enable")
+            for argv in commands
+        )
+    elif original_state == "linked-runtime":
+        assert (
+            "systemctl",
+            "--user",
+            "link",
+            "--runtime",
+            str(fragment),
+        ) in commands
+        assert not any(
+            argv[:3] == ("systemctl", "--user", "enable")
+            for argv in commands
+        )
+
+
 def test_persistently_failing_install_restores_exact_launcher_and_daemon_state(
     desktop_prerequisites: Path,
 ) -> None:
@@ -853,10 +968,46 @@ def test_unconfirmed_worker_quiescence_keeps_old_selection_unpublished(
     assert runner.install_calls == 0
 
 
+def test_legacy_worker_stop_failure_aborts_before_new_selection_is_published(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "xpu")
+
+    class LegacyStopFailure(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.install_calls = 0
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if argv == (
+                "systemctl",
+                "--user",
+                "stop",
+                "fun-voice-worker.service",
+            ):
+                return CommandResult(1, "")
+            if "install-user.sh" in argv[0]:
+                self.install_calls += 1
+            return result
+
+    runner = LegacyStopFailure()
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert load_runtime_selection(desktop_prerequisites) == previous
+    assert runner.install_calls == 0
+
+
 def test_interrupt_during_install_rolls_back_before_next_run_can_accept_selection(
     desktop_prerequisites: Path,
 ) -> None:
     previous = _write_selection(desktop_prerequisites, "xpu")
+    previous_runtime = previous.python.parent.parent
 
     class InterruptRunner(FakeRunner):
         def __init__(self) -> None:
@@ -881,11 +1032,58 @@ def test_interrupt_during_install_rolls_back_before_next_run_can_accept_selectio
 
     assert runner.install_calls == 1
     assert load_runtime_selection(desktop_prerequisites) == previous
+    assert set((desktop_prerequisites / "runtimes").iterdir()) == {
+        previous_runtime
+    }
     next_runner = FakeRunner.all_fail()
     assert run_initialization(
         _options("auto", root=desktop_prerequisites), next_runner
     ) == previous
     assert next_runner.calls == []
+
+
+def test_failed_install_removes_the_prejournaled_promoted_runtime(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "cpu")
+
+    class JournalObservingInstallFailure(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.published_runtime: Path | None = None
+            self.journal: dict[str, Any] | None = None
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if "install-user.sh" in argv[0]:
+                self.published_runtime = load_runtime_selection(
+                    desktop_prerequisites
+                ).python.parent.parent
+                self.journal = json.loads(
+                    (
+                        desktop_prerequisites
+                        / ".initialization-transaction.json"
+                    ).read_text(encoding="utf-8")
+                )
+                return CommandResult(1, "")
+            return result
+
+    runner = JournalObservingInstallFailure()
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert runner.published_runtime is not None
+    assert runner.published_runtime != previous.python.parent.parent
+    assert runner.journal is not None
+    assert runner.journal["runtime_promotion"]["destination"] == (
+        runner.published_runtime.name
+    )
+    assert not runner.published_runtime.exists()
+    assert load_runtime_selection(desktop_prerequisites) == previous
 
 
 def test_next_run_recovers_model_snapshot_left_by_abrupt_interruption(
@@ -920,11 +1118,22 @@ def test_next_run_recovers_model_snapshot_left_by_abrupt_interruption(
         for relative in bootstrap._DEPLOYMENT_BINDINGS
     ]
     journal = {
-        "version": 2,
+        "version": 3,
         "previous_manifest": base64.b64encode(previous_bytes).decode("ascii"),
         "previous_mode": previous_mode,
         "active_units": [],
-        "enabled_units": [],
+        "unit_files": [
+            {
+                "unit": "fun-voice-daemon.service",
+                "state": "disabled",
+                "fragment_path": None,
+            },
+            {
+                "unit": "fun-voice-worker.service",
+                "state": "disabled",
+                "fragment_path": None,
+            },
+        ],
         "bindings": bindings,
         "model_promotions": [
             {
@@ -933,6 +1142,11 @@ def test_next_run_recovers_model_snapshot_left_by_abrupt_interruption(
                 "had_destination": True,
             }
         ],
+        "runtime_promotion": {
+            "backend": "cpu",
+            "token": token,
+            "destination": f"cpu-{token}",
+        },
     }
     journal_path = desktop_prerequisites / ".initialization-transaction.json"
     journal_path.write_text(json.dumps(journal), encoding="utf-8")
@@ -1030,6 +1244,101 @@ def test_failed_accelerator_model_candidates_do_not_pollute_cpu_cache(
     }
     candidates = desktop_prerequisites / "model-candidates"
     assert not candidates.exists() or list(candidates.iterdir()) == []
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt(), SystemExit(7)])
+def test_probe_base_exception_cleans_candidate_runtime_and_model_cache(
+    desktop_prerequisites: Path,
+    interruption: BaseException,
+) -> None:
+    class InterruptedProbe(FakeRunner):
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if "fun_voice.backend_probe" in argv:
+                raise interruption
+            return result
+
+    with pytest.raises(type(interruption)):
+        run_initialization(
+            _options("cpu", root=desktop_prerequisites),
+            InterruptedProbe({"cpu": passed("cpu", "float32")}),
+        )
+
+    runtimes = desktop_prerequisites / "runtimes"
+    candidates = desktop_prerequisites / "model-candidates"
+    assert not runtimes.exists() or list(runtimes.iterdir()) == []
+    assert not candidates.exists() or list(candidates.iterdir()) == []
+
+
+def test_parse_interruption_cleans_candidate_runtime_and_model_cache(
+    desktop_prerequisites: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fun_voice.bootstrap as bootstrap
+
+    def interrupt_parse(payload: str, expected: str) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(bootstrap, "_parse_probe", interrupt_parse)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_initialization(
+            _options("cpu", root=desktop_prerequisites),
+            FakeRunner({"cpu": passed("cpu", "float32")}),
+        )
+
+    runtimes = desktop_prerequisites / "runtimes"
+    candidates = desktop_prerequisites / "model-candidates"
+    assert not runtimes.exists() or list(runtimes.iterdir()) == []
+    assert not candidates.exists() or list(candidates.iterdir()) == []
+
+
+def test_cpu_initialization_sweeps_stale_candidate_models(
+    desktop_prerequisites: Path,
+) -> None:
+    stale = desktop_prerequisites / (
+        "model-candidates/0123456789abcdef0123456789abcdef/models/"
+        "Qwen--Qwen3.5-0.8B/snapshots/master"
+    )
+    stale.mkdir(parents=True, mode=0o700)
+    desktop_prerequisites.chmod(0o700)
+    (stale / "configuration.json").write_text("stale", encoding="utf-8")
+
+    selected = run_initialization(
+        _options("cpu", root=desktop_prerequisites),
+        FakeRunner({"cpu": passed("cpu", "float32")}),
+    )
+
+    assert selected.backend == "cpu"
+    candidates = desktop_prerequisites / "model-candidates"
+    assert not candidates.exists() or list(candidates.iterdir()) == []
+
+
+def test_stale_candidate_symlink_is_unlinked_without_touching_its_target(
+    desktop_prerequisites: Path,
+    tmp_path: Path,
+) -> None:
+    expected = _write_selection(desktop_prerequisites, "cpu")
+    outside = tmp_path / "outside-candidate"
+    outside.mkdir(mode=0o700)
+    sentinel = outside / "keep"
+    sentinel.write_text("keep", encoding="utf-8")
+    candidates = desktop_prerequisites / "model-candidates"
+    candidates.mkdir(mode=0o700)
+    stale = candidates / "0123456789abcdef0123456789abcdef"
+    stale.symlink_to(outside, target_is_directory=True)
+
+    runner = FakeRunner.all_fail()
+    selected = run_initialization(
+        _options("auto", root=desktop_prerequisites), runner
+    )
+
+    assert selected == expected
+    assert not stale.exists() and not stale.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert runner.calls == []
 
 
 def test_model_promotion_rejects_symlinked_canonical_cache_ancestors(

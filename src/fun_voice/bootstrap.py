@@ -70,6 +70,23 @@ _MANAGED_UNITS = (
 _ENABLEMENT_UNITS = frozenset(
     {"fun-voice-daemon.service", _LEGACY_WORKER_UNIT}
 )
+_UNIT_FILE_STATES = frozenset(
+    {
+        "enabled",
+        "enabled-runtime",
+        "linked",
+        "linked-runtime",
+        "disabled",
+        "static",
+        "indirect",
+        "generated",
+        "transient",
+        "masked",
+        "masked-runtime",
+        "alias",
+        "not-found",
+    }
+)
 _TRANSACTION_FILE = ".initialization-transaction.json"
 _MODEL_CACHE_NAMES = {
     "nano": "FunAudioLLM--Fun-ASR-Nano-2512",
@@ -123,9 +140,16 @@ class CommandRunner(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class _UnitFileSnapshot:
+    unit: str
+    state: str
+    fragment_path: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _ServiceSnapshot:
     active_units: frozenset[str]
-    enabled_units: frozenset[str]
+    unit_files: tuple[_UnitFileSnapshot, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +163,13 @@ class _ModelPromotionPlan:
     key: str
     token: str
     had_destination: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimePromotionPlan:
+    backend: Backend
+    token: str
+    destination: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,14 +437,138 @@ def _candidate_models_path(root: Path, runtime: Path) -> Path:
     return root / "model-candidates" / token
 
 
+def _runtime_promotion_paths(
+    root: Path, plan: _RuntimePromotionPlan
+) -> tuple[Path, Path]:
+    runtimes = root / "runtimes"
+    return (
+        runtimes / f".candidate-{plan.backend}-{plan.token}",
+        runtimes / plan.destination,
+    )
+
+
+def _require_owned_runtime_parent(root: Path) -> Path:
+    runtimes = root / "runtimes"
+    try:
+        details = runtimes.lstat()
+    except OSError as exc:
+        raise InitializationError("install") from exc
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or details.st_mode & 0o022
+    ):
+        raise InitializationError("install")
+    return runtimes
+
+
+def _plan_candidate_runtime(
+    root: Path,
+    backend: Backend,
+    candidate: Path,
+    destination: Path,
+) -> _RuntimePromotionPlan:
+    token = destination.name.removeprefix(f"{backend}-")
+    plan = _RuntimePromotionPlan(backend, token, destination.name)
+    expected_candidate, expected_destination = _runtime_promotion_paths(root, plan)
+    _require_owned_runtime_parent(root)
+    try:
+        candidate_details = candidate.lstat()
+    except OSError as exc:
+        raise InitializationError("install") from exc
+    if (
+        not _valid_generation_token(token)
+        or candidate != expected_candidate
+        or destination != expected_destination
+        or stat.S_ISLNK(candidate_details.st_mode)
+        or not stat.S_ISDIR(candidate_details.st_mode)
+        or candidate_details.st_uid != os.geteuid()
+        or destination.exists()
+        or destination.is_symlink()
+    ):
+        raise InitializationError("install")
+    return plan
+
+
+def _promote_candidate_runtime(root: Path, plan: _RuntimePromotionPlan) -> Path:
+    candidate, destination = _runtime_promotion_paths(root, plan)
+    _plan_candidate_runtime(root, plan.backend, candidate, destination)
+    try:
+        os.replace(candidate, destination)
+    except OSError as exc:
+        raise InitializationError("install") from exc
+    return destination
+
+
+def _restore_runtime_promotion(root: Path, plan: _RuntimePromotionPlan) -> None:
+    _require_owned_runtime_parent(root)
+    candidate, destination = _runtime_promotion_paths(root, plan)
+    for path in (candidate, destination):
+        if not path.exists() and not path.is_symlink():
+            continue
+        try:
+            details = path.lstat()
+        except OSError as exc:
+            raise InitializationError("install") from exc
+        if details.st_uid != os.geteuid() or not (
+            stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode)
+        ):
+            raise InitializationError("install")
+        _discard_candidate(path)
+
+
 def _discard_candidate(candidate: Path) -> None:
     try:
         if candidate.is_symlink() or candidate.is_file():
             candidate.unlink()
         elif candidate.exists():
             shutil.rmtree(candidate)
-    except OSError:
-        pass
+        if candidate.exists() or candidate.is_symlink():
+            raise InitializationError("install")
+    except InitializationError:
+        raise
+    except OSError as exc:
+        raise InitializationError("install") from exc
+
+
+def _valid_generation_token(value: str) -> bool:
+    return len(value) == 32 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _sweep_stale_model_candidates(root: Path) -> None:
+    base = root / "model-candidates"
+    if not base.exists() and not base.is_symlink():
+        return
+    try:
+        details = base.lstat()
+        if (
+            stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.geteuid()
+        ):
+            raise InitializationError("install")
+        os.chmod(base, 0o700, follow_symlinks=False)
+        candidates = tuple(base.iterdir())
+        for candidate in candidates:
+            candidate_details = candidate.lstat()
+            candidate_is_directory = stat.S_ISDIR(candidate_details.st_mode)
+            candidate_is_symlink = stat.S_ISLNK(candidate_details.st_mode)
+            if (
+                not _valid_generation_token(candidate.name)
+                or candidate_details.st_uid != os.geteuid()
+                or not (candidate_is_directory or candidate_is_symlink)
+            ):
+                raise InitializationError("install")
+            if candidate_is_directory:
+                os.chmod(candidate, 0o700, follow_symlinks=False)
+            _discard_candidate(candidate)
+    except InitializationError:
+        raise
+    except OSError as exc:
+        raise InitializationError("install") from exc
 
 
 def _stop_service(runner: CommandRunner, unit: str) -> None:
@@ -435,13 +590,14 @@ def _stop_service(runner: CommandRunner, unit: str) -> None:
 
 
 def _quiesce_model_services(runner: CommandRunner) -> None:
-    """Quiesce the daemon, then prove both possible workers have exited."""
+    """Quiesce the daemon, then prove every managed worker has exited."""
     _stop_service(runner, "fun-voice-daemon.service")
-    for unit in _ASR_WORKER_UNITS:
+    worker_units = (*_ASR_WORKER_UNITS, _LEGACY_WORKER_UNIT)
+    for unit in worker_units:
         stopped = runner.run(("systemctl", "--user", "stop", unit))
         if stopped.returncode != 0:
             raise InitializationError("install")
-    for unit in _ASR_WORKER_UNITS:
+    for unit in worker_units:
         state = runner.run(
             (
                 "systemctl",
@@ -480,33 +636,83 @@ def _snapshot_service_state(runner: CommandRunner) -> _ServiceSnapshot:
             raise InitializationError("install")
         if value in {"active", "activating", "reloading"}:
             active.add(unit)
-    enabled: set[str] = set()
-    for unit in _ENABLEMENT_UNITS:
+    unit_files: list[_UnitFileSnapshot] = []
+    for unit in sorted(_ENABLEMENT_UNITS):
         state = runner.run(("systemctl", "--user", "is-enabled", unit))
         value = state.stdout.strip()
-        if value in {"enabled", "enabled-runtime", "linked", "linked-runtime"}:
-            enabled.add(unit)
-        elif value not in {
-            "disabled",
-            "static",
-            "indirect",
-            "generated",
-            "transient",
-            "masked",
-            "masked-runtime",
-            "alias",
-            "not-found",
-        }:
+        if value not in _UNIT_FILE_STATES:
             raise InitializationError("install")
-    return _ServiceSnapshot(frozenset(active), frozenset(enabled))
+        fragment: str | None = None
+        if value in {"linked", "linked-runtime"}:
+            fragment_result = runner.run(
+                (
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "--property=FragmentPath",
+                    "--value",
+                    unit,
+                )
+            )
+            fragment = fragment_result.stdout.strip()
+            if (
+                fragment_result.returncode != 0
+                or not fragment
+                or not Path(fragment).is_absolute()
+                or Path(fragment).name != unit
+            ):
+                raise InitializationError("install")
+        unit_files.append(_UnitFileSnapshot(unit, value, fragment))
+    return _ServiceSnapshot(frozenset(active), tuple(unit_files))
 
 
 def _restore_service_state(
     runner: CommandRunner, snapshot: _ServiceSnapshot
 ) -> None:
-    for unit in snapshot.enabled_units:
-        enabled = runner.run(("systemctl", "--user", "enable", unit))
-        if enabled.returncode != 0:
+    for unit_file in snapshot.unit_files:
+        unit = unit_file.unit
+        current = runner.run(("systemctl", "--user", "is-enabled", unit))
+        current_state = current.stdout.strip()
+        if current_state not in _UNIT_FILE_STATES:
+            raise InitializationError("install")
+        if current_state != unit_file.state:
+            command: tuple[str, ...]
+            if unit_file.state == "enabled":
+                command = ("systemctl", "--user", "enable", unit)
+            elif unit_file.state == "enabled-runtime":
+                command = ("systemctl", "--user", "enable", "--runtime", unit)
+            elif unit_file.state == "linked":
+                if unit_file.fragment_path is None:
+                    raise InitializationError("install")
+                command = (
+                    "systemctl",
+                    "--user",
+                    "link",
+                    unit_file.fragment_path,
+                )
+            elif unit_file.state == "linked-runtime":
+                if unit_file.fragment_path is None:
+                    raise InitializationError("install")
+                command = (
+                    "systemctl",
+                    "--user",
+                    "link",
+                    "--runtime",
+                    unit_file.fragment_path,
+                )
+            elif unit_file.state == "masked":
+                command = ("systemctl", "--user", "mask", unit)
+            elif unit_file.state == "masked-runtime":
+                command = ("systemctl", "--user", "mask", "--runtime", unit)
+            elif unit_file.state == "disabled":
+                command = ("systemctl", "--user", "disable", unit)
+            else:
+                raise InitializationError("install")
+            restored = runner.run(command)
+            if restored.returncode != 0:
+                raise InitializationError("install")
+        verified = runner.run(("systemctl", "--user", "is-enabled", unit))
+        if verified.stdout.strip() != unit_file.state:
             raise InitializationError("install")
     for unit in (*_ASR_WORKER_UNITS, _LEGACY_WORKER_UNIT, "fun-voice-daemon.service"):
         if unit not in snapshot.active_units:
@@ -518,7 +724,9 @@ def _restore_service_state(
 
 def _stop_managed_services_for_restore(runner: CommandRunner) -> None:
     for unit in _MANAGED_UNITS:
-        runner.run(("systemctl", "--user", "stop", unit))
+        stopped = runner.run(("systemctl", "--user", "stop", unit))
+        if stopped.returncode != 0:
+            raise InitializationError("install")
         state = runner.run(
             (
                 "systemctl",
@@ -544,10 +752,11 @@ def _write_transaction_journal(
     services: _ServiceSnapshot,
     bindings: Sequence[_BindingSnapshot],
     model_promotions: Sequence[_ModelPromotionPlan],
+    runtime_promotion: _RuntimePromotionPlan,
 ) -> Path:
     path = root / _TRANSACTION_FILE
     payload = {
-        "version": 2,
+        "version": 3,
         "previous_manifest": (
             None
             if previous_bytes is None
@@ -555,7 +764,14 @@ def _write_transaction_journal(
         ),
         "previous_mode": previous_mode,
         "active_units": sorted(services.active_units),
-        "enabled_units": sorted(services.enabled_units),
+        "unit_files": [
+            {
+                "unit": item.unit,
+                "state": item.state,
+                "fragment_path": item.fragment_path,
+            }
+            for item in services.unit_files
+        ],
         "bindings": [
             {
                 "relative_path": item.relative_path,
@@ -577,6 +793,11 @@ def _write_transaction_journal(
             }
             for item in model_promotions
         ],
+        "runtime_promotion": {
+            "backend": runtime_promotion.backend,
+            "token": runtime_promotion.token,
+            "destination": runtime_promotion.destination,
+        },
     }
     temporary: Path | None = None
     try:
@@ -605,6 +826,7 @@ def _read_transaction_journal(
     _ServiceSnapshot,
     tuple[_BindingSnapshot, ...],
     tuple[_ModelPromotionPlan, ...],
+    _RuntimePromotionPlan,
 ] | None:
     path = root / _TRANSACTION_FILE
     if not path.exists() and not path.is_symlink():
@@ -625,19 +847,21 @@ def _read_transaction_journal(
             "previous_manifest",
             "previous_mode",
             "active_units",
-            "enabled_units",
+            "unit_files",
             "bindings",
             "model_promotions",
+            "runtime_promotion",
         }:
             raise InitializationError("install")
         encoded = raw["previous_manifest"]
         mode = raw["previous_mode"]
         units = raw["active_units"]
-        enabled_units = raw["enabled_units"]
+        unit_files_raw = raw["unit_files"]
         bindings_raw = raw["bindings"]
         promotions_raw = raw["model_promotions"]
+        runtime_raw = raw["runtime_promotion"]
         if (
-            raw["version"] != 2
+            raw["version"] != 3
             or (encoded is not None and not isinstance(encoded, str))
             or (mode is not None and mode != 0o600)
             or not isinstance(units, list)
@@ -645,14 +869,10 @@ def _read_transaction_journal(
                 isinstance(unit, str) and unit in _MANAGED_UNITS for unit in units
             )
             or len(set(units)) != len(units)
-            or not isinstance(enabled_units, list)
-            or not all(
-                isinstance(unit, str) and unit in _ENABLEMENT_UNITS
-                for unit in enabled_units
-            )
-            or len(set(enabled_units)) != len(enabled_units)
+            or not isinstance(unit_files_raw, list)
             or not isinstance(bindings_raw, list)
             or not isinstance(promotions_raw, list)
+            or not isinstance(runtime_raw, dict)
         ):
             raise InitializationError("install")
         previous = (
@@ -660,6 +880,43 @@ def _read_transaction_journal(
             if encoded is None
             else base64.b64decode(encoded.encode("ascii"), validate=True)
         )
+        unit_files: list[_UnitFileSnapshot] = []
+        seen_units: set[str] = set()
+        for item in unit_files_raw:
+            if not isinstance(item, dict) or set(item) != {
+                "unit",
+                "state",
+                "fragment_path",
+            }:
+                raise InitializationError("install")
+            unit = item["unit"]
+            unit_state = item["state"]
+            fragment = item["fragment_path"]
+            if (
+                not isinstance(unit, str)
+                or unit not in _ENABLEMENT_UNITS
+                or unit in seen_units
+                or not isinstance(unit_state, str)
+                or unit_state not in _UNIT_FILE_STATES
+                or (fragment is not None and not isinstance(fragment, str))
+                or (
+                    unit_state in {"linked", "linked-runtime"}
+                    and (
+                        not fragment
+                        or not Path(fragment).is_absolute()
+                        or Path(fragment).name != unit
+                    )
+                )
+                or (
+                    unit_state not in {"linked", "linked-runtime"}
+                    and fragment is not None
+                )
+            ):
+                raise InitializationError("install")
+            seen_units.add(unit)
+            unit_files.append(_UnitFileSnapshot(unit, unit_state, fragment))
+        if seen_units != _ENABLEMENT_UNITS:
+            raise InitializationError("install")
         bindings: list[_BindingSnapshot] = []
         seen_paths: set[str] = set()
         for item in bindings_raw:
@@ -727,14 +984,32 @@ def _read_transaction_journal(
                 raise InitializationError("install")
             seen_keys.add(key)
             promotions.append(_ModelPromotionPlan(key, token, had_destination))
+        if set(runtime_raw) != {"backend", "token", "destination"}:
+            raise InitializationError("install")
+        runtime_backend = runtime_raw["backend"]
+        runtime_token = runtime_raw["token"]
+        runtime_destination = runtime_raw["destination"]
+        if (
+            not isinstance(runtime_backend, str)
+            or runtime_backend not in {"cuda", "xpu", "cpu"}
+            or not isinstance(runtime_token, str)
+            or not _valid_generation_token(runtime_token)
+            or not isinstance(runtime_destination, str)
+            or runtime_destination != f"{runtime_backend}-{runtime_token}"
+        ):
+            raise InitializationError("install")
+        runtime_plan = _RuntimePromotionPlan(
+            cast(Backend, runtime_backend), runtime_token, runtime_destination
+        )
     except (OSError, UnicodeError, ValueError) as exc:
         raise InitializationError("install") from exc
     return (
         previous,
         cast(int | None, mode),
-        _ServiceSnapshot(frozenset(units), frozenset(enabled_units)),
+        _ServiceSnapshot(frozenset(units), tuple(unit_files)),
         tuple(bindings),
         tuple(promotions),
+        runtime_plan,
     )
 
 
@@ -822,10 +1097,18 @@ def _restore_deployment(
     journal = _read_transaction_journal(root)
     if journal is None:
         return
-    previous_bytes, previous_mode, services, bindings, promotions = journal
+    (
+        previous_bytes,
+        previous_mode,
+        services,
+        bindings,
+        promotions,
+        runtime_promotion,
+    ) = journal
     manifest = selection_path(root)
     _stop_managed_services_for_restore(runner)
     _restore_model_promotions(root, promotions)
+    _restore_runtime_promotion(root, runtime_promotion)
     _restore_manifest(manifest, previous_bytes, previous_mode)
     _restore_deployment_bindings(bindings)
     reload_result = runner.run(("systemctl", "--user", "daemon-reload"))
@@ -997,6 +1280,55 @@ def _commit_model_promotion(promotions: Sequence[_ModelPromotion]) -> None:
             _discard_candidate(promotion.backup)
 
 
+def _migrate_legacy_data_root_permissions(root: Path) -> None:
+    """Privatize an existing current-user application root without following links."""
+    try:
+        details = root.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise InitializationError("lock") from exc
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid()
+    ):
+        raise InitializationError("lock")
+    if stat.S_IMODE(details.st_mode) == 0o700:
+        return
+
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(root, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino)
+        ):
+            raise InitializationError("lock")
+        os.fchmod(descriptor, 0o700)
+        migrated = root.lstat()
+        if (
+            (migrated.st_dev, migrated.st_ino) != (opened.st_dev, opened.st_ino)
+            or stat.S_IMODE(migrated.st_mode) != 0o700
+        ):
+            raise InitializationError("lock")
+    except InitializationError:
+        raise
+    except OSError as exc:
+        raise InitializationError("lock") from exc
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
 @contextmanager
 def _initialization_lock(root: Path) -> Iterator[None]:
     lock_path = root / ".initialize.lock"
@@ -1062,6 +1394,7 @@ def run_initialization(
     )
     root = options.data_root or default_data_root()
     project_root = options.project_root or Path(__file__).resolve().parents[2]
+    _migrate_legacy_data_root_permissions(root)
     with _initialization_lock(root):
         return _run_locked_initialization(
             options, runner, candidates, root, project_root
@@ -1077,6 +1410,7 @@ def _run_locked_initialization(
 ) -> RuntimeSelection:
     if _read_transaction_journal(root) is not None:
         _restore_deployment(root, runner)
+    _sweep_stale_model_candidates(root)
     manifest = selection_path(root)
     previous: RuntimeSelection | None = None
     previous_bytes: bytes | None = None
@@ -1097,65 +1431,85 @@ def _run_locked_initialization(
         raise InitializationError("native_prerequisite")
 
     successful: RuntimeSelection | None = None
+    successful_candidate: Path | None = None
     successful_models: Path | None = None
+    runtime_plan: _RuntimePromotionPlan | None = None
     for backend in candidates:
         candidate, runtime = _candidate_runtime_paths(root, backend)
         candidate_models = _candidate_models_path(root, runtime)
-        build = runner.run(
-            (
-                str(project_root / "scripts/create-runtime-env.sh"),
-                "--backend",
-                backend,
-                "--runtime-dir",
-                str(candidate),
-                "--models-root",
-                str(candidate_models),
+        try:
+            build = runner.run(
+                (
+                    str(project_root / "scripts/create-runtime-env.sh"),
+                    "--backend",
+                    backend,
+                    "--runtime-dir",
+                    str(candidate),
+                    "--models-root",
+                    str(candidate_models),
+                )
             )
-        )
-        if build.returncode != 0:
+            if build.returncode != 0:
+                _discard_candidate(candidate)
+                _discard_candidate(candidate_models)
+                _record_candidate_failure(backend, "environment")
+                if options.backend != "auto":
+                    raise InitializationError("selected backend failed")
+                continue
+            probe_result = runner.run(
+                (
+                    str(candidate / "bin/python"),
+                    "-P",
+                    "-m",
+                    "fun_voice.backend_probe",
+                    "--backend",
+                    backend,
+                    "--models-root",
+                    str(candidate_models),
+                    "--json",
+                ),
+                env=_probe_environment(project_root, candidate_models),
+            )
+        except BaseException:
             _discard_candidate(candidate)
             _discard_candidate(candidate_models)
-            _record_candidate_failure(backend, "environment")
-            if options.backend != "auto":
-                raise InitializationError("selected backend failed")
-            continue
-        probe_result = runner.run(
-            (
-                str(candidate / "bin/python"),
-                "-P",
-                "-m",
-                "fun_voice.backend_probe",
-                "--backend",
-                backend,
-                "--models-root",
-                str(candidate_models),
-                "--json",
-            ),
-            env=_probe_environment(project_root, candidate_models),
-        )
+            raise
         try:
             parsed = _parse_probe(probe_result.stdout, backend)
             if probe_result.returncode == 0 and parsed.status == "pass":
                 pending = _selection_from_probe(backend, runtime, parsed)
                 try:
-                    os.replace(candidate, runtime)
-                except OSError:
+                    pending_runtime_plan = _plan_candidate_runtime(
+                        root, backend, candidate, runtime
+                    )
+                except InitializationError:
                     category = "environment"
                 else:
                     successful = pending
+                    successful_candidate = candidate
                     successful_models = candidate_models
+                    runtime_plan = pending_runtime_plan
                     break
             else:
                 category = parsed.error_category or "internal"
         except InitializationError:
             category = "internal"
+        except BaseException:
+            _discard_candidate(candidate)
+            _discard_candidate(candidate_models)
+            raise
         _discard_candidate(candidate)
         _discard_candidate(candidate_models)
         _record_candidate_failure(backend, category)
         if options.backend != "auto":
             raise InitializationError("selected backend failed")
 
-    if successful is None or successful_models is None:
+    if (
+        successful is None
+        or successful_candidate is None
+        or successful_models is None
+        or runtime_plan is None
+    ):
         raise InitializationError("no backend available")
 
     try:
@@ -1171,14 +1525,19 @@ def _run_locked_initialization(
             services=services,
             bindings=bindings,
             model_promotions=model_plans,
+            runtime_promotion=runtime_plan,
         )
     except BaseException:
+        _discard_candidate(successful_candidate)
         _discard_candidate(successful_models)
         raise
     promotions: list[_ModelPromotion] = []
     try:
         if previous is not None:
             _quiesce_model_services(runner)
+        promoted_runtime = _promote_candidate_runtime(root, runtime_plan)
+        if promoted_runtime != successful.python.parent.parent:
+            raise InitializationError("install")
         promotions = _promote_candidate_models(root, model_plans)
         published = write_runtime_selection(successful, root)
         install = runner.run(
@@ -1209,6 +1568,7 @@ def _run_locked_initialization(
         except BaseException as restore_exc:  # noqa: BLE001 - preserve rollback proof
             rollback_error = restore_exc
         finally:
+            _discard_candidate(successful_candidate)
             _discard_candidate(successful_models)
         if rollback_error is not None:
             raise InitializationError("install") from rollback_error
@@ -1216,6 +1576,7 @@ def _run_locked_initialization(
             raise
         raise InitializationError("install") from exc
     _commit_model_promotion(promotions)
+    _discard_candidate(successful_candidate)
     _discard_candidate(successful_models)
     return successful
 

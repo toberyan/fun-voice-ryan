@@ -251,6 +251,44 @@ def test_install_to_launcher_to_worker_uses_verified_non_default_data_root(
     assert "%h/.local/share/fun-voice-ryan/models" not in unit_text
 
 
+def test_legacy_worker_disable_failure_preserves_its_unit_file(
+    tmp_path: Path,
+) -> None:
+    project, manifest, _, environment = _portable_install_fixture(tmp_path)
+    legacy = Path(environment["HOME"]) / (
+        ".config/systemd/user/fun-voice-worker.service"
+    )
+    legacy.parent.mkdir(parents=True, mode=0o700)
+    legacy.write_text("legacy unit\n", encoding="utf-8")
+    fake_systemctl = Path(environment["PATH"].split(":", 1)[0]) / "systemctl"
+    fake_systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$*\" == '--user disable --now fun-voice-worker.service' ]]; "
+        "then exit 1; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_systemctl.chmod(0o700)
+
+    completed = subprocess.run(
+        [
+            str(project / "scripts/install-user.sh"),
+            "--runtime-selection",
+            str(manifest),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "ERROR(systemd): cannot stop and disable retired warm worker" in (
+        completed.stderr
+    )
+    assert legacy.read_text(encoding="utf-8") == "legacy unit\n"
+
+
 def test_uninstaller_preserves_portable_runtime_and_model_state() -> None:
     uninstall = (ROOT / "scripts/uninstall-user.sh").read_text(encoding="utf-8")
     assert "MODELS_DIR=" not in uninstall
@@ -991,6 +1029,17 @@ def test_installer_defers_daemon_start_until_graphical_session_import() -> None:
     assert "enable fun-voice-daemon.service" not in install
     assert "restart fun-voice-daemon.service" not in install
     assert not (ROOT / "systemd/fun-voice-worker.service").exists()
+
+
+def test_installer_fails_closed_before_deleting_the_legacy_worker_unit() -> None:
+    install = (ROOT / "scripts/install-user.sh").read_text(encoding="utf-8")
+    disable = "systemctl --user disable --now fun-voice-worker.service"
+    remove = 'rm -f "${SYSTEMD_USER_DIR}/fun-voice-worker.service"'
+
+    assert f"{disable} 2>/dev/null || true" not in install
+    assert disable in install
+    assert '|| die "systemd" "cannot stop and disable retired warm worker"' in install
+    assert install.index(disable) < install.index(remove)
 
 
 def test_current_user_docs_describe_x11_not_dde_bridge() -> None:

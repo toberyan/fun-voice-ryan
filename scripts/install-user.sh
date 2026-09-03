@@ -245,9 +245,20 @@ if ! command -v systemctl >/dev/null 2>&1; then
 fi
 # ``fun-voice-worker.service`` belongs to the old warm architecture. It is an
 # exact application-owned path, not a glob or user-selected target.
-systemctl --user disable --now fun-voice-worker.service 2>/dev/null || true
-rm -f "${SYSTEMD_USER_DIR}/fun-voice-worker.service" \
-    || die "systemd" "cannot remove retired warm worker unit"
+if [[ -e "${SYSTEMD_USER_DIR}/fun-voice-worker.service" \
+    || -L "${SYSTEMD_USER_DIR}/fun-voice-worker.service" ]]; then
+    systemctl --user disable --now fun-voice-worker.service \
+        || die "systemd" "cannot stop and disable retired warm worker"
+    LEGACY_ACTIVE_STATE="$(systemctl --user show --property=ActiveState --value \
+        fun-voice-worker.service)" \
+        || die "systemd" "cannot confirm retired warm worker state"
+    case "${LEGACY_ACTIVE_STATE}" in
+        inactive|failed) ;;
+        *) die "systemd" "retired warm worker is still active" ;;
+    esac
+    rm -f "${SYSTEMD_USER_DIR}/fun-voice-worker.service" \
+        || die "systemd" "cannot remove retired warm worker unit"
+fi
 systemctl --user daemon-reload || die "systemd" "daemon-reload failed"
 # Starting here is too early: the user manager can run before the graphical
 # session has supplied DISPLAY/XAUTHORITY.  The autostart session importer
