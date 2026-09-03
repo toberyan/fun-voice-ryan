@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 
 import pytest
@@ -12,6 +13,12 @@ from fun_voice.scheduler import ModelLifecycle, ModelProfileError, ModelSchedule
 
 def _key(generation: int = 1) -> SessionKey:
     return SessionKey(session_id=f"session-{generation}", generation=generation)
+
+
+@pytest.mark.parametrize("startup_timeout", [math.nan, math.inf, -math.inf])
+def test_scheduler_rejects_non_finite_startup_timeout(startup_timeout: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        ModelScheduler(startup_timeout=startup_timeout)
 
 
 def test_final_tail_precedes_queued_provisional_tail() -> None:

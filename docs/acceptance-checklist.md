@@ -1,8 +1,7 @@
 # 真实 Deepin X11 会话验收清单
 
-> 本清单由**人工**在真实 Deepin DDE **X11** 会话中执行。执行前先确认
-> `systemctl --user status fun-voice-daemon` 为 `active`。Nano/SenseVoice worker 与 Qwen
-> 都是按需进程，登录后未启动是预期行为。
+> 本清单由**人工**在真实 Deepin DDE **X11** 会话中执行。先完成第 0 节首次初始化，再确认
+> daemon 已运行。Nano/SenseVoice worker 与 Qwen 都是按需进程，登录后未启动是预期行为。
 > `x11_hotkey` 在本次 daemon 启动后首次真实按住 `Super+C` 前会是 `fail`；完成第 1 节的
 > 第一次按住/松开后重新运行 `fun-voice-selftest --format json`，应全部 `pass`。
 
@@ -17,7 +16,7 @@
       的 backend/device 是 `cuda`/`cuda:0`，dtype 是探测通过的 BF16，硬件不支持时才是 FP16。
 - [ ] 确认 Nano 是 primary、SenseVoiceSmall 是 fallback；有效录音前没有模型进程常驻。
 - [ ] 启用修正时确认 `fun-voice-worker@nano.service`（或实际使用的 SenseVoice worker）
-      已停止，随后才出现 Qwen 进程；说话人请求才按需运行 CAM++。
+      已停止，随后才出现 Qwen 进程。当前版本不验收 CAM++、说话人或结构化结果 API。
 - [ ] 按住/松开 `Super+C` 完成一次中英混合输入，确认最终文本上屏并留在 clipboard。
 
 ### Intel XPU 机器
@@ -25,7 +24,7 @@
 - [ ] 执行 `scripts/initialize-first-run.sh --backend xpu`，确认 `selection.json` 是
       `xpu`/`xpu:0`/BF16，不接受 FP16 或 CPU 静默回退。
 - [ ] 确认 Nano primary、SenseVoiceSmall fallback，且 Qwen 只在 ASR worker 已停止后运行；
-      CAM++ 只在说话人能力实际请求时启动。
+      当前版本不应启动 CAM++，也不验收说话人或结构化结果 API。
 - [ ] `docs/xpu-poc.md` 的九项 POC 可作为显式 Intel XPU 诊断运行，但它不是 CUDA/CPU
       初始化的前置条件。
 - [ ] 按住/松开 `Super+C` 完成输入，确认最终文本上屏并留在 clipboard。
@@ -40,6 +39,14 @@
       初始化没有下载 Qwen3.5-0.8B 或 CAM++ 快照，也没有 Qwen/CAM++ 进程。
 - [ ] 按住/松开 `Super+C`，确认原始 SenseVoiceSmall 文本经 Fcitx 上屏并写入 clipboard；
       悬浮窗、焦点保护、长录音切分等非模型桌面行为与加速器路径一致。
+
+完成所选初始化路径后执行：
+
+```bash
+systemctl --user status fun-voice-daemon.service --no-pager
+```
+
+确认 daemon 为 `active` 后再继续以下交互验收。
 
 ## 1. X11 Super+C 独占、按住录音、松开识别
 

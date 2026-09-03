@@ -1115,6 +1115,60 @@ def test_acceptance_checklist_has_mutually_exclusive_backend_sections() -> None:
         assert required in checklist
 
 
+def test_current_docs_do_not_claim_unimplemented_speaker_or_structured_api() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    operations = (ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    checklist = (ROOT / "docs/acceptance-checklist.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "当前版本未实现 CAM++ 加载、说话人分离/身份或结构化结果接口" in readme
+    assert "CAM++ 按需" not in readme
+    assert "CAM++ 按需" not in operations
+    assert "结构化结果只经接口提供" not in operations
+    assert "分别比较 Nano 原始结果与串行 Qwen 修正" not in operations
+    assert "说话人请求才按需运行 CAM++" not in checklist
+    assert "CAM++ 只在说话人能力实际请求时启动" not in checklist
+
+
+def test_native_builder_reports_an_actionable_category_when_cmake_fails(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    script = project / "scripts/build-native-artifacts.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/build-native-artifacts.sh", script)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    cmake = fake_bin / "cmake"
+    cmake.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
+    cmake.chmod(0o700)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+    completed = subprocess.run(
+        [str(script)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "native_prerequisite" in completed.stderr
+
+
+def test_clean_machine_acceptance_initializes_before_daemon_status_check() -> None:
+    checklist = (ROOT / "docs/acceptance-checklist.md").read_text(
+        encoding="utf-8"
+    )
+    first_initialization = checklist.index("scripts/initialize-first-run.sh --backend")
+    daemon_status = checklist.index(
+        "systemctl --user status fun-voice-daemon.service --no-pager"
+    )
+    assert first_initialization < daemon_status
+
+
 def test_xpu_poc_is_documented_as_optional_explicit_diagnostic() -> None:
     document = (ROOT / "docs/xpu-poc.md").read_text(encoding="utf-8")
     assert "显式 Intel XPU 诊断" in document

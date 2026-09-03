@@ -231,6 +231,34 @@ def _module_device_type(module: Any) -> str | None:
     return device_type if isinstance(device_type, str) else None
 
 
+def _normalized_dtype(value: object) -> str | None:
+    name = str(value).lower().removeprefix("torch.")
+    aliases = {"bfloat16": "bf16", "float16": "fp16", "float32": "float32"}
+    return aliases.get(name)
+
+
+def _module_dtype(module: Any) -> str | None:
+    direct = _normalized_dtype(getattr(module, "dtype", None))
+    if direct is not None:
+        return direct
+    parameters = getattr(module, "parameters", None)
+    if not callable(parameters):
+        return None
+    observed: set[str] = set()
+    try:
+        values = parameters()
+    except Exception:
+        return None
+    for parameter in values:
+        floating = getattr(parameter, "is_floating_point", None)
+        if callable(floating) and not floating():
+            continue
+        normalized = _normalized_dtype(getattr(parameter, "dtype", None))
+        if normalized is not None:
+            observed.add(normalized)
+    return next(iter(observed)) if len(observed) == 1 else None
+
+
 def device_type(device: str) -> SelectedDeviceType:
     """Return the supported backend type for one selected device string."""
     value = device.split(":", 1)[0]
@@ -239,8 +267,13 @@ def device_type(device: str) -> SelectedDeviceType:
     return cast(SelectedDeviceType, value)
 
 
-def check_engine_devices(engine: Any, *, expected: SelectedDeviceType) -> None:
-    """Raise if encoder, adaptor, or embeddings miss the selected backend."""
+def check_engine_devices(
+    engine: Any,
+    *,
+    expected: SelectedDeviceType,
+    expected_dtype: str | None = None,
+) -> None:
+    """Raise if encoder, adaptor, or embeddings miss the selected policy."""
     for name in ("audio_encoder", "audio_adaptor", "embed_tokens"):
         module = getattr(engine, name, None)
         if module is None:
@@ -248,6 +281,22 @@ def check_engine_devices(engine: Any, *, expected: SelectedDeviceType) -> None:
         actual = _module_device_type(module)
         if actual != expected:
             raise DeviceMismatchError(f"{name} is on {actual!r}, expected {expected!r}")
+        if expected_dtype is not None:
+            actual_dtype = _module_dtype(module)
+            if actual_dtype != expected_dtype:
+                raise DeviceMismatchError(
+                    f"{name} dtype is {actual_dtype!r}, expected {expected_dtype!r}"
+                )
+
+
+def _funasr_precision_kwargs(dtype: str) -> dict[str, object]:
+    if dtype not in {"float32", "bf16", "fp16"}:
+        raise DeviceMismatchError("unsupported selected dtype")
+    return {
+        "dtype": dtype,
+        "bf16": dtype == "bf16",
+        "fp16": dtype == "fp16",
+    }
 
 
 def _is_oom_error(exc: BaseException) -> bool:
@@ -423,12 +472,19 @@ class NanoRuntime:
 
     def device_evidence(self) -> tuple[str, str]:
         """Return separately verified Nano/VAD selected-device evidence."""
-        check_engine_devices(self.engine, expected=self.expected_device_type)
+        check_engine_devices(
+            self.engine,
+            expected=self.expected_device_type,
+            expected_dtype=self.dtype,
+        )
         vad_model = getattr(self.vad, "_model", None)
         if vad_model is None:
             raise DeviceMismatchError("FSMN-VAD exposes no inspectable model")
         _assert_funasr_model_device(
-            vad_model, name="FSMN-VAD", expected=self.expected_device_type
+            vad_model,
+            name="FSMN-VAD",
+            expected=self.expected_device_type,
+            expected_dtype=self.dtype,
         )
         return self.device, self.device
 
@@ -451,14 +507,10 @@ class NanoRuntime:
     def _model_ready(self) -> bool:
         if self._closed:
             return False
-        engine = self.engine
-        for name in ("audio_encoder", "audio_adaptor", "embed_tokens"):
-            module = getattr(engine, name, None)
-            if (
-                module is None
-                or _module_device_type(module) != self.expected_device_type
-            ):
-                return False
+        try:
+            self.device_evidence()
+        except DeviceMismatchError:
+            return False
         return True
 
     # -- transcription ------------------------------------------------------
@@ -472,7 +524,11 @@ class NanoRuntime:
     ) -> Transcription:
         """Transcribe an audio path after checking the selected backend."""
         try:
-            check_engine_devices(self.engine, expected=self.expected_device_type)
+            check_engine_devices(
+                self.engine,
+                expected=self.expected_device_type,
+                expected_dtype=self.dtype,
+            )
             load_started = time.perf_counter()
             samples = _load_audio_samples(audio, sample_rate)
         except NanoRuntimeError as exc:
@@ -728,9 +784,13 @@ def load_nano_runtime(
     # Reuse the already-downloaded FSMN-VAD instead of re-downloading it.
     os.environ.setdefault("MODELSCOPE_CACHE", str(models_root()))
 
-    engine = load_native_nano_engine(selected_device)
-    check_engine_devices(engine, expected=expected_device_type)
-    vad = _load_vad(selected_device)
+    engine = load_native_nano_engine(selected_device, selection.dtype)
+    check_engine_devices(
+        engine,
+        expected=expected_device_type,
+        expected_dtype=selection.dtype,
+    )
+    vad = _load_vad(selected_device, selection.dtype)
     return NanoRuntime(
         engine=engine,
         vad=vad,
@@ -740,7 +800,7 @@ def load_nano_runtime(
 
 
 def load_native_nano_engine(
-    device: str, *, model_dir: str | Path | None = None
+    device: str, dtype: str = "bf16", *, model_dir: str | Path | None = None
 ) -> NativeNanoEngine:
     """Load a local native Nano checkpoint for a selected supported device.
 
@@ -755,30 +815,44 @@ def load_native_nano_engine(
         model=str(nano_model_dir() if model_dir is None else model_dir),
         trust_remote_code=True,
         device=device,
+        **_funasr_precision_kwargs(dtype),
         disable_update=True,
     )
     _assert_funasr_model_device(
-        model, name="Fun-ASR-Nano", expected=expected_device_type
+        model,
+        name="Fun-ASR-Nano",
+        expected=expected_device_type,
+        expected_dtype=dtype,
     )
     return NativeNanoEngine(model)
 
 
-def _load_vad(device: str) -> FsmnVadSegmenter:
+def _load_vad(device: str, dtype: str = "bf16") -> FsmnVadSegmenter:
     expected_device_type = device_type(device)
     from funasr import AutoModel
 
     model = AutoModel(
         model=str(vad_model_dir()),
         device=device,
+        **_funasr_precision_kwargs(dtype),
         disable_update=True,
         max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
     )
-    _assert_funasr_model_device(model, name="FSMN-VAD", expected=expected_device_type)
+    _assert_funasr_model_device(
+        model,
+        name="FSMN-VAD",
+        expected=expected_device_type,
+        expected_dtype=dtype,
+    )
     return FsmnVadSegmenter(model)
 
 
 def _assert_funasr_model_device(
-    model: Any, *, name: str, expected: SelectedDeviceType
+    model: Any,
+    *,
+    name: str,
+    expected: SelectedDeviceType,
+    expected_dtype: str | None = None,
 ) -> None:
     """Reject a FunASR model unless it is entirely on the selected backend."""
     for candidate in (
@@ -797,8 +871,36 @@ def _assert_funasr_model_device(
                 raise DeviceMismatchError(
                     f"{name} is not entirely on {expected!r}"
                 )
+            if expected_dtype is not None:
+                actual_dtype = _module_dtype(candidate)
+                if actual_dtype != expected_dtype:
+                    raise DeviceMismatchError(
+                        f"{name} dtype is {actual_dtype!r}, expected {expected_dtype!r}"
+                    )
             return
     raise DeviceMismatchError(f"{name} exposes no inspectable parameters")
+
+
+def _assert_sensevoice_components(
+    model: Any,
+    *,
+    expected: SelectedDeviceType,
+    expected_dtype: str,
+) -> None:
+    _assert_funasr_model_device(
+        model,
+        name="SenseVoiceSmall",
+        expected=expected,
+        expected_dtype=expected_dtype,
+    )
+    vad_model = getattr(model, "vad_model", None)
+    if vad_model is not None:
+        _assert_funasr_model_device(
+            vad_model,
+            name="FSMN-VAD",
+            expected=expected,
+            expected_dtype=expected_dtype,
+        )
 
 
 class SenseVoiceRuntime:
@@ -824,10 +926,10 @@ class SenseVoiceRuntime:
         ready = not self._closed
         if ready:
             try:
-                _assert_funasr_model_device(
+                _assert_sensevoice_components(
                     self._model,
-                    name="SenseVoiceSmall",
                     expected=self.expected_device_type,
+                    expected_dtype=self.dtype,
                 )
             except DeviceMismatchError:
                 ready = False
@@ -856,10 +958,10 @@ class SenseVoiceRuntime:
         if self._closed:
             raise ModelLoadError("SenseVoiceSmall runtime is closed")
         try:
-            _assert_funasr_model_device(
+            _assert_sensevoice_components(
                 self._model,
-                name="SenseVoiceSmall",
                 expected=self.expected_device_type,
+                expected_dtype=self.dtype,
             )
             results = self._model.generate(input=audio)
         except NanoRuntimeError as exc:
@@ -913,7 +1015,8 @@ def load_sensevoice_runtime(
         raise ModelLoadError("sensevoice is not allowed by selected runtime")
     selected_device = selection.device
     expected_device_type = device_type(selected_device)
-    del inference
+    if inference.dtype != selection.dtype or inference.device != selection.device:
+        raise ModelLoadError("SenseVoice configuration differs from selected runtime")
     os.environ.setdefault("MODELSCOPE_CACHE", str(models_root()))
     from funasr import AutoModel
 
@@ -921,11 +1024,14 @@ def load_sensevoice_runtime(
         model=str(sensevoice_model_dir()),
         vad_model=str(vad_model_dir()),
         device=selected_device,
+        **_funasr_precision_kwargs(selection.dtype),
         disable_update=True,
         max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
     )
-    _assert_funasr_model_device(
-        model, name="SenseVoiceSmall", expected=expected_device_type
+    _assert_sensevoice_components(
+        model,
+        expected=expected_device_type,
+        expected_dtype=selection.dtype,
     )
     return SenseVoiceRuntime(
         model, selection=selection, default_timeout=default_timeout

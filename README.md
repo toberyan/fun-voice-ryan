@@ -5,9 +5,12 @@ Fun Voice Ryan 是运行在 Deepin DDE X11 上的本地语音输入助手：按�
 并将最终文本保留在剪贴板。推理运行时由首次初始化根据硬件验证结果选择，不在登录时加载模型。
 
 加速器路径以准确率优先：Fun-ASR-Nano-2512 为主识别，SenseVoiceSmall 为加载/OOM
-备用，识别 worker 完全停止后才按需运行 Qwen3.5-0.8B 修正和 CAM++ 说话人能力。
+备用，识别 worker 完全停止后才按需运行 Qwen3.5-0.8B 修正。
 纯 CPU 路径为低内存兜底，只使用 SenseVoiceSmall 与 VAD，提交原始识别文本；不下载、
 不启动 Nano、Qwen 或 CAM++。
+
+当前版本未实现 CAM++ 加载、说话人分离/身份或结构化结果接口；加速器清单中的
+`campplus` revision 及其预下载快照只是后续能力预留，不代表已有可调用的产品能力。
 
 ## 开发与桌面前提
 
@@ -42,9 +45,13 @@ fun-voice-selftest --format json
 `--backend cuda|xpu|cpu` 只验证该后端，失败时不回退，也不会覆盖旧的有效选择。
 `--force-reselect` 用于驱动、硬件或运行时发生变化后的重新选择。
 
+初始化会先验证或构建 Fcitx 插件与 DTK overlay；缺少开发依赖时以固定
+`native_prerequisite` 类别退出，尚不会创建候选运行时或下载模型。各后端的模型下载位于
+独立候选缓存，失败候选会被丢弃，只有成功选择允许的模型快照会提升到正式缓存。
+
 初始化会一次性下载所选后端允许的模型集：
 
-- CUDA / Intel XPU：Nano、SenseVoiceSmall、VAD、Qwen3.5-0.8B、CAM++；
+- CUDA / Intel XPU：Nano、SenseVoiceSmall、VAD、Qwen3.5-0.8B，以及仅作后续能力预留的 CAM++ 快照；
 - CPU：SenseVoiceSmall、VAD，严格为 **SenseVoice-only**，无 Qwen、无说话人能力。
 
 CUDA 优先使用通过探测的 BF16，不支持时允许探测并选择 FP16；Intel XPU 只接受 BF16；
@@ -74,8 +81,8 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/fun-voice-ryan/
 
 ## 使用与诊断
 
-登录后 daemon 常驻但不加载模型；Nano、SenseVoiceSmall、Qwen 和 CAM++ 均按需启动并在
-空闲时卸载。按住 `Super+C` 录音，松开后识别、上屏并更新剪贴板。
+登录后 daemon 常驻但不加载模型；Nano、SenseVoiceSmall 和 Qwen 均按需启动并在空闲时
+卸载。按住 `Super+C` 录音，松开后识别、上屏并更新剪贴板。
 
 ```bash
 fun-voice-selftest --format json

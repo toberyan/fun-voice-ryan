@@ -5,6 +5,7 @@ umask 077
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIMES_ROOT="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/runtimes"
 MODELS_BASE="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/models"
+MODEL_CANDIDATES_BASE="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/model-candidates"
 UV="${UV:-$(command -v uv || true)}"
 FUNASR_COMMIT="8cd758c0ced576516b05a749194e6a94cdd38f99"
 FUNASR_TARBALL_SHA256="f8b2c9b9954c463b5c0e433bd1f2706b5c6c28f16f755f55ec66365960c06da0"
@@ -157,12 +158,24 @@ else
     [[ "${RUNTIME_RESOLVED}" != "${PROJECT_VENV_RESOLVED}" ]] \
         || die "repository .venv is not an isolated runtime"
 fi
-[[ "${MODELS_RESOLVED}" == "$(realpath -m "${MODELS_BASE}")" ]] \
-    || die "models root is outside the application data root"
+MODELS_BASE_RESOLVED="$(realpath -m "${MODELS_BASE}")"
+MODEL_CANDIDATES_RESOLVED="$(realpath -m "${MODEL_CANDIDATES_BASE}")"
+if [[ "${MODELS_RESOLVED}" != "${MODELS_BASE_RESOLVED}" ]]; then
+    CANDIDATE_PARENT="$(dirname -- "${MODELS_RESOLVED}")"
+    CANDIDATE_NAME="$(basename -- "${MODELS_RESOLVED}")"
+    if [[ "${CANDIDATE_PARENT}" != "${MODEL_CANDIDATES_RESOLVED}" \
+        || ! "${CANDIDATE_NAME}" =~ ^[0-9a-f]{32}$ ]]; then
+        die "models root is outside the application data root"
+    fi
+fi
 [[ ! -L "${RUNTIME_DIR}" ]] || die "runtime directory must not be a symlink"
 
 prepare_secure_directory "${RUNTIMES_ROOT}" \
     || die "application runtimes root is unsafe"
+if [[ "${MODELS_RESOLVED}" != "${MODELS_BASE_RESOLVED}" ]]; then
+    prepare_secure_directory "${MODEL_CANDIDATES_BASE}" \
+        || die "models parent is unsafe"
+fi
 prepare_secure_directory "${MODELS_ROOT}" \
     || die "models root is unsafe"
 

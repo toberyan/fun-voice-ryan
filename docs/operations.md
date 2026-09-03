@@ -24,12 +24,17 @@ fun-voice-selftest --format json
 fcitx5、`uv`、CMake、pkg-config 和数据目录可写性。`--dry-run` 只显示候选顺序，不做这些
 桌面检查，也不写文件。
 
+通过桌面前提检查后，初始化会先验证或构建 Fcitx 插件与 DTK overlay；原生构建失败以
+`native_prerequisite` 类别终止，且发生在运行时创建或模型下载之前。每个硬件候选使用独立
+模型缓存；失败候选整体丢弃，只有最终成功策略允许的快照才提升到正式 `models/`，已有的
+其他用户快照和 revision 保持不变。
+
 选中后端的有效策略是：
 
-| 后端 | 精度 | ASR | 修正/说话人 |
+| 后端 | 精度 | ASR | 当前可用修正能力 |
 | --- | --- | --- | --- |
-| CUDA | 优先 BF16，探测不支持时允许 FP16 | Nano primary，SenseVoiceSmall fallback | Qwen3.5-0.8B / CAM++ 按需 |
-| Intel XPU | 仅 BF16 | Nano primary，SenseVoiceSmall fallback | Qwen3.5-0.8B / CAM++ 按需 |
+| CUDA | 优先 BF16，探测不支持时允许 FP16 | Nano primary，SenseVoiceSmall fallback | Qwen3.5-0.8B 按需 |
+| Intel XPU | 仅 BF16 | Nano primary，SenseVoiceSmall fallback | Qwen3.5-0.8B 按需 |
 | CPU | FP32 | **SenseVoice-only**，无 fallback | 禁用，不下载 Qwen/CAM++ |
 
 `docs/xpu-poc.md` 的九项 POC 仅为显式 Intel XPU 诊断：该命令自身失败关闭，但不能阻断
@@ -54,8 +59,11 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/fun-voice-ryan/
 固定 Python module，不解析任意模块名，也不使用 shell 拼接用户命令。
 
 首次成功探测会一次性下载该后端允许的模型集：CUDA/XPU 下载 Nano、SenseVoiceSmall、
-VAD、Qwen3.5-0.8B、CAM++；CPU 只下载 SenseVoiceSmall 与 VAD。重新安装不会隐式删除或
-重复下载已有快照。
+VAD、Qwen3.5-0.8B，以及作为后续能力预留但当前不会加载的 CAM++ 快照；CPU 只下载
+SenseVoiceSmall 与 VAD。重新安装不会隐式删除或重复下载已有快照。
+
+当前版本没有 CAM++ loader、说话人分离/身份请求，也没有结构化结果 endpoint。
+`selection.json` 的 `speaker_enabled` 仅是后续能力预留位，当前没有对外入口或验收承诺。
 
 ## 3. 配置来源与覆盖规则
 
@@ -91,9 +99,8 @@ journalctl --user -u fun-voice-daemon.service -f
 已经 `inactive`/`failed` 且 transport 不可达，再启动一次 Qwen 子进程。停止确认失败、
 Qwen 超时/OOM/校验拒绝时直接提交原始转写，绝不让 ASR 与 Qwen 同时抢占设备。
 
-CPU selection 的调度器只允许 SenseVoice profile：不会探测或启动 Nano socket，不创建
-Qwen child，也不会加载 CAM++。所有模型按需加载并在空闲窗口后卸载；登录本身不占用数 GB
-模型内存。
+CPU selection 的调度器只允许 SenseVoice profile：不会探测或启动 Nano socket，也不创建
+Qwen child。所有当前可执行模型按需加载并在空闲窗口后卸载；登录本身不占用数 GB 模型内存。
 
 ## 5. 自检与故障排查
 
@@ -155,7 +162,8 @@ fun-voice-benchmark --manifest /path/to/private-manifest.jsonl \
 ```
 
 输出只含类别级 CER、术语准确率、标点 P/R/F1 与冷/热 P50/P95 聚合值，可选报告固定
-`0600`。加速器可分别比较 Nano 原始结果与串行 Qwen 修正；CPU 只测 SenseVoice 原始结果。
+`0600`。命令严格使用当前 selection 的 primary profile 和 daemon 相同的 worker 生命周期：
+加速器测 Nano 原始结果，CPU 测 SenseVoice 原始结果。当前命令不提供 Qwen 对照模式。
 
 ## 9. 隐私与长录音
 
@@ -163,7 +171,8 @@ fun-voice-benchmark --manifest /path/to/private-manifest.jsonl \
   `0700`/`0600` 切分，结束后删除。
 - 10 分钟后按固定 60 秒分片识别并按时间顺序拼接；25 分钟提醒一次，30 分钟强制停止。
 - 日志、通知、probe 与 selftest 均不包含语音、转写正文或模型绝对路径。
-- 最终上屏文本（修正成功时为修正文本，否则为原始 ASR）留在剪贴板，结构化结果只经接口提供。
+- 最终上屏文本（修正成功时为修正文本，否则为原始 ASR）留在剪贴板；当前版本尚未提供
+  结构化结果接口。
 
 ## 10. 卸载
 

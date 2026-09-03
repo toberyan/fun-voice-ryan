@@ -8,6 +8,7 @@ score that invocation.  The optional report contains aggregates exclusively.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -20,8 +21,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fun_voice import config
-from fun_voice.contracts import CaptureArtifact, Transcription
-from fun_voice.daemon import SocketWorkerClient, default_start_worker_service
+from fun_voice.contracts import CaptureArtifact, SessionKey, Transcription
+from fun_voice.daemon import (
+    SocketWorkerClient,
+    SystemdModelProfileSupervisor,
+    _worker_socket_path,
+    default_health_worker_profile,
+    default_start_worker_service,
+    default_stop_worker_service,
+)
+from fun_voice.runtime_selection import RuntimeSelection, load_runtime_selection
+from fun_voice.scheduler import ModelScheduler
 
 _CATEGORY_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 _SCORE_KEYS = (
@@ -32,6 +42,7 @@ _SCORE_KEYS = (
     "punctuation_f1",
 )
 _MAX_REFERENCE_CHARACTERS = 16_384
+_BENCHMARK_WAIT_SECONDS = 180.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +53,76 @@ class BenchmarkCase:
     audio: str
     reference: str
     terms: tuple[str, ...] = ()
+
+
+class _SelectedBenchmarkRuntime:
+    """Run benchmark ASR through the daemon's selected worker lifecycle."""
+
+    def __init__(
+        self,
+        selection: RuntimeSelection,
+        *,
+        paths: config.RuntimePaths,
+        user_config: config.Config,
+    ) -> None:
+        effective = config.effective_runtime_config(user_config, selection)
+        start = functools.partial(default_start_worker_service, selection=selection)
+        stop = functools.partial(default_stop_worker_service, selection=selection)
+        health = functools.partial(default_health_worker_profile, selection=selection)
+        self._profile = effective.primary_asr_profile
+        self._workers = {
+            profile: SocketWorkerClient(
+                _worker_socket_path(paths, profile),
+                profile=profile,
+                start_service=start,
+                stop_service=stop,
+                auto_start_service=False,
+            )
+            for profile in selection.policy().allowed_profiles
+        }
+        supervisor = SystemdModelProfileSupervisor(
+            workers=self._workers,
+            start_service=start,
+            stop_service=stop,
+            service_lifecycle=health,
+        )
+        self._scheduler = ModelScheduler(
+            start_profile=supervisor.start_profile,
+            stop_profile=supervisor.stop_profile,
+            health_profile=supervisor.health_profile,
+            transport_profile=supervisor.transport_profile,
+            allowed_profiles=selection.policy().allowed_profiles,
+        )
+        self._key = SessionKey("local-benchmark")
+        self._scheduler.activate(self._key)
+
+    def transcribe(self, artifact: CaptureArtifact) -> Transcription:
+        worker = self._workers[self._profile]
+        handle = self._scheduler.run_asr(
+            self._key, self._profile, lambda: worker.transcribe(artifact)
+        )
+        if not handle.wait(timeout=_BENCHMARK_WAIT_SECONDS):
+            raise RuntimeError("benchmark ASR timed out")
+        result = handle.result()
+        if not isinstance(result, Transcription):
+            raise RuntimeError("benchmark ASR returned an invalid result")
+        return result
+
+    def close(self) -> None:
+        self._scheduler.close()
+        for worker in self._workers.values():
+            worker.close()
+
+
+def _build_selected_benchmark_runtime(
+    selection: RuntimeSelection,
+    *,
+    paths: config.RuntimePaths,
+    user_config: config.Config,
+) -> _SelectedBenchmarkRuntime:
+    return _SelectedBenchmarkRuntime(
+        selection, paths=paths, user_config=user_config
+    )
 
 
 def score_text(
@@ -266,13 +347,17 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        selection = load_runtime_selection()
+        user_config = config.load_config()
         cases = _load_manifest(args.manifest)
         paths = config.build_runtime_paths(config.resolve_runtime_dir())
-        worker = SocketWorkerClient(
-            paths.worker_socket,
-            start_service=lambda: default_start_worker_service("nano"),
+        runtime = _build_selected_benchmark_runtime(
+            selection, paths=paths, user_config=user_config
         )
-        report = _run_cases(cases, worker.transcribe)
+        try:
+            report = _run_cases(cases, runtime.transcribe)
+        finally:
+            runtime.close()
         if args.output is not None:
             _write_report(args.output, report)
     except Exception:  # noqa: BLE001 - never echo private manifest/model data

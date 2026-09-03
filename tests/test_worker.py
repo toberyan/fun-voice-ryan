@@ -61,8 +61,9 @@ class FakeVad:
 
 
 class FakeModule:
-    def __init__(self, device_type: str) -> None:
+    def __init__(self, device_type: str, dtype: str = "torch.bfloat16") -> None:
         self.device = SimpleNamespace(type=device_type)
+        self.dtype = dtype
 
 
 class FakeEngine:
@@ -126,9 +127,15 @@ class SlowEngine:
 class FakeNativeNanoModel:
     """Fake native FunASR wrapper used without importing model dependencies."""
 
-    def __init__(self) -> None:
-        module = SimpleNamespace(device=SimpleNamespace(type="xpu"))
-        parameter = SimpleNamespace(device=SimpleNamespace(type="xpu"))
+    def __init__(self, dtype: str = "torch.bfloat16") -> None:
+        module = SimpleNamespace(
+            device=SimpleNamespace(type="xpu"), dtype=dtype
+        )
+        parameter = SimpleNamespace(
+            device=SimpleNamespace(type="xpu"),
+            dtype=dtype,
+            is_floating_point=lambda: True,
+        )
         module.parameters = lambda: iter([parameter])
         llm_model = SimpleNamespace(get_input_embeddings=lambda: module)
         llm_model.parameters = lambda: iter([parameter])
@@ -367,13 +374,18 @@ def test_native_nano_loader_uses_only_local_snapshot_and_xpu(
 
     monkeypatch.setitem(sys.modules, "funasr", SimpleNamespace(AutoModel=_auto_model))
 
-    engine = nano_mod.load_native_nano_engine("xpu:0", model_dir="/local/nano")
+    engine = nano_mod.load_native_nano_engine(
+        "xpu:0", "bf16", model_dir="/local/nano"
+    )
 
     assert isinstance(engine, NativeNanoEngine)
     assert captured == {
         "model": "/local/nano",
         "trust_remote_code": True,
         "device": "xpu:0",
+        "dtype": "bf16",
+        "bf16": True,
+        "fp16": False,
         "disable_update": True,
     }
     assert engine.decoder_device_type == "xpu"
@@ -474,8 +486,10 @@ def test_runtime_timeout_raises_then_next_request_succeeds() -> None:
 # --- Device guard -----------------------------------------------------------
 
 
-def _engine_on(device_type: str) -> SimpleNamespace:
-    mod = SimpleNamespace(device=SimpleNamespace(type=device_type))
+def _engine_on(
+    device_type: str, dtype: str = "torch.bfloat16"
+) -> SimpleNamespace:
+    mod = SimpleNamespace(device=SimpleNamespace(type=device_type), dtype=dtype)
     return SimpleNamespace(audio_encoder=mod, audio_adaptor=mod, embed_tokens=mod)
 
 
@@ -527,7 +541,11 @@ def test_live_fd_rejects_an_oversized_descriptor_before_vad() -> None:
 
 
 def test_vad_loader_rejects_a_non_xpu_model(monkeypatch: pytest.MonkeyPatch) -> None:
-    parameter = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+    parameter = SimpleNamespace(
+        device=SimpleNamespace(type="cpu"),
+        dtype="torch.bfloat16",
+        is_floating_point=lambda: True,
+    )
     model = SimpleNamespace(parameters=lambda: iter([parameter]))
     monkeypatch.setitem(
         sys.modules,
@@ -536,16 +554,80 @@ def test_vad_loader_rejects_a_non_xpu_model(monkeypatch: pytest.MonkeyPatch) -> 
     )
 
     with pytest.raises(DeviceMismatchError):
-        nano_mod._load_vad("xpu:0")
+        nano_mod._load_vad("xpu:0", "bf16")
+
+
+def test_vad_loader_rejects_selected_dtype_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter = SimpleNamespace(
+        device=SimpleNamespace(type="xpu"),
+        dtype="torch.float32",
+        is_floating_point=lambda: True,
+    )
+    model = SimpleNamespace(parameters=lambda: iter([parameter]))
+    captured: dict[str, object] = {}
+
+    def auto_model(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setitem(sys.modules, "funasr", SimpleNamespace(AutoModel=auto_model))
+
+    with pytest.raises(DeviceMismatchError, match="dtype"):
+        nano_mod._load_vad("xpu:0", "bf16")
+    assert captured["dtype"] == "bf16"
+    assert captured["bf16"] is True
+    assert captured["fp16"] is False
+
+
+def test_loaded_nano_runtime_health_rechecks_vad_selected_dtype() -> None:
+    parameter = SimpleNamespace(
+        device=SimpleNamespace(type="xpu"),
+        dtype="torch.float32",
+        is_floating_point=lambda: True,
+    )
+    vad_model = SimpleNamespace(parameters=lambda: iter([parameter]))
+    runtime = NanoRuntime(
+        engine=_engine_on("xpu"),
+        vad=FsmnVadSegmenter(vad_model),
+        selection=_selection("xpu"),
+    )
+
+    assert runtime.health().model_ready is False
+    with pytest.raises(DeviceMismatchError, match="dtype"):
+        runtime.device_evidence()
 
 
 def test_nano_loader_rejects_a_non_xpu_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        nano_mod, "load_native_nano_engine", lambda _device: _engine_on("cpu")
+        nano_mod,
+        "load_native_nano_engine",
+        lambda _device, _dtype: _engine_on("cpu"),
     )
-    monkeypatch.setattr(nano_mod, "_load_vad", lambda _device: FakeVad([(0, 100)]))
+    monkeypatch.setattr(
+        nano_mod, "_load_vad", lambda _device, _dtype: FakeVad([(0, 100)])
+    )
 
     with pytest.raises(DeviceMismatchError):
+        nano_mod.load_nano_runtime(
+            selection=_selection("xpu"), inference=_inference(_selection("xpu"))
+        )
+
+
+def test_nano_loader_rejects_engine_with_wrong_selected_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        nano_mod,
+        "load_native_nano_engine",
+        lambda _device, _dtype: _engine_on("xpu", "torch.float32"),
+    )
+    monkeypatch.setattr(
+        nano_mod, "_load_vad", lambda _device, _dtype: FakeVad([(0, 100)])
+    )
+
+    with pytest.raises(DeviceMismatchError, match="dtype"):
         nano_mod.load_nano_runtime(
             selection=_selection("xpu"), inference=_inference(_selection("xpu"))
         )
@@ -558,12 +640,14 @@ def test_nano_loader_uses_accelerator_selection_not_toml(
     selection = _selection(backend)
     captured: dict[str, str] = {}
 
-    def load_engine(device: str) -> SimpleNamespace:
+    def load_engine(device: str, dtype: str) -> SimpleNamespace:
         captured["engine_device"] = device
+        captured["engine_dtype"] = dtype
         return _engine_on(backend)
 
-    def load_vad(device: str) -> FakeVad:
+    def load_vad(device: str, dtype: str) -> FakeVad:
         captured["vad_device"] = device
+        captured["vad_dtype"] = dtype
         return FakeVad([(0, 100)])
 
     monkeypatch.setattr(nano_mod, "load_native_nano_engine", load_engine)
@@ -576,7 +660,9 @@ def test_nano_loader_uses_accelerator_selection_not_toml(
     assert runtime.device == f"{backend}:0"
     assert captured == {
         "engine_device": f"{backend}:0",
+        "engine_dtype": "bf16",
         "vad_device": f"{backend}:0",
+        "vad_dtype": "bf16",
     }
 
 
@@ -585,8 +671,20 @@ def test_cpu_sensevoice_loader_uses_selected_cpu_dtype_and_device_type(
 ) -> None:
     selection = _selection("cpu")
     captured: dict[str, object] = {}
-    parameter = SimpleNamespace(device=SimpleNamespace(type="cpu"))
-    model = SimpleNamespace(parameters=lambda: iter([parameter]))
+    parameter = SimpleNamespace(
+        device=SimpleNamespace(type="cpu"),
+        dtype="torch.float32",
+        is_floating_point=lambda: True,
+    )
+    vad_parameter = SimpleNamespace(
+        device=SimpleNamespace(type="cpu"),
+        dtype="torch.float32",
+        is_floating_point=lambda: True,
+    )
+    vad_model = SimpleNamespace(parameters=lambda: iter([vad_parameter]))
+    model = SimpleNamespace(
+        parameters=lambda: iter([parameter]), vad_model=vad_model
+    )
 
     def auto_model(**kwargs: object) -> SimpleNamespace:
         captured.update(kwargs)
@@ -599,9 +697,32 @@ def test_cpu_sensevoice_loader_uses_selected_cpu_dtype_and_device_type(
     )
 
     assert captured["device"] == "cpu"
+    assert captured["dtype"] == "float32"
+    assert captured["bf16"] is False
+    assert captured["fp16"] is False
     assert runtime.device == "cpu"
     assert runtime.dtype == "float32"
     assert runtime.expected_device_type == "cpu"
+
+
+def test_loaded_sensevoice_health_rechecks_vad_selected_dtype() -> None:
+    main_parameter = SimpleNamespace(
+        device=SimpleNamespace(type="cpu"),
+        dtype="torch.float32",
+        is_floating_point=lambda: True,
+    )
+    vad_parameter = SimpleNamespace(
+        device=SimpleNamespace(type="cpu"),
+        dtype="torch.bfloat16",
+        is_floating_point=lambda: True,
+    )
+    model = SimpleNamespace(
+        parameters=lambda: iter([main_parameter]),
+        vad_model=SimpleNamespace(parameters=lambda: iter([vad_parameter])),
+    )
+    runtime = nano_mod.SenseVoiceRuntime(model, selection=_selection("cpu"))
+
+    assert runtime.health().model_ready is False
 
 
 def test_nano_loader_rejects_cpu_selection_before_model_import(
@@ -611,7 +732,7 @@ def test_nano_loader_rejects_cpu_selection_before_model_import(
     monkeypatch.setattr(
         nano_mod,
         "load_native_nano_engine",
-        lambda _device: pytest.fail("Nano engine must not load for CPU"),
+        lambda _device, _dtype: pytest.fail("Nano engine must not load for CPU"),
     )
 
     with pytest.raises(ModelLoadError, match="nano is not allowed"):

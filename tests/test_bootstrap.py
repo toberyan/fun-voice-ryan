@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -42,6 +43,8 @@ class FakeRunner:
         self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
     ) -> CommandResult:
         self.calls.append((argv, env))
+        if argv[:3] == ("systemctl", "--user", "show"):
+            return CommandResult(0, "inactive\n")
         if "create-runtime-env.sh" in argv[0]:
             backend = argv[argv.index("--backend") + 1]
             runtime = Path(argv[argv.index("--runtime-dir") + 1])
@@ -57,6 +60,23 @@ class FakeRunner:
             backend = argv[argv.index("--backend") + 1]
             self.probed.append(backend)
             result = replace(self.results[backend], backend=backend)
+            models_root = Path(argv[argv.index("--models-root") + 1])
+            cache_names = {
+                "nano": "FunAudioLLM--Fun-ASR-Nano-2512",
+                "sensevoice": "iic--SenseVoiceSmall",
+                "vad": "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+                "qwen": "Qwen--Qwen3.5-0.8B",
+                "campplus": "iic--speech_campplus_sv_zh-cn_16k-common",
+            }
+            for key in result.models:
+                snapshot = (
+                    models_root
+                    / "models"
+                    / cache_names[key]
+                    / "snapshots/master"
+                )
+                snapshot.mkdir(parents=True, mode=0o700, exist_ok=True)
+                (snapshot / "configuration.json").write_text("{}", encoding="utf-8")
             return CommandResult(0 if result.status == "pass" else 1, result.to_json())
         return CommandResult(0, "")
 
@@ -127,6 +147,7 @@ def desktop_prerequisites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     monkeypatch.setenv("XDG_CURRENT_DESKTOP", "Deepin;DDE")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     monkeypatch.setenv("PATH", str(tools))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     return tmp_path / "data" / "fun-voice-ryan"
 
 
@@ -374,7 +395,11 @@ def test_install_failure_restores_exact_previous_manifest(
         )
     assert manifest.read_bytes() == previous_bytes
     assert manifest.stat().st_mode & 0o777 == previous_mode
-    assert not any(call[0][0] == "systemctl" for call in runner.calls)
+    assert not any(
+        call[0]
+        == ("systemctl", "--user", "restart", "fun-voice-daemon.service")
+        for call in runner.calls
+    )
 
 
 def test_accelerator_to_cpu_reselection_stops_both_workers_before_daemon(
@@ -449,7 +474,9 @@ def test_accelerator_to_cpu_reselection_stops_both_workers_before_daemon(
         "--value",
         "fun-voice-daemon.service",
     )
-    assert commands.index(daemon_stop) < commands.index(daemon_confirm)
+    daemon_stop_index = commands.index(daemon_stop)
+    daemon_confirm_index = commands.index(daemon_confirm, daemon_stop_index + 1)
+    assert daemon_stop_index < daemon_confirm_index
     for unit in sorted(worker_units):
         stop = ("systemctl", "--user", "stop", unit)
         confirm = (
@@ -461,11 +488,453 @@ def test_accelerator_to_cpu_reselection_stops_both_workers_before_daemon(
             unit,
         )
         assert (
-            commands.index(daemon_confirm)
+            daemon_confirm_index
             < commands.index(stop)
-            < commands.index(confirm)
+            < commands.index(confirm, commands.index(stop) + 1)
             < restart_index
         )
+
+
+def test_same_backend_new_generation_quiesces_both_workers_before_restart(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "xpu")
+
+    class GenerationRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"xpu": passed("xpu", "bf16")})
+            self.running = {
+                "fun-voice-daemon.service",
+                "fun-voice-worker@nano.service",
+                "fun-voice-worker@sensevoice.service",
+            }
+            self.install_generation: str | None = None
+            self.restart_running: set[str] | None = None
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if "install-user.sh" in argv[0]:
+                self.install_generation = load_runtime_selection(
+                    desktop_prerequisites
+                ).python.parent.parent.name
+            elif argv[:3] == ("systemctl", "--user", "stop"):
+                self.running.discard(argv[-1])
+            elif argv[:3] == ("systemctl", "--user", "show"):
+                return CommandResult(
+                    0, "active\n" if argv[-1] in self.running else "inactive\n"
+                )
+            elif argv == (
+                "systemctl",
+                "--user",
+                "restart",
+                "fun-voice-daemon.service",
+            ):
+                self.restart_running = set(self.running)
+                self.running.add("fun-voice-daemon.service")
+            return result
+
+    runner = GenerationRunner()
+    selected = run_initialization(
+        _options("xpu", force=True, root=desktop_prerequisites), runner
+    )
+
+    assert selected.python != previous.python
+    assert runner.install_generation == selected.python.parent.parent.name
+    assert runner.restart_running == set()
+    commands = [argv for argv, _ in runner.calls]
+    install_index = next(
+        index for index, argv in enumerate(commands) if "install-user.sh" in argv[0]
+    )
+    restart_index = commands.index(
+        ("systemctl", "--user", "restart", "fun-voice-daemon.service")
+    )
+    for unit in (
+        "fun-voice-daemon.service",
+        "fun-voice-worker@nano.service",
+        "fun-voice-worker@sensevoice.service",
+    ):
+        stop = ("systemctl", "--user", "stop", unit)
+        confirm = (
+            "systemctl",
+            "--user",
+            "show",
+            "--property=ActiveState",
+            "--value",
+            unit,
+        )
+        stop_index = commands.index(stop)
+        confirm_index = commands.index(confirm, stop_index + 1)
+        assert stop_index < confirm_index < install_index < restart_index
+
+
+def test_restart_failure_restores_old_binding_manifest_and_active_state(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "xpu")
+
+    class RestartFailureRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.daemon_active = True
+            self.worker_active = {"fun-voice-worker@nano.service"}
+            self.install_bindings: list[Path] = []
+            self.restart_attempts = 0
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if "install-user.sh" in argv[0]:
+                self.install_bindings.append(
+                    load_runtime_selection(desktop_prerequisites).python
+                )
+            elif argv[:3] == ("systemctl", "--user", "show"):
+                unit = argv[-1]
+                active = (
+                    self.daemon_active
+                    if unit == "fun-voice-daemon.service"
+                    else unit in self.worker_active
+                )
+                return CommandResult(0, "active\n" if active else "inactive\n")
+            elif argv[:3] == ("systemctl", "--user", "stop"):
+                unit = argv[-1]
+                if unit == "fun-voice-daemon.service":
+                    self.daemon_active = False
+                else:
+                    self.worker_active.discard(unit)
+            elif argv[:3] == ("systemctl", "--user", "start"):
+                unit = argv[-1]
+                if unit == "fun-voice-daemon.service":
+                    self.daemon_active = True
+                else:
+                    self.worker_active.add(unit)
+            elif argv == (
+                "systemctl",
+                "--user",
+                "restart",
+                "fun-voice-daemon.service",
+            ):
+                self.restart_attempts += 1
+                if self.restart_attempts == 1:
+                    return CommandResult(1, "")
+                self.daemon_active = True
+            return result
+
+    runner = RestartFailureRunner()
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert load_runtime_selection(desktop_prerequisites) == previous
+    assert len(runner.install_bindings) == 1
+    assert runner.install_bindings[0] != previous.python
+    assert runner.daemon_active is True
+    assert runner.worker_active == {"fun-voice-worker@nano.service"}
+
+
+def test_failed_restart_restores_previously_inactive_daemon_state(
+    desktop_prerequisites: Path,
+) -> None:
+    class ActiveDespiteRestartFailure(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.daemon_active = False
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if argv[:3] == ("systemctl", "--user", "show"):
+                active = argv[-1] == "fun-voice-daemon.service" and self.daemon_active
+                return CommandResult(0, "active\n" if active else "inactive\n")
+            if (
+                argv[:3] == ("systemctl", "--user", "stop")
+                and argv[-1] == "fun-voice-daemon.service"
+            ):
+                self.daemon_active = False
+            if argv == (
+                "systemctl",
+                "--user",
+                "restart",
+                "fun-voice-daemon.service",
+            ):
+                self.daemon_active = True
+                return CommandResult(1, "")
+            return result
+
+    runner = ActiveDespiteRestartFailure()
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", root=desktop_prerequisites), runner
+        )
+
+    assert runner.daemon_active is False
+    assert not selection_path(desktop_prerequisites).exists()
+
+
+def test_persistently_failing_install_restores_exact_launcher_and_daemon_state(
+    desktop_prerequisites: Path,
+) -> None:
+    _write_selection(desktop_prerequisites, "xpu")
+    launcher = Path(os.environ["HOME"]) / ".local/bin/fun-voice-daemon"
+    launcher.parent.mkdir(parents=True, mode=0o700)
+    launcher.write_bytes(b"#!/bin/sh\nexec /old/runtime\n")
+    launcher.chmod(0o700)
+    previous_bytes = launcher.read_bytes()
+
+    class PersistentInstallFailure(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.daemon_active = True
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if "install-user.sh" in argv[0]:
+                launcher.write_bytes(b"#!/bin/sh\nexec /new/runtime\n")
+                launcher.chmod(0o700)
+                return CommandResult(1, "")
+            if argv[:3] == ("systemctl", "--user", "show"):
+                active = argv[-1] == "fun-voice-daemon.service" and self.daemon_active
+                return CommandResult(0, "active\n" if active else "inactive\n")
+            if (
+                argv[:3] == ("systemctl", "--user", "stop")
+                and argv[-1] == "fun-voice-daemon.service"
+            ):
+                self.daemon_active = False
+            if (
+                argv[:3] == ("systemctl", "--user", "start")
+                and argv[-1] == "fun-voice-daemon.service"
+            ):
+                self.daemon_active = True
+            return result
+
+    runner = PersistentInstallFailure()
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert launcher.read_bytes() == previous_bytes
+    assert launcher.stat().st_mode & 0o777 == 0o700
+    assert runner.daemon_active is True
+
+
+def test_unconfirmed_worker_quiescence_keeps_old_selection_unpublished(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "xpu")
+
+    class QuiesceFailure(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"xpu": passed("xpu", "bf16")})
+            self.install_calls = 0
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if argv == (
+                "systemctl",
+                "--user",
+                "stop",
+                "fun-voice-worker@sensevoice.service",
+            ):
+                return CommandResult(1, "")
+            if "install-user.sh" in argv[0]:
+                self.install_calls += 1
+            return result
+
+    runner = QuiesceFailure()
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("xpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert load_runtime_selection(desktop_prerequisites) == previous
+    assert runner.install_calls == 0
+
+
+def test_interrupt_during_install_rolls_back_before_next_run_can_accept_selection(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "xpu")
+
+    class InterruptRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.install_calls = 0
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if "install-user.sh" in argv[0]:
+                self.install_calls += 1
+                if self.install_calls == 1:
+                    raise KeyboardInterrupt
+            return result
+
+    runner = InterruptRunner()
+    with pytest.raises(KeyboardInterrupt):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert runner.install_calls == 1
+    assert load_runtime_selection(desktop_prerequisites) == previous
+    next_runner = FakeRunner.all_fail()
+    assert run_initialization(
+        _options("auto", root=desktop_prerequisites), next_runner
+    ) == previous
+    assert next_runner.calls == []
+
+
+def test_next_run_recovers_model_snapshot_left_by_abrupt_interruption(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "xpu")
+    manifest = selection_path(desktop_prerequisites)
+    previous_bytes = manifest.read_bytes()
+    previous_mode = manifest.stat().st_mode & 0o777
+    token = "0123456789abcdef0123456789abcdef"
+    snapshots = (
+        desktop_prerequisites
+        / "models/models/iic--SenseVoiceSmall/snapshots"
+    )
+    current = snapshots / "master"
+    backup = snapshots / f".previous-master-{token}"
+    current.mkdir(parents=True, mode=0o700)
+    backup.mkdir(mode=0o700)
+    (current / "configuration.json").write_text("new", encoding="utf-8")
+    (backup / "configuration.json").write_text("old", encoding="utf-8")
+    _write_selection(desktop_prerequisites, "cpu")
+
+    import fun_voice.bootstrap as bootstrap
+
+    bindings = [
+        {
+            "relative_path": relative,
+            "kind": "missing",
+            "content": None,
+            "mode": None,
+        }
+        for relative in bootstrap._DEPLOYMENT_BINDINGS
+    ]
+    journal = {
+        "version": 2,
+        "previous_manifest": base64.b64encode(previous_bytes).decode("ascii"),
+        "previous_mode": previous_mode,
+        "active_units": [],
+        "bindings": bindings,
+        "model_promotions": [
+            {
+                "key": "sensevoice",
+                "token": token,
+                "had_destination": True,
+            }
+        ],
+    }
+    journal_path = desktop_prerequisites / ".initialization-transaction.json"
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    journal_path.chmod(0o600)
+
+    runner = FakeRunner.all_fail()
+    selected = run_initialization(
+        _options("auto", root=desktop_prerequisites), runner
+    )
+
+    assert selected == previous
+    assert (current / "configuration.json").read_text(encoding="utf-8") == "old"
+    assert not backup.exists()
+    assert not journal_path.exists()
+    assert not any("create-runtime-env.sh" in argv[0] for argv, _ in runner.calls)
+
+
+def test_native_build_failure_precedes_runtime_and_model_work(
+    desktop_prerequisites: Path,
+) -> None:
+    class NativeFailureRunner(FakeRunner):
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if "build-native-artifacts.sh" in argv[0]:
+                return CommandResult(1, "")
+            return result
+
+    runner = NativeFailureRunner({"cpu": passed("cpu", "float32")})
+    with pytest.raises(InitializationError, match="^native_prerequisite$"):
+        run_initialization(_options("cpu", root=desktop_prerequisites), runner)
+
+    commands = [argv for argv, _ in runner.calls]
+    assert any("build-native-artifacts.sh" in argv[0] for argv in commands)
+    assert not any("create-runtime-env.sh" in argv[0] for argv in commands)
+    assert not selection_path(desktop_prerequisites).exists()
+
+
+def test_failed_accelerator_model_candidates_do_not_pollute_cpu_cache(
+    desktop_prerequisites: Path,
+) -> None:
+    unrelated = desktop_prerequisites / "models/models/user--private/snapshots/master"
+    unrelated.mkdir(parents=True, mode=0o700)
+    desktop_prerequisites.chmod(0o700)
+    (unrelated / "keep").write_text("keep", encoding="utf-8")
+
+    class CandidateCacheRunner(FakeRunner):
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            if "fun_voice.backend_probe" in argv:
+                backend = argv[argv.index("--backend") + 1]
+                models_root = Path(argv[argv.index("--models-root") + 1])
+                names = (
+                    (
+                        "iic--SenseVoiceSmall",
+                        "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+                    )
+                    if backend == "cpu"
+                    else (
+                        "FunAudioLLM--Fun-ASR-Nano-2512",
+                        "iic--SenseVoiceSmall",
+                        "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+                        "Qwen--Qwen3.5-0.8B",
+                        "iic--speech_campplus_sv_zh-cn_16k-common",
+                    )
+                )
+                for name in names:
+                    snapshot = models_root / "models" / name / "snapshots/master"
+                    snapshot.mkdir(parents=True, mode=0o700)
+                    (snapshot / "configuration.json").write_text(
+                        "{}", encoding="utf-8"
+                    )
+            return super().run(argv, env=env)
+
+    runner = CandidateCacheRunner(
+        {
+            "cuda": fail("tensor"),
+            "xpu": fail("asr"),
+            "cpu": passed("cpu", "float32"),
+        }
+    )
+    selected = run_initialization(
+        _options("auto", root=desktop_prerequisites), runner
+    )
+
+    assert selected.backend == "cpu"
+    final_models = desktop_prerequisites / "models/models"
+    assert (unrelated / "keep").read_text(encoding="utf-8") == "keep"
+    assert {path.name for path in final_models.iterdir()} == {
+        "user--private",
+        "iic--SenseVoiceSmall",
+        "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    }
+    candidates = desktop_prerequisites / "model-candidates"
+    assert not candidates.exists() or list(candidates.iterdir()) == []
 
 
 def test_successful_candidate_is_atomically_promoted_to_immutable_generation(

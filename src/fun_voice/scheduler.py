@@ -10,6 +10,7 @@ unpublishable instead.
 from __future__ import annotations
 
 import heapq
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -132,8 +133,8 @@ class ModelScheduler:
             or len(set(allowed_profiles)) != len(allowed_profiles)
         ):
             raise ValueError("allowed ASR profiles are invalid")
-        if startup_timeout < 0:
-            raise ValueError("ASR startup timeout must be non-negative")
+        if not math.isfinite(startup_timeout) or startup_timeout < 0:
+            raise ValueError("ASR startup timeout must be finite and non-negative")
         self._start_profile = (
             start_profile if start_profile is not None else self._deny_profile_start
         )

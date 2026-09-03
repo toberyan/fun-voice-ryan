@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -16,7 +17,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from fun_voice.runtime_selection import (
     Backend,
@@ -60,6 +61,32 @@ _ASR_WORKER_UNITS = (
     "fun-voice-worker@nano.service",
     "fun-voice-worker@sensevoice.service",
 )
+_MANAGED_UNITS = ("fun-voice-daemon.service", *_ASR_WORKER_UNITS)
+_TRANSACTION_FILE = ".initialization-transaction.json"
+_MODEL_CACHE_NAMES = {
+    "nano": "FunAudioLLM--Fun-ASR-Nano-2512",
+    "sensevoice": "iic--SenseVoiceSmall",
+    "vad": "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    "qwen": "Qwen--Qwen3.5-0.8B",
+    "campplus": "iic--speech_campplus_sv_zh-cn_16k-common",
+}
+_DEPLOYMENT_BINDINGS = (
+    ".local/bin/fun-voice-daemon",
+    ".local/bin/fun-voice-worker",
+    ".local/bin/fun-voice-preflight",
+    ".local/bin/fun-voice-selftest",
+    ".local/bin/fun-voice-corrector",
+    ".local/bin/fun-voice-benchmark",
+    ".local/bin/fun-voice-bridge",
+    ".config/systemd/user/fun-voice-daemon.service",
+    ".config/systemd/user/fun-voice-worker@.service",
+    ".config/systemd/user/fun-voice-worker.service",
+    ".config/autostart/fun-voice-session.desktop",
+    ".local/lib/fcitx5/fcitx5-fun-voice.so",
+    ".local/share/fcitx5/addon/fcitx5-fun-voice.conf",
+    ".local/lib/fun-voice-ryan/fun-voice-overlay",
+)
+_MAX_BINDING_BYTES = 4 * 1024 * 1024
 
 
 class InitializationError(RuntimeError):
@@ -85,6 +112,32 @@ class CommandRunner(Protocol):
     def run(
         self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
     ) -> CommandResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _ServiceSnapshot:
+    active_units: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelPromotion:
+    destination: Path
+    backup: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelPromotionPlan:
+    key: str
+    token: str
+    had_destination: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _BindingSnapshot:
+    relative_path: str
+    kind: Literal["missing", "file", "symlink"]
+    content: bytes | None
+    mode: int | None
 
 
 class SubprocessCommandRunner:
@@ -339,9 +392,14 @@ def _candidate_runtime_paths(root: Path, backend: Backend) -> tuple[Path, Path]:
     )
 
 
+def _candidate_models_path(root: Path, runtime: Path) -> Path:
+    token = runtime.name.rsplit("-", 1)[-1]
+    return root / "model-candidates" / token
+
+
 def _discard_candidate(candidate: Path) -> None:
     try:
-        if candidate.is_symlink():
+        if candidate.is_symlink() or candidate.is_file():
             candidate.unlink()
         elif candidate.exists():
             shutil.rmtree(candidate)
@@ -367,8 +425,8 @@ def _stop_service(runner: CommandRunner, unit: str) -> None:
         raise InitializationError("install")
 
 
-def _stop_accelerator_workers(runner: CommandRunner) -> None:
-    """Quiesce the old daemon, then prove both workers have exited."""
+def _quiesce_model_services(runner: CommandRunner) -> None:
+    """Quiesce the daemon, then prove both possible workers have exited."""
     _stop_service(runner, "fun-voice-daemon.service")
     for unit in _ASR_WORKER_UNITS:
         stopped = runner.run(("systemctl", "--user", "stop", unit))
@@ -387,6 +445,462 @@ def _stop_accelerator_workers(runner: CommandRunner) -> None:
         )
         if state.returncode != 0 or state.stdout.strip() not in {"inactive", "failed"}:
             raise InitializationError("install")
+
+
+def _snapshot_service_state(runner: CommandRunner) -> _ServiceSnapshot:
+    active: set[str] = set()
+    for unit in _MANAGED_UNITS:
+        state = runner.run(
+            (
+                "systemctl",
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--value",
+                unit,
+            )
+        )
+        if state.returncode == 0 and state.stdout.strip() in {
+            "active",
+            "activating",
+            "reloading",
+        }:
+            active.add(unit)
+    return _ServiceSnapshot(frozenset(active))
+
+
+def _restore_service_state(
+    runner: CommandRunner, snapshot: _ServiceSnapshot
+) -> None:
+    for unit in (*_ASR_WORKER_UNITS, "fun-voice-daemon.service"):
+        if unit not in snapshot.active_units:
+            continue
+        started = runner.run(("systemctl", "--user", "start", unit))
+        if started.returncode != 0:
+            raise InitializationError("install")
+
+
+def _stop_managed_services_for_restore(runner: CommandRunner) -> None:
+    for unit in _MANAGED_UNITS:
+        runner.run(("systemctl", "--user", "stop", unit))
+        state = runner.run(
+            (
+                "systemctl",
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--value",
+                unit,
+            )
+        )
+        if state.returncode != 0 or state.stdout.strip() not in {
+            "inactive",
+            "failed",
+        }:
+            raise InitializationError("install")
+
+
+def _write_transaction_journal(
+    root: Path,
+    *,
+    previous_bytes: bytes | None,
+    previous_mode: int | None,
+    services: _ServiceSnapshot,
+    bindings: Sequence[_BindingSnapshot],
+    model_promotions: Sequence[_ModelPromotionPlan],
+) -> Path:
+    path = root / _TRANSACTION_FILE
+    payload = {
+        "version": 2,
+        "previous_manifest": (
+            None
+            if previous_bytes is None
+            else base64.b64encode(previous_bytes).decode("ascii")
+        ),
+        "previous_mode": previous_mode,
+        "active_units": sorted(services.active_units),
+        "bindings": [
+            {
+                "relative_path": item.relative_path,
+                "kind": item.kind,
+                "content": (
+                    None
+                    if item.content is None
+                    else base64.b64encode(item.content).decode("ascii")
+                ),
+                "mode": item.mode,
+            }
+            for item in bindings
+        ],
+        "model_promotions": [
+            {
+                "key": item.key,
+                "token": item.token,
+                "had_destination": item.had_destination,
+            }
+            for item in model_promotions
+        ],
+    }
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=root, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(
+                (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        return path
+    except OSError as exc:
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise InitializationError("install") from exc
+
+
+def _read_transaction_journal(
+    root: Path,
+) -> tuple[
+    bytes | None,
+    int | None,
+    _ServiceSnapshot,
+    tuple[_BindingSnapshot, ...],
+    tuple[_ModelPromotionPlan, ...],
+] | None:
+    path = root / _TRANSACTION_FILE
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        details = path.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_size > 64 * 1024 * 1024
+        ):
+            raise InitializationError("install")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or set(raw) != {
+            "version",
+            "previous_manifest",
+            "previous_mode",
+            "active_units",
+            "bindings",
+            "model_promotions",
+        }:
+            raise InitializationError("install")
+        encoded = raw["previous_manifest"]
+        mode = raw["previous_mode"]
+        units = raw["active_units"]
+        bindings_raw = raw["bindings"]
+        promotions_raw = raw["model_promotions"]
+        if (
+            raw["version"] != 2
+            or (encoded is not None and not isinstance(encoded, str))
+            or (mode is not None and mode != 0o600)
+            or not isinstance(units, list)
+            or not all(
+                isinstance(unit, str) and unit in _MANAGED_UNITS for unit in units
+            )
+            or len(set(units)) != len(units)
+            or not isinstance(bindings_raw, list)
+            or not isinstance(promotions_raw, list)
+        ):
+            raise InitializationError("install")
+        previous = (
+            None
+            if encoded is None
+            else base64.b64decode(encoded.encode("ascii"), validate=True)
+        )
+        bindings: list[_BindingSnapshot] = []
+        seen_paths: set[str] = set()
+        for item in bindings_raw:
+            if not isinstance(item, dict) or set(item) != {
+                "relative_path",
+                "kind",
+                "content",
+                "mode",
+            }:
+                raise InitializationError("install")
+            relative = item["relative_path"]
+            kind = item["kind"]
+            content_value = item["content"]
+            binding_mode = item["mode"]
+            if (
+                relative not in _DEPLOYMENT_BINDINGS
+                or relative in seen_paths
+                or kind not in {"missing", "file", "symlink"}
+                or (content_value is not None and not isinstance(content_value, str))
+                or (binding_mode is not None and not isinstance(binding_mode, int))
+            ):
+                raise InitializationError("install")
+            content = (
+                None
+                if content_value is None
+                else base64.b64decode(content_value.encode("ascii"), validate=True)
+            )
+            if (
+                (
+                    kind == "missing"
+                    and (content is not None or binding_mode is not None)
+                )
+                or (kind == "file" and (content is None or binding_mode is None))
+                or (kind == "symlink" and (content is None or binding_mode is not None))
+                or (content is not None and len(content) > _MAX_BINDING_BYTES)
+            ):
+                raise InitializationError("install")
+            seen_paths.add(relative)
+            bindings.append(
+                _BindingSnapshot(relative, cast(Any, kind), content, binding_mode)
+            )
+        if seen_paths != set(_DEPLOYMENT_BINDINGS):
+            raise InitializationError("install")
+        promotions: list[_ModelPromotionPlan] = []
+        seen_keys: set[str] = set()
+        for item in promotions_raw:
+            if not isinstance(item, dict) or set(item) != {
+                "key",
+                "token",
+                "had_destination",
+            }:
+                raise InitializationError("install")
+            key = item["key"]
+            token = item["token"]
+            had_destination = item["had_destination"]
+            if (
+                not isinstance(key, str)
+                or key not in _MODEL_CACHE_NAMES
+                or key in seen_keys
+                or not isinstance(token, str)
+                or len(token) != 32
+                or any(character not in "0123456789abcdef" for character in token)
+                or not isinstance(had_destination, bool)
+            ):
+                raise InitializationError("install")
+            seen_keys.add(key)
+            promotions.append(_ModelPromotionPlan(key, token, had_destination))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise InitializationError("install") from exc
+    return (
+        previous,
+        cast(int | None, mode),
+        _ServiceSnapshot(frozenset(units)),
+        tuple(bindings),
+        tuple(promotions),
+    )
+
+
+def _snapshot_deployment_bindings() -> tuple[_BindingSnapshot, ...]:
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    if not home.is_absolute():
+        raise InitializationError("install")
+    snapshots: list[_BindingSnapshot] = []
+    for relative in _DEPLOYMENT_BINDINGS:
+        path = home / relative
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            snapshots.append(_BindingSnapshot(relative, "missing", None, None))
+            continue
+        except OSError as exc:
+            raise InitializationError("install") from exc
+        if stat.S_ISLNK(details.st_mode):
+            try:
+                target = os.readlink(path).encode("utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise InitializationError("install") from exc
+            if len(target) > 4096:
+                raise InitializationError("install")
+            snapshots.append(_BindingSnapshot(relative, "symlink", target, None))
+        elif stat.S_ISREG(details.st_mode) and details.st_size <= _MAX_BINDING_BYTES:
+            try:
+                content = path.read_bytes()
+            except OSError as exc:
+                raise InitializationError("install") from exc
+            snapshots.append(
+                _BindingSnapshot(
+                    relative, "file", content, stat.S_IMODE(details.st_mode)
+                )
+            )
+        else:
+            raise InitializationError("install")
+    return tuple(snapshots)
+
+
+def _restore_deployment_bindings(bindings: Sequence[_BindingSnapshot]) -> None:
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    for item in bindings:
+        path = home / item.relative_path
+        try:
+            if path.exists() or path.is_symlink():
+                if path.is_dir() and not path.is_symlink():
+                    raise InitializationError("install")
+                path.unlink()
+            if item.kind == "missing":
+                continue
+            path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            temporary = path.parent / f".{path.name}.restore-{secrets.token_hex(8)}"
+            if item.kind == "file":
+                assert item.content is not None and item.mode is not None
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                    item.mode,
+                )
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(item.content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(temporary, item.mode)
+            else:
+                assert item.content is not None
+                os.symlink(item.content.decode("utf-8"), temporary)
+            os.replace(temporary, path)
+        except (OSError, UnicodeError) as exc:
+            raise InitializationError("install") from exc
+
+
+def _clear_transaction_journal(root: Path) -> None:
+    try:
+        (root / _TRANSACTION_FILE).unlink(missing_ok=True)
+    except OSError as exc:
+        raise InitializationError("install") from exc
+
+
+def _restore_deployment(
+    root: Path,
+    runner: CommandRunner,
+) -> None:
+    journal = _read_transaction_journal(root)
+    if journal is None:
+        return
+    previous_bytes, previous_mode, services, bindings, promotions = journal
+    manifest = selection_path(root)
+    _stop_managed_services_for_restore(runner)
+    _restore_model_promotions(root, promotions)
+    _restore_manifest(manifest, previous_bytes, previous_mode)
+    _restore_deployment_bindings(bindings)
+    reload_result = runner.run(("systemctl", "--user", "daemon-reload"))
+    if reload_result.returncode != 0:
+        raise InitializationError("install")
+    _restore_service_state(runner, services)
+    _clear_transaction_journal(root)
+
+
+def _model_promotion_paths(
+    root: Path, plan: _ModelPromotionPlan
+) -> tuple[Path, Path, Path]:
+    name = _MODEL_CACHE_NAMES[plan.key]
+    source = (
+        root
+        / "model-candidates"
+        / plan.token
+        / "models"
+        / name
+        / "snapshots/master"
+    )
+    snapshots = root / "models" / "models" / name / "snapshots"
+    return source, snapshots / "master", snapshots / f".previous-master-{plan.token}"
+
+
+def _plan_candidate_models(
+    root: Path,
+    candidate_root: Path,
+    model_keys: Mapping[str, str],
+) -> tuple[_ModelPromotionPlan, ...]:
+    token = candidate_root.name
+    if (
+        candidate_root != root / "model-candidates" / token
+        or len(token) != 32
+        or any(character not in "0123456789abcdef" for character in token)
+    ):
+        raise InitializationError("install")
+    plans: list[_ModelPromotionPlan] = []
+    try:
+        for key in model_keys:
+            if key not in _MODEL_CACHE_NAMES:
+                raise InitializationError("install")
+            plan = _ModelPromotionPlan(key, token, False)
+            source, destination, backup = _model_promotion_paths(root, plan)
+            if not source.is_dir() or source.is_symlink():
+                raise InitializationError("install")
+            if backup.exists() or backup.is_symlink():
+                raise InitializationError("install")
+            plans.append(
+                _ModelPromotionPlan(
+                    key,
+                    token,
+                    destination.exists() or destination.is_symlink(),
+                )
+            )
+    except OSError as exc:
+        raise InitializationError("install") from exc
+    return tuple(plans)
+
+
+def _promote_candidate_models(
+    root: Path,
+    plans: Sequence[_ModelPromotionPlan],
+) -> list[_ModelPromotion]:
+    promotions: list[_ModelPromotion] = []
+    try:
+        for plan in plans:
+            source, destination, backup_path = _model_promotion_paths(root, plan)
+            snapshots = destination.parent
+            snapshots.mkdir(parents=True, mode=0o700, exist_ok=True)
+            if not source.is_dir() or source.is_symlink():
+                raise InitializationError("install")
+            destination_exists = destination.exists() or destination.is_symlink()
+            if destination_exists != plan.had_destination:
+                raise InitializationError("install")
+            backup: Path | None = None
+            if plan.had_destination:
+                backup = backup_path
+                if backup.exists() or backup.is_symlink():
+                    raise InitializationError("install")
+                os.replace(destination, backup)
+            os.replace(source, destination)
+            promotions.append(_ModelPromotion(destination, backup))
+    except (OSError, KeyError, InitializationError) as exc:
+        _rollback_model_promotion(promotions)
+        raise InitializationError("install") from exc
+    return promotions
+
+
+def _restore_model_promotions(
+    root: Path, plans: Sequence[_ModelPromotionPlan]
+) -> None:
+    for plan in reversed(plans):
+        source, destination, backup = _model_promotion_paths(root, plan)
+        if plan.had_destination:
+            if not backup.exists() and not backup.is_symlink():
+                continue
+            _discard_candidate(destination)
+            try:
+                os.replace(backup, destination)
+            except OSError as exc:
+                raise InitializationError("install") from exc
+        elif not source.exists() and not source.is_symlink():
+            _discard_candidate(destination)
+
+
+def _rollback_model_promotion(promotions: Sequence[_ModelPromotion]) -> None:
+    for promotion in reversed(promotions):
+        _discard_candidate(promotion.destination)
+        if promotion.backup is not None:
+            try:
+                os.replace(promotion.backup, promotion.destination)
+            except OSError as exc:
+                raise InitializationError("install") from exc
+
+
+def _commit_model_promotion(promotions: Sequence[_ModelPromotion]) -> None:
+    for promotion in promotions:
+        if promotion.backup is not None:
+            _discard_candidate(promotion.backup)
 
 
 @contextmanager
@@ -467,6 +981,8 @@ def _run_locked_initialization(
     root: Path,
     project_root: Path,
 ) -> RuntimeSelection:
+    if _read_transaction_journal(root) is not None:
+        _restore_deployment(root, runner)
     manifest = selection_path(root)
     previous: RuntimeSelection | None = None
     previous_bytes: bytes | None = None
@@ -482,10 +998,15 @@ def _run_locked_initialization(
             print("already_selected")
             return previous
 
-    models_root = root / "models"
+    native = runner.run((str(project_root / "scripts/build-native-artifacts.sh"),))
+    if native.returncode != 0:
+        raise InitializationError("native_prerequisite")
+
     successful: RuntimeSelection | None = None
+    successful_models: Path | None = None
     for backend in candidates:
         candidate, runtime = _candidate_runtime_paths(root, backend)
+        candidate_models = _candidate_models_path(root, runtime)
         build = runner.run(
             (
                 str(project_root / "scripts/create-runtime-env.sh"),
@@ -494,11 +1015,12 @@ def _run_locked_initialization(
                 "--runtime-dir",
                 str(candidate),
                 "--models-root",
-                str(models_root),
+                str(candidate_models),
             )
         )
         if build.returncode != 0:
             _discard_candidate(candidate)
+            _discard_candidate(candidate_models)
             _record_candidate_failure(backend, "environment")
             if options.backend != "auto":
                 raise InitializationError("selected backend failed")
@@ -512,10 +1034,10 @@ def _run_locked_initialization(
                 "--backend",
                 backend,
                 "--models-root",
-                str(models_root),
+                str(candidate_models),
                 "--json",
             ),
-            env=_probe_environment(project_root, models_root),
+            env=_probe_environment(project_root, candidate_models),
         )
         try:
             parsed = _parse_probe(probe_result.stdout, backend)
@@ -527,20 +1049,39 @@ def _run_locked_initialization(
                     category = "environment"
                 else:
                     successful = pending
+                    successful_models = candidate_models
                     break
             else:
                 category = parsed.error_category or "internal"
         except InitializationError:
             category = "internal"
         _discard_candidate(candidate)
+        _discard_candidate(candidate_models)
         _record_candidate_failure(backend, category)
         if options.backend != "auto":
             raise InitializationError("selected backend failed")
 
-    if successful is None:
+    if successful is None or successful_models is None:
         raise InitializationError("no backend available")
 
+    services = _snapshot_service_state(runner)
+    bindings = _snapshot_deployment_bindings()
+    model_plans = _plan_candidate_models(
+        root, successful_models, successful.model_revisions
+    )
+    _write_transaction_journal(
+        root,
+        previous_bytes=previous_bytes,
+        previous_mode=previous_mode,
+        services=services,
+        bindings=bindings,
+        model_promotions=model_plans,
+    )
+    promotions: list[_ModelPromotion] = []
     try:
+        if previous is not None:
+            _quiesce_model_services(runner)
+        promotions = _promote_candidate_models(root, model_plans)
         published = write_runtime_selection(successful, root)
         install = runner.run(
             (
@@ -551,12 +1092,8 @@ def _run_locked_initialization(
         )
         if install.returncode != 0:
             raise InitializationError("install")
-        if (
-            previous is not None
-            and previous.backend in {"cuda", "xpu"}
-            and successful.backend == "cpu"
-        ):
-            _stop_accelerator_workers(runner)
+        if previous is None:
+            _quiesce_model_services(runner)
         reload_result = runner.run(("systemctl", "--user", "daemon-reload"))
         if reload_result.returncode != 0:
             raise InitializationError("install")
@@ -565,9 +1102,23 @@ def _run_locked_initialization(
         )
         if restart.returncode != 0:
             raise InitializationError("install")
-    except (OSError, RuntimeSelectionError, InitializationError) as exc:
-        _restore_manifest(manifest, previous_bytes, previous_mode)
+        _clear_transaction_journal(root)
+    except BaseException as exc:
+        rollback_error: BaseException | None = None
+        try:
+            _rollback_model_promotion(promotions)
+            _restore_deployment(root, runner)
+        except BaseException as restore_exc:  # noqa: BLE001 - preserve rollback proof
+            rollback_error = restore_exc
+        finally:
+            _discard_candidate(successful_models)
+        if rollback_error is not None:
+            raise InitializationError("install") from rollback_error
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         raise InitializationError("install") from exc
+    _commit_model_promotion(promotions)
+    _discard_candidate(successful_models)
     return successful
 
 
