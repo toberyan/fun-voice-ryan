@@ -424,10 +424,23 @@ def _default_final_tail_probe(
     blocker_started = threading.Event()
     release_blocker = threading.Event()
     execution_order: list[str] = []
+    profile_state = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
+
+    def start_profile(profile: str) -> bool:
+        profile_state[profile] = ModelLifecycle.READY
+        return True
+
+    def stop_profile(profile: str) -> bool:
+        profile_state[profile] = ModelLifecycle.INACTIVE
+        return True
+
     scheduler = ModelScheduler(
-        start_profile=lambda _profile: True,
-        stop_profile=lambda _profile: True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        start_profile=start_profile,
+        stop_profile=stop_profile,
+        health_profile=lambda profile: profile_state[profile],
     )
     key = SessionKey("incremental-poc", generation=1)
     scheduler.activate(key)

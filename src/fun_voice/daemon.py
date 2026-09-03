@@ -270,6 +270,7 @@ class SystemdModelProfileSupervisor:
         workers: Mapping[AsrProfile, HealthWorkerClient],
         start_service: Callable[[AsrProfile], bool] | None = None,
         stop_service: Callable[[AsrProfile], bool] | None = None,
+        service_lifecycle: Callable[[AsrProfile], ModelLifecycle] | None = None,
     ) -> None:
         self._workers = dict(workers)
         self._start_service = (
@@ -278,6 +279,7 @@ class SystemdModelProfileSupervisor:
         self._stop_service = (
             stop_service if stop_service is not None else default_stop_worker_service
         )
+        self._service_lifecycle = service_lifecycle
         self._confirmed_inactive: dict[AsrProfile, bool] = {
             "nano": False,
             "sensevoice": False,
@@ -302,24 +304,51 @@ class SystemdModelProfileSupervisor:
         return stopped
 
     def health_profile(self, profile: AsrProfile) -> ModelLifecycle:
-        worker = self._workers.get(profile)
-        if worker is None:
+        """Return systemd lifecycle evidence for ASR release decisions."""
+        service_lifecycle = self._service_lifecycle
+        if service_lifecycle is None:
             return (
                 ModelLifecycle.INACTIVE
                 if self._confirmed_inactive[profile]
-                else ModelLifecycle.UNKNOWN
+                else ModelLifecycle.READY
             )
         try:
-            lifecycle = ModelLifecycle(worker.health().lifecycle)
+            observed = service_lifecycle(profile)
+        except Exception:  # noqa: BLE001 - deny lifecycle uncertainty
+            return ModelLifecycle.UNKNOWN
+        if not isinstance(observed, ModelLifecycle):
+            return ModelLifecycle.UNKNOWN
+        if observed in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
+            self._confirmed_inactive[profile] = True
+        elif observed is ModelLifecycle.READY:
+            self._confirmed_inactive[profile] = False
+        return observed
+
+    def transport_profile(self, profile: AsrProfile) -> ModelLifecycle:
+        """Confirm an active systemd unit can receive a socket request.
+
+        This deliberately ignores model residency. A worker accepts the health
+        request before lazy preload/transcription materializes its model.
+        """
+        service_lifecycle = self.health_profile(profile)
+        if service_lifecycle is not ModelLifecycle.READY:
+            return service_lifecycle
+        worker = self._workers.get(profile)
+        if worker is None:
+            return ModelLifecycle.UNKNOWN
+        try:
+            # A successful health RPC proves the same-UID socket accepts
+            # requests. Model residency is intentionally not part of this
+            # transport probe: preload/transcribe lazily materializes models.
+            worker.health()
         except Exception:  # noqa: BLE001 - no untrusted worker error propagation
             return (
                 ModelLifecycle.INACTIVE
                 if self._confirmed_inactive[profile]
                 else ModelLifecycle.UNKNOWN
             )
-        if lifecycle in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
-            self._confirmed_inactive[profile] = True
-        return lifecycle
+        self._confirmed_inactive[profile] = False
+        return ModelLifecycle.READY
 
 
 class TextCorrector(Protocol):
@@ -962,14 +991,19 @@ class VoiceDaemon:
         self._fallback_worker = fallback_worker
         self._corrector = corrector
         self._model_lease = model_lease
+        self._primary_asr_profile = primary_asr_profile
+        self._fallback_asr_profile = fallback_asr_profile
+        allowed_profiles: tuple[AsrProfile, ...] = (primary_asr_profile,)
+        if fallback_worker is not None and fallback_asr_profile is not None:
+            allowed_profiles += (fallback_asr_profile,)
         self._scheduler = scheduler if scheduler is not None else ModelScheduler(
             start_profile=self._start_asr_for_scheduler,
             stop_profile=self._release_asr_for_scheduler,
             health_profile=self._asr_lifecycle_after_release,
+            transport_profile=self._asr_transport_lifecycle,
+            allowed_profiles=allowed_profiles,
         )
         self._metrics = metrics if metrics is not None else MetricsLedger()
-        self._primary_asr_profile = primary_asr_profile
-        self._fallback_asr_profile = fallback_asr_profile
         self._metric_sequence: int | None = None
         self._asr_preloader = (
             asr_preloader if asr_preloader is not None else nano_preloader
@@ -1510,10 +1544,27 @@ class VoiceDaemon:
         del profile
         return True
 
-    def _asr_lifecycle_after_release(
-        self, _profile: AsrProfile
-    ) -> ModelLifecycle:
-        """The existing lease is affirmative only after systemd saw inactive."""
+    def _asr_transport_lifecycle(self, profile: AsrProfile) -> ModelLifecycle:
+        """Probe an injected worker's request transport without loading a model."""
+        worker: object | None
+        if profile == self._primary_asr_profile:
+            worker = self._worker
+        elif profile == self._fallback_asr_profile:
+            worker = self._fallback_worker
+        else:
+            return ModelLifecycle.UNKNOWN
+        health = getattr(worker, "health", None)
+        if not callable(health):
+            return ModelLifecycle.UNKNOWN
+        try:
+            health()
+        except Exception:  # noqa: BLE001 - injected transport must fail closed
+            return ModelLifecycle.UNKNOWN
+        return ModelLifecycle.READY
+
+    @staticmethod
+    def _asr_lifecycle_after_release(_profile: AsrProfile) -> ModelLifecycle:
+        """Compatibility release evidence for the injected legacy worker seam."""
         return ModelLifecycle.INACTIVE
 
     def _record_correction_timing(self, timing: object) -> None:
@@ -1901,10 +1952,23 @@ def build_voice_daemon(
         if effective.enhanced.enabled
         else None
     )
+    profile_workers: dict[AsrProfile, HealthWorkerClient] = {
+        effective.primary_asr_profile: primary
+    }
+    if fallback is not None and effective.fallback_asr_profile is not None:
+        profile_workers[effective.fallback_asr_profile] = fallback
+    supervisor = SystemdModelProfileSupervisor(
+        workers=profile_workers,
+        start_service=dependencies.start_worker_service,
+        stop_service=dependencies.stop_worker_service,
+        service_lifecycle=dependencies.health_worker_profile,
+    )
     scheduler = ModelScheduler(
-        start_profile=dependencies.start_worker_service,
-        stop_profile=dependencies.stop_worker_service,
-        health_profile=dependencies.health_worker_profile,
+        start_profile=supervisor.start_profile,
+        stop_profile=supervisor.stop_profile,
+        health_profile=supervisor.health_profile,
+        transport_profile=supervisor.transport_profile,
+        allowed_profiles=selection.policy().allowed_profiles,
     )
     return VoiceDaemon(
         guard=dependencies.guard,

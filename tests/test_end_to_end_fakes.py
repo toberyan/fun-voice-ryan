@@ -206,6 +206,15 @@ class _TextWorker:
         self.transcriptions.append(artifact)
         return Transcription(text=self.text, segments=())
 
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
+
     def close(self) -> None:
         pass
 
@@ -223,6 +232,15 @@ class FlakyWorker:
         if self.calls == 1:
             raise WorkerError(ErrorCode("worker", "oom"), "out of memory")
         return Transcription(text=self.text, segments=())
+
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -540,6 +558,15 @@ class BlockingWorker:
         self.started.set()
         self.release.wait(timeout=10.0)
         return Transcription(text="你好", segments=())
+
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
 
     def close(self) -> None:
         pass

@@ -250,6 +250,15 @@ class FakeWorker:
             raise self.error
         return self.result or Transcription(text=self.text, segments=())
 
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
+
     def close(self) -> None:
         self.closed = True
 
@@ -407,6 +416,15 @@ class _PolicyWorker(FakeWorker):
     def preload(self) -> PreloadTiming:
         return PreloadTiming()
 
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
+
 
 def _recording_worker_factory(
     created_workers: list[tuple[str, Path]], worker: _PolicyWorker
@@ -423,6 +441,19 @@ def _recording_worker_factory(
 
 
 def _daemon_dependencies(fcitx: FakeFcitx) -> object:
+    started_profiles: set[str] = set()
+
+    def start_worker(profile: str) -> bool:
+        started_profiles.add(profile)
+        return True
+
+    def health_worker(profile: str) -> ModelLifecycle:
+        return (
+            ModelLifecycle.READY
+            if profile in started_profiles
+            else ModelLifecycle.INACTIVE
+        )
+
     paths = config.RuntimePaths(
         runtime_dir=Path("/runtime"),
         worker_socket=Path("/runtime/worker.sock"),
@@ -438,9 +469,9 @@ def _daemon_dependencies(fcitx: FakeFcitx) -> object:
         injector=FakeInjector(),
         notifier=FakeNotifier(),
         overlay=FakeOverlay(),
-        start_worker_service=lambda _profile: True,
+        start_worker_service=start_worker,
         stop_worker_service=lambda _profile: True,
-        health_worker_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        health_worker_profile=health_worker,
         capture_config=CaptureConfig(),
     )
 
@@ -470,6 +501,9 @@ def test_daemon_cpu_registers_only_sensevoice_and_never_constructs_qwen(
         ]
         assert daemon._fallback_worker is None  # noqa: SLF001 - policy boundary
         assert daemon._corrector is None  # noqa: SLF001 - policy boundary
+        assert daemon._scheduler._allowed_profiles == (  # noqa: SLF001 - policy boundary
+            "sensevoice",
+        )
     finally:
         daemon.shutdown()
 
@@ -582,10 +616,16 @@ def test_start_notifies_recording() -> None:
 def test_cold_start_shows_preparing_until_nano_preload_finishes() -> None:
     preload_started = threading.Event()
     release_preload = threading.Event()
+    profiles = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
     scheduler = ModelScheduler(
-        start_profile=lambda _profile: True,
+        start_profile=lambda profile: (
+            profiles.__setitem__(profile, ModelLifecycle.READY) or True
+        ),
         stop_profile=lambda _profile: True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        health_profile=lambda profile: profiles[profile],
     )
 
     def preload() -> None:
@@ -825,6 +865,26 @@ def test_systemd_profile_supervisor_confirms_worker_health_after_stop() -> None:
     assert stopped == ["nano"]
 
 
+def test_systemd_profile_supervisor_accepts_transport_before_lazy_model_load() -> None:
+    class LazyWorker:
+        def health(self) -> WorkerHealth:
+            return WorkerHealth(
+                version="test",
+                xpu_ready=False,
+                model_ready=False,
+                device="cpu",
+                lifecycle="inactive",
+            )
+
+    supervisor = daemon_mod.SystemdModelProfileSupervisor(
+        workers={"sensevoice": LazyWorker()},
+        service_lifecycle=lambda _profile: ModelLifecycle.READY,
+    )
+
+    assert supervisor.health_profile("sensevoice") is ModelLifecycle.READY
+    assert supervisor.transport_profile("sensevoice") is ModelLifecycle.READY
+
+
 def test_completed_session_metrics_contain_only_aggregate_stage_data() -> None:
     h = Harness()
     _started(h)
@@ -885,14 +945,18 @@ def test_primary_preload_and_final_asr_restart_after_worker_idle_exit() -> None:
             ModelLifecycle.READY,
             ModelLifecycle.READY,
             ModelLifecycle.INACTIVE,
+            ModelLifecycle.READY,
             ModelLifecycle.INACTIVE,
+            ModelLifecycle.READY,
         )
     )
     scheduler = ModelScheduler(
+        allowed_profiles=("nano",),
         start_profile=lambda profile: events.append(f"start:{profile}") or True,
         stop_profile=lambda _profile: True,
-        health_profile=lambda profile: events.append(f"health:{profile}")
-        or next(health_states),
+        health_profile=lambda profile: (
+            events.append(f"health:{profile}") or next(health_states)
+        ),
     )
 
     def preload() -> PreloadTiming:
@@ -917,9 +981,11 @@ def test_primary_preload_and_final_asr_restart_after_worker_idle_exit() -> None:
             "health:nano",
             "health:nano",
             "start:nano",
+            "health:nano",
             "preload",
             "health:nano",
             "start:nano",
+            "health:nano",
         ]
         assert [fcitx.commits for fcitx in h.fcitx_instances] == [
             [("tok-123", "你好")],
@@ -1225,10 +1291,18 @@ def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> Non
             corrector_threads.append(threading.current_thread().name)
             return super().correct(raw_text)
 
+    profiles = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
     scheduler = ModelScheduler(
-        start_profile=lambda _profile: True,
-        stop_profile=lambda _profile: True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        start_profile=lambda profile: (
+            profiles.__setitem__(profile, ModelLifecycle.READY) or True
+        ),
+        stop_profile=lambda profile: (
+            profiles.__setitem__(profile, ModelLifecycle.INACTIVE) or True
+        ),
+        health_profile=lambda profile: profiles[profile],
     )
     h = Harness(
         worker=ThreadWorker(text="get commit"),
@@ -1249,10 +1323,25 @@ def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> Non
 def test_daemon_routes_model_load_fallback_through_scheduler_profile_switch() -> None:
     starts: list[str] = []
     stops: list[str] = []
+    profiles = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
+
+    def start(profile: str) -> bool:
+        starts.append(profile)
+        profiles[profile] = ModelLifecycle.READY
+        return True
+
+    def stop(profile: str) -> bool:
+        stops.append(profile)
+        profiles[profile] = ModelLifecycle.INACTIVE
+        return True
+
     scheduler = ModelScheduler(
-        start_profile=lambda profile: starts.append(profile) or True,
-        stop_profile=lambda profile: stops.append(profile) or True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        start_profile=start,
+        stop_profile=stop,
+        health_profile=lambda profile: profiles[profile],
     )
     fallback = FakeWorker(text="备用结果")
     h = Harness(

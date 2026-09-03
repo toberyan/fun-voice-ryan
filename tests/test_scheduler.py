@@ -251,10 +251,24 @@ def test_correction_is_denied_when_another_asr_profile_remains_active() -> None:
 def test_correction_rechecks_an_observed_failed_asr_profile() -> None:
     stopped: list[str] = []
     ran: list[str] = []
+    state = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
+
+    def start(profile: str) -> bool:
+        state[profile] = ModelLifecycle.READY
+        return True
+
+    def stop(profile: str) -> bool:
+        stopped.append(profile)
+        state[profile] = ModelLifecycle.INACTIVE
+        return True
+
     scheduler = ModelScheduler(
-        start_profile=lambda _profile: True,
-        stop_profile=lambda profile: stopped.append(profile) or True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        start_profile=start,
+        stop_profile=stop,
+        health_profile=lambda profile: state[profile],
     )
     key = _key()
     scheduler.activate(key)
@@ -298,19 +312,25 @@ def test_task_handle_returns_value_or_reraises_owner_error() -> None:
 
 def test_asr_profile_is_started_by_scheduler_and_switches_only_after_release() -> None:
     calls: list[tuple[str, str]] = []
+    state = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
 
     def start(profile: str) -> bool:
         calls.append(("start", profile))
+        state[profile] = ModelLifecycle.READY
         return True
 
     def stop(profile: str) -> bool:
         calls.append(("stop", profile))
+        state[profile] = ModelLifecycle.INACTIVE
         return True
 
     scheduler = ModelScheduler(
         start_profile=start,
         stop_profile=stop,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        health_profile=lambda profile: state[profile],
     )
     key = _key()
     scheduler.activate(key)
@@ -331,15 +351,17 @@ def test_asr_profile_is_started_by_scheduler_and_switches_only_after_release() -
 
 
 def test_asr_restarts_after_a_cached_ready_profile_is_observed_inactive() -> None:
-    health_states = iter((ModelLifecycle.READY, ModelLifecycle.INACTIVE))
+    health_states = iter(
+        (ModelLifecycle.READY, ModelLifecycle.INACTIVE, ModelLifecycle.READY)
+    )
     checked: list[str] = []
     starts: list[str] = []
     ran: list[str] = []
     scheduler = ModelScheduler(
+        allowed_profiles=("nano",),
         start_profile=lambda profile: starts.append(profile) or True,
         stop_profile=lambda _profile: True,
-        health_profile=lambda profile: checked.append(profile)
-        or next(health_states),
+        health_profile=lambda profile: checked.append(profile) or next(health_states),
     )
     key = _key()
     scheduler.activate(key)
@@ -349,7 +371,7 @@ def test_asr_restarts_after_a_cached_ready_profile_is_observed_inactive() -> Non
     second = scheduler.run_asr(key, "nano", lambda: ran.append("second"))
     assert second.wait(timeout=1.0)
 
-    assert checked == ["nano", "nano"]
+    assert checked == ["nano", "nano", "nano"]
     assert starts == ["nano"]
     assert ran == ["first", "second"]
     scheduler.close()
@@ -361,10 +383,10 @@ def test_asr_unknown_health_denies_callback_when_restart_is_unconfirmed() -> Non
     starts: list[str] = []
     ran: list[str] = []
     scheduler = ModelScheduler(
+        allowed_profiles=("nano",),
         start_profile=lambda profile: starts.append(profile) or True,
         stop_profile=lambda _profile: True,
-        health_profile=lambda profile: checked.append(profile)
-        or next(health_states),
+        health_profile=lambda profile: checked.append(profile) or next(health_states),
     )
     key = _key()
     scheduler.activate(key)
@@ -379,4 +401,177 @@ def test_asr_unknown_health_denies_callback_when_restart_is_unconfirmed() -> Non
     assert checked == ["nano", "nano"]
     assert starts == ["nano"]
     assert ran == ["initial"]
+    scheduler.close()
+
+
+def test_asr_waits_for_transport_ready_after_service_start() -> None:
+    now = 0.0
+    sleeps: list[float] = []
+    state = {"nano": ModelLifecycle.INACTIVE}
+    starts: list[str] = []
+    ran: list[str] = []
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+        state["nano"] = ModelLifecycle.READY
+
+    scheduler = ModelScheduler(
+        allowed_profiles=("nano",),
+        start_profile=lambda profile: (
+            starts.append(profile)
+            or state.__setitem__(profile, ModelLifecycle.LOADING)
+            or True
+        ),
+        health_profile=lambda profile: state[profile],
+        startup_timeout=1.0,
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    handle = scheduler.run_asr(key, "nano", lambda: ran.append("asr"))
+
+    assert handle.wait(timeout=1.0)
+    assert handle.result() is None
+    assert starts == ["nano"]
+    assert sleeps == [0.05]
+    assert ran == ["asr"]
+    scheduler.close()
+
+
+def test_asr_denies_callback_when_started_service_never_becomes_transport_ready() -> (
+    None
+):
+    now = 0.0
+    sleeps: list[float] = []
+    state = {"nano": ModelLifecycle.INACTIVE}
+    starts: list[str] = []
+    ran: list[str] = []
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    def start(profile: str) -> bool:
+        starts.append(profile)
+        state[profile] = ModelLifecycle.UNKNOWN
+        return True
+
+    scheduler = ModelScheduler(
+        allowed_profiles=("nano",),
+        start_profile=start,
+        health_profile=lambda profile: state[profile],
+        startup_timeout=0.1,
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    handle = scheduler.run_asr(key, "nano", lambda: ran.append("asr"))
+
+    assert handle.wait(timeout=1.0)
+    with pytest.raises(ModelProfileError, match="transport was not ready"):
+        handle.result()
+    assert starts == ["nano"]
+    assert sleeps == [0.05, 0.05]
+    assert ran == []
+    assert scheduler.profile_state("nano") is ModelLifecycle.UNKNOWN
+    scheduler.close()
+
+
+def test_asr_releases_freshly_observed_active_sibling_before_target_runs() -> None:
+    state = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.READY,
+    }
+    events: list[tuple[str, str] | str] = []
+
+    def health(profile: str) -> ModelLifecycle:
+        events.append(("health", profile))
+        return state[profile]
+
+    def stop(profile: str) -> bool:
+        events.append(("stop", profile))
+        state[profile] = ModelLifecycle.INACTIVE
+        return True
+
+    def start(profile: str) -> bool:
+        events.append(("start", profile))
+        state[profile] = ModelLifecycle.READY
+        return True
+
+    scheduler = ModelScheduler(
+        allowed_profiles=("nano", "sensevoice"),
+        start_profile=start,
+        stop_profile=stop,
+        health_profile=health,
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    handle = scheduler.run_asr(key, "nano", lambda: events.append("asr"))
+
+    assert handle.wait(timeout=1.0)
+    assert events == [
+        ("health", "sensevoice"),
+        ("stop", "sensevoice"),
+        ("health", "sensevoice"),
+        ("health", "nano"),
+        ("start", "nano"),
+        ("health", "nano"),
+        "asr",
+    ]
+    scheduler.close()
+
+
+def test_asr_denies_unknown_allowed_sibling_before_starting_target() -> None:
+    checked: list[str] = []
+    starts: list[str] = []
+    ran: list[str] = []
+    scheduler = ModelScheduler(
+        allowed_profiles=("nano", "sensevoice"),
+        start_profile=lambda profile: starts.append(profile) or True,
+        health_profile=lambda profile: (
+            checked.append(profile) or ModelLifecycle.UNKNOWN
+        ),
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    handle = scheduler.run_asr(key, "nano", lambda: ran.append("asr"))
+
+    assert handle.wait(timeout=1.0)
+    with pytest.raises(ModelProfileError, match="sibling health was unconfirmed"):
+        handle.result()
+    assert checked == ["sensevoice"]
+    assert starts == []
+    assert ran == []
+    scheduler.close()
+
+
+def test_cpu_scheduler_never_probes_disallowed_nano_profile() -> None:
+    checked: list[str] = []
+    scheduler = ModelScheduler(
+        allowed_profiles=("sensevoice",),
+        health_profile=lambda profile: checked.append(profile) or ModelLifecycle.READY,
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    handle = scheduler.run_asr(key, "sensevoice", lambda: "asr")
+
+    assert handle.wait(timeout=1.0)
+    assert handle.result() == "asr"
+    assert checked == ["sensevoice"]
     scheduler.close()
