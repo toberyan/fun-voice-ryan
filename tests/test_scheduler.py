@@ -157,7 +157,7 @@ def test_correction_runs_only_after_producing_asr_is_inactive() -> None:
     )
 
     assert handle.wait(timeout=1.0)
-    assert stopped == ["nano"]
+    assert stopped == ["nano", "sensevoice"]
     assert ran == ["qwen"]
     assert outcomes == [(True, "corrected")]
     scheduler.close()
@@ -183,6 +183,38 @@ def test_correction_is_skipped_when_profile_release_is_uncertain() -> None:
     assert handle.wait(timeout=1.0)
     assert ran == []
     assert outcomes == [(False, None)]
+    scheduler.close()
+
+
+def test_correction_reconciles_an_unobserved_sibling_before_qwen() -> None:
+    stopped: list[str] = []
+    checked: list[str] = []
+    ran: list[str] = []
+
+    def health(profile: str) -> ModelLifecycle:
+        checked.append(profile)
+        return (
+            ModelLifecycle.READY
+            if profile == "sensevoice"
+            else ModelLifecycle.INACTIVE
+        )
+
+    scheduler = ModelScheduler(
+        stop_profile=lambda profile: stopped.append(profile) or True,
+        health_profile=health,
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    handle = scheduler.run_correction(
+        key, "nano", lambda: ran.append("qwen") or "corrected"
+    )
+
+    assert handle.wait(timeout=1.0)
+    assert stopped == ["nano", "sensevoice"]
+    assert checked == ["nano", "sensevoice"]
+    assert ran == []
+    assert getattr(handle.result(), "permitted", None) is False
     scheduler.close()
 
 

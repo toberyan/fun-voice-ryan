@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import sys
 from collections.abc import Sequence
@@ -12,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from fun_voice import config
+from fun_voice import corrector as corrector_module
 from fun_voice.corrector import (
     DEFAULT_TIMEOUT_SECONDS,
     CorrectionError,
@@ -113,19 +116,89 @@ def test_qwen_is_not_started_until_a_correction_is_requested() -> None:
         calls.append((command, request, timeout))
         return '{"status":"ok","text":"[[FINAL]]git commit[[/FINAL]]"}'
 
+    selection = _selection()
     corrector = OnDemandQwenCorrector(
-        command=("qwen-corrector",),
-        timeout_seconds=17.0,
-        runner=runner,
-        selection=_selection(),
+        timeout_seconds=17.0, runner=runner, selection=selection
     )
 
     assert calls == []
     assert corrector.correct("get commit") == "git commit"
     assert len(calls) == 1
-    assert calls[0][0] == ("qwen-corrector",)
+    expected_fingerprint = hashlib.sha256(
+        json.dumps(
+            selection.to_dict(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert calls[0][0] == (
+        str(selection.python),
+        "-m",
+        "fun_voice.corrector",
+        "--selection-fingerprint",
+        expected_fingerprint,
+    )
     assert calls[0][2] == 17.0
-    assert json.loads(calls[0][1]) == {"text": "get commit"}
+    assert json.loads(calls[0][1]) == {
+        "text": "get commit",
+        "selection_fingerprint": expected_fingerprint,
+    }
+
+
+def test_corrector_child_rejects_a_mismatched_cli_selection_before_reading_text(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(corrector_module, "load_runtime_selection", _selection)
+    monkeypatch.setattr(
+        corrector_module,
+        "_read_request",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("text was accepted")),
+    )
+
+    assert corrector_module.main(["--selection-fingerprint", "0" * 64]) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_code"] == "correction.selection_mismatch"
+
+
+def test_corrector_child_rejects_a_mismatched_request_selection_before_model_load(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    selection = _selection()
+    expected_fingerprint = hashlib.sha256(
+        json.dumps(
+            selection.to_dict(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    generated: list[str] = []
+    monkeypatch.setattr(corrector_module, "load_runtime_selection", lambda: selection)
+    monkeypatch.setattr(
+        corrector_module,
+        "generate_enveloped_correction",
+        lambda *_args, **_kwargs: generated.append("model") or None,
+    )
+    monkeypatch.setattr(
+        corrector_module.sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {"text": "get commit", "selection_fingerprint": "1" * 64}
+            )
+        ),
+    )
+
+    assert (
+        corrector_module.main(["--selection-fingerprint", expected_fingerprint])
+        == 1
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_code"] == "correction.selection_mismatch"
+    assert generated == []
 
 
 def test_qwen_process_failure_is_exposed_for_raw_text_fallback() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
 import json
 import os
 import sys
@@ -78,6 +79,25 @@ def test_cpu_manifest_round_trip_forbids_accelerator_models(tmp_path: Path) -> N
     assert dict(expected.model_revisions) == {"sensevoice": "master", "vad": "master"}
     with pytest.raises(TypeError):
         expected.model_revisions["qwen"] = "master"  # type: ignore[index]
+
+
+def test_selection_fingerprint_is_a_canonical_manifest_digest(tmp_path: Path) -> None:
+    selection = _selection(tmp_path / "data")
+    reordered = dataclasses.replace(
+        selection,
+        model_revisions={"vad": "master", "sensevoice": "master"},
+    )
+    expected = hashlib.sha256(
+        json.dumps(
+            selection.to_dict(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert runtime_selection.selection_fingerprint(selection) == expected
+    assert runtime_selection.selection_fingerprint(reordered) == expected
 
 
 @pytest.mark.parametrize(

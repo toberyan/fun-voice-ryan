@@ -31,7 +31,12 @@ from typing import Any
 
 from fun_voice import config
 from fun_voice.contracts import CORRECTION_REJECTION_REASONS, CorrectionTiming
-from fun_voice.runtime_selection import RuntimeSelection, load_runtime_selection
+from fun_voice.runtime_selection import (
+    RuntimeSelection,
+    RuntimeSelectionError,
+    load_runtime_selection,
+    selection_fingerprint,
+)
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 MAX_OUTPUT_CHARACTERS = 1536
@@ -68,6 +73,7 @@ _DEFAULT_REJECTION_REASON = {
     "correction.generation": "generation",
     "correction.timeout": "timeout",
     "correction.unavailable": "unavailable",
+    "correction.selection_mismatch": "unavailable",
     "correction.internal": "internal",
 }
 
@@ -447,7 +453,14 @@ class OnDemandQwenCorrector:
             inference if inference is not None else config.EnhancedInferenceConfig(),
             policy,
         )
-        self._command = tuple(command or (sys.executable, "-m", "fun_voice.corrector"))
+        self._selection_fingerprint = selection_fingerprint(selection)
+        child_command = tuple(command or ("-m", "fun_voice.corrector"))
+        self._command = (
+            str(selection.python),
+            *child_command,
+            "--selection-fingerprint",
+            self._selection_fingerprint,
+        )
         self._timeout_seconds = (
             timeout_seconds
             if timeout_seconds is not None
@@ -465,7 +478,10 @@ class OnDemandQwenCorrector:
             or len(raw_text) > self._inference.correction_max_source_characters
         ):
             raise CorrectionError("correction.input_too_large")
-        request = json.dumps({"text": raw_text}, ensure_ascii=False)
+        request = json.dumps(
+            {"text": raw_text, "selection_fingerprint": self._selection_fingerprint},
+            ensure_ascii=False,
+        )
         response = self._runner(self._command, request, self._timeout_seconds)
         try:
             # vLLM emits startup diagnostics before the corrector's final
@@ -509,12 +525,17 @@ class OnDemandQwenCorrector:
         """No process is retained between calls."""
 
 
-def _read_request() -> str:
+def _read_request(expected_selection_fingerprint: str) -> str:
     try:
         decoded: Any = json.loads(sys.stdin.read())
     except json.JSONDecodeError as exc:
         raise CorrectionError("correction.protocol") from exc
-    text = decoded.get("text") if isinstance(decoded, dict) else None
+    if (
+        not isinstance(decoded, dict)
+        or decoded.get("selection_fingerprint") != expected_selection_fingerprint
+    ):
+        raise CorrectionError("correction.selection_mismatch")
+    text = decoded.get("text")
     if not isinstance(text, str):
         raise CorrectionError("correction.protocol")
     return text
@@ -523,12 +544,24 @@ def _read_request() -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run a single stdin request and write one JSON result to stdout."""
     parser = argparse.ArgumentParser(prog="fun-voice-corrector")
-    parser.parse_args(argv)
+    parser.add_argument("--selection-fingerprint")
+    args = parser.parse_args(argv)
     try:
-        selection = load_runtime_selection()
+        try:
+            selection = load_runtime_selection()
+        except RuntimeSelectionError as exc:
+            raise CorrectionError("correction.selection_mismatch") from exc
+        expected_selection_fingerprint = args.selection_fingerprint
+        if (
+            not isinstance(expected_selection_fingerprint, str)
+            or selection_fingerprint(selection) != expected_selection_fingerprint
+        ):
+            raise CorrectionError("correction.selection_mismatch")
         effective = config.effective_runtime_config(config.load_config(), selection)
         result = generate_enveloped_correction(
-            _read_request(), inference=effective.enhanced, selection=selection
+            _read_request(expected_selection_fingerprint),
+            inference=effective.enhanced,
+            selection=selection,
         )
     except CorrectionError as exc:
         print(

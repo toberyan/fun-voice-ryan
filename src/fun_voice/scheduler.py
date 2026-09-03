@@ -191,21 +191,13 @@ class ModelScheduler:
         def guarded() -> CorrectionOutcome:
             other: AsrProfile = "sensevoice" if profile == "nano" else "nano"
             for candidate in (profile, other):
-                # Always ask the producing profile to release: its process can
-                # have outlived our local state. A second profile is released
-                # whenever the scheduler has observed anything other than a
-                # confirmed inactive state.
-                needs_release = (
-                    candidate == profile
-                    or self._profile_states[candidate] is not ModelLifecycle.INACTIVE
-                )
                 try:
-                    if needs_release:
-                        if not self._stop_profile(candidate):
-                            return CorrectionOutcome(permitted=False)
-                        state = self._health_profile(candidate)
-                    else:
-                        state = self._profile_states[candidate]
+                    # Scheduler state is not process evidence. Reconcile both
+                    # profiles before Qwen so an unobserved sibling cannot
+                    # retain the selected accelerator.
+                    if not self._stop_profile(candidate):
+                        return CorrectionOutcome(permitted=False)
+                    state = self._health_profile(candidate)
                 except Exception:  # noqa: BLE001 - deny lease on uncertainty
                     return CorrectionOutcome(permitted=False)
                 if state not in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:

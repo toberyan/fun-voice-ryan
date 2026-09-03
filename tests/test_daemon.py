@@ -62,7 +62,7 @@ from fun_voice.desktop import (
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
 from fun_voice.overlay import OverlayModel
-from fun_voice.runtime_selection import RuntimeSelection
+from fun_voice.runtime_selection import RuntimeSelection, RuntimeSelectionError
 from fun_voice.scheduler import ModelLifecycle, ModelScheduler
 
 ARTIFACT = CaptureArtifact(
@@ -298,6 +298,8 @@ class Harness:
         overlay: FakeOverlay | None = None,
         model_lease: AllowingLease | RejectingLease | None = None,
         nano_preloader: Callable[[], PreloadTiming | None] | None = None,
+        asr_preloader: Callable[[], PreloadTiming | None] | None = None,
+        primary_asr_profile: str = "nano",
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         capture_config: CaptureConfig | None = None,
@@ -341,6 +343,8 @@ class Harness:
                 else None
             ),
             nano_preloader=nano_preloader,
+            asr_preloader=asr_preloader,
+            primary_asr_profile=primary_asr_profile,  # type: ignore[arg-type]
             monotonic=monotonic if monotonic is not None else time.monotonic,
             sleep=sleep if sleep is not None else time.sleep,
             capture_config=(
@@ -517,6 +521,29 @@ def test_daemon_accelerator_uses_distinct_nano_and_sensevoice_sockets(
         daemon.shutdown()
 
 
+def test_daemon_clients_leave_service_start_to_the_model_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client_options: list[dict[str, object]] = []
+
+    def worker_factory(*_args: object, **kwargs: object) -> _PolicyWorker:
+        client_options.append(dict(kwargs))
+        return _PolicyWorker()
+
+    monkeypatch.setattr(daemon_mod, "SocketWorkerClient", worker_factory)
+
+    daemon = daemon_mod.build_voice_daemon(
+        _daemon_dependencies(FakeFcitx()), selection=_accelerator_selection()
+    )
+    try:
+        assert [options["auto_start_service"] for options in client_options] == [
+            False,
+            False,
+        ]
+    finally:
+        daemon.shutdown()
+
+
 # --- State machine -----------------------------------------------------------
 
 
@@ -684,6 +711,27 @@ def test_worker_stop_confirms_inactive_before_qwen(
     ]
 
 
+def test_default_service_helpers_fail_closed_when_selection_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(
+        daemon_mod,
+        "load_runtime_selection",
+        lambda: (_ for _ in ()).throw(RuntimeSelectionError("missing")),
+    )
+    monkeypatch.setattr(
+        daemon_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: calls.append(object()),
+    )
+
+    assert daemon_mod.default_start_worker_service("nano") is False
+    assert daemon_mod.default_stop_worker_service("nano") is False
+    assert daemon_mod.default_health_worker_profile("nano") is ModelLifecycle.UNKNOWN
+    assert calls == []
+
+
 @pytest.mark.parametrize("health_failure", ["timeout", "nonzero", "unknown"])
 def test_uncertain_worker_health_denies_qwen_after_asr_release(
     monkeypatch: pytest.MonkeyPatch, health_failure: str
@@ -827,6 +875,46 @@ def test_daemon_aggregates_worker_and_preload_stage_durations() -> None:
     assert report["asr_vad_ms"] == {"p50": 5, "p95": 5}
     assert report["asr_generate_ms"] == {"p50": 9, "p95": 9}
     assert "你好" not in repr(report)
+
+
+def test_sensevoice_primary_preload_uses_generic_asr_metrics_only() -> None:
+    completed_preload = threading.Event()
+
+    def preload() -> PreloadTiming:
+        completed_preload.set()
+        return PreloadTiming(warmup_status="ready")
+
+    h = Harness(
+        worker=FakeWorker(
+            transcription=Transcription(text="你好", segments=(), engine="sensevoice")
+        ),
+        asr_preloader=preload,
+        primary_asr_profile="sensevoice",
+    )
+    _started(h)
+    assert completed_preload.wait(timeout=2.0)
+    h.daemon.stop()
+
+    report = h.daemon.dispatch({"op": "metrics"})
+
+    assert report["asr_preload"] == {"ready": 1}
+    assert report["asr_warmup"] == {"ready": 1}
+    assert report["asr_preload_profile"] == {"sensevoice": 1}
+    assert "nano_preload" not in report
+    assert "nano_warmup" not in report
+
+
+def test_nano_primary_keeps_legacy_preload_metrics_for_compatible_consumers() -> None:
+    h = Harness()
+    _started(h)
+    h.daemon.stop()
+
+    report = h.daemon.dispatch({"op": "metrics"})
+
+    assert report["asr_preload"] == {"not_requested": 1}
+    assert report["asr_preload_profile"] == {"nano": 1}
+    assert report["nano_preload"] == {"not_requested": 1}
+    assert report["nano_warmup"] == {"not_requested": 1}
 
 
 def test_daemon_requests_nano_preload_only_after_capture_starts(

@@ -6,6 +6,7 @@ validate a selection before importing any selected backend's dependencies.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -132,6 +133,17 @@ class RuntimeSelection:
             probe_status=cast(Literal["pass"], probe.get("status")),
             selected_at=cast(int, probe.get("selected_at")),
         )
+
+
+def selection_fingerprint(selection: RuntimeSelection) -> str:
+    """Return the canonical SHA-256 identity for persisted selection data."""
+    payload = json.dumps(
+        selection.to_dict(),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def data_root(env: Mapping[str, str] | None = None) -> Path:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import inspect
 import logging
 import os
 import signal
@@ -431,7 +432,11 @@ def default_start_worker_service(
     profile: AsrProfile = "nano", *, selection: RuntimeSelection | None = None
 ) -> bool:
     """Start one on-demand worker and return whether systemd accepted it."""
-    service = worker_service_name(profile, selection=selection)
+    try:
+        service = worker_service_name(profile, selection=selection)
+    except (RuntimeSelectionError, ValueError):
+        logger.warning("could not resolve selected worker service")
+        return False
     try:
         result = subprocess.run(
             ["systemctl", "--user", "start", service],
@@ -457,7 +462,11 @@ def default_stop_worker_service(
     avoids concurrent model residency when no cross-process accelerator
     telemetry is available.
     """
-    service = worker_service_name(profile, selection=selection)
+    try:
+        service = worker_service_name(profile, selection=selection)
+    except (RuntimeSelectionError, ValueError):
+        logger.warning("could not resolve selected worker service")
+        return False
     try:
         result = subprocess.run(
             ["systemctl", "--user", "stop", service],
@@ -507,7 +516,11 @@ def default_health_worker_profile(
     profile: AsrProfile, *, selection: RuntimeSelection | None = None
 ) -> ModelLifecycle:
     """Return the selected worker's confirmed systemd lifecycle state."""
-    service = worker_service_name(profile, selection=selection)
+    try:
+        service = worker_service_name(profile, selection=selection)
+    except (RuntimeSelectionError, ValueError):
+        logger.warning("could not resolve selected worker service")
+        return ModelLifecycle.UNKNOWN
     try:
         result = subprocess.run(
             [
@@ -575,9 +588,21 @@ class SocketWorkerClient:
     def _start_profile_service(self) -> None:
         """Start this selected profile while preserving legacy no-arg seams."""
         try:
+            signature = inspect.signature(self._start_service)
+        except (TypeError, ValueError):
             self._start_service(self._profile)
+            return
+        try:
+            signature.bind(self._profile)
         except TypeError:
-            self._start_service()
+            try:
+                signature.bind(profile=self._profile)
+            except TypeError:
+                self._start_service()
+            else:
+                self._start_service(profile=self._profile)
+        else:
+            self._start_service(self._profile)
 
     def transcribe(self, artifact: CaptureArtifact) -> Transcription:
         request = {
@@ -916,6 +941,7 @@ class VoiceDaemon:
         corrector: TextCorrector | None = None,
         model_lease: ModelLease | None = None,
         metrics: MetricsLedger | None = None,
+        asr_preloader: Callable[[], PreloadTiming | None] | None = None,
         nano_preloader: Callable[[], PreloadTiming | None] | None = None,
         scheduler: ModelScheduler | None = None,
         primary_asr_profile: AsrProfile = "nano",
@@ -945,7 +971,9 @@ class VoiceDaemon:
         self._primary_asr_profile = primary_asr_profile
         self._fallback_asr_profile = fallback_asr_profile
         self._metric_sequence: int | None = None
-        self._nano_preloader = nano_preloader
+        self._asr_preloader = (
+            asr_preloader if asr_preloader is not None else nano_preloader
+        )
         self._preload_lock = threading.Lock()
         self._preload_cancel: threading.Event | None = None
         self._preload_handle: TaskHandle | None = None
@@ -1078,13 +1106,14 @@ class VoiceDaemon:
                 return "cancelled"
 
             self._metric_sequence = self._metrics.begin()
+            self._record_primary_preload_state(self._metric_sequence)
             if hot:
                 self._state = DaemonState.RECORDING
                 self._show_overlay(DaemonState.RECORDING)
-            elif self._nano_preloader is None:
+            elif self._asr_preloader is None:
                 self._mark_recording_ready(key)
             else:
-                self._schedule_nano_preload(self._metric_sequence)
+                self._schedule_primary_preload(self._metric_sequence)
             logger.info("state -> %s", self._state.value)
             self._notify(NOTIFY_RECORDING)
             return "started"
@@ -1104,23 +1133,44 @@ class VoiceDaemon:
                 return False
             self._sleep(C_CONFIRM_POLL_SECONDS)
 
-    def _schedule_nano_preload(self, sequence: int) -> None:
+    def _schedule_primary_preload(self, sequence: int) -> None:
         """Start one non-blocking primary-profile preload after capture begins."""
-        preloader = self._nano_preloader
+        preloader = self._asr_preloader
         session = self._session
         if preloader is None or session is None:
             return
         cancelled = threading.Event()
         self._preload_cancel = cancelled
-        self._metrics.record(sequence, nano_preload="scheduled")
+        updates: dict[str, object] = {
+            "asr_preload": "scheduled",
+            "asr_preload_profile": self._primary_asr_profile,
+        }
+        if self._primary_asr_profile == "nano":
+            updates["nano_preload"] = "scheduled"
+        self._metrics.record(sequence, **updates)
         self._preload_handle = self._scheduler.run_asr(
             session.key,
             self._primary_asr_profile,
-            lambda: self._preload_nano(sequence, session.key, preloader, cancelled),
+            lambda: self._preload_primary(
+                sequence, session.key, preloader, cancelled
+            ),
             kind=ModelTaskKind.STABLE_SEGMENT,
         )
 
-    def _preload_nano(
+    def _record_primary_preload_state(self, sequence: int) -> None:
+        """Record a profile-neutral preload baseline before optional warmup."""
+        updates: dict[str, object] = {
+            "asr_preload": "not_requested",
+            "asr_warmup": "not_requested",
+            "asr_preload_profile": self._primary_asr_profile,
+        }
+        if self._primary_asr_profile == "nano":
+            updates.update(
+                nano_preload="not_requested", nano_warmup="not_requested"
+            )
+        self._metrics.record(sequence, **updates)
+
+    def _preload_primary(
         self,
         sequence: int,
         key: SessionKey,
@@ -1134,18 +1184,24 @@ class VoiceDaemon:
             try:
                 timing = preloader()
             except Exception as exc:  # noqa: BLE001 - recording stays unaffected
-                logger.info("nano preload unavailable: %s", type(exc).__name__)
-                self._metrics.record(
-                    sequence,
-                    preload_ms=_elapsed_ms(started, self._monotonic()),
-                    nano_preload="failed",
-                )
+                logger.info("ASR preload unavailable: %s", type(exc).__name__)
+                failure_updates: dict[str, object] = {
+                    "preload_ms": _elapsed_ms(started, self._monotonic()),
+                    "asr_preload": "failed",
+                    "asr_preload_profile": self._primary_asr_profile,
+                }
+                if self._primary_asr_profile == "nano":
+                    failure_updates["nano_preload"] = "failed"
+                self._metrics.record(sequence, **failure_updates)
                 self._mark_recording_ready(key)
                 return
             updates: dict[str, object] = {
                 "preload_ms": _elapsed_ms(started, self._monotonic()),
-                "nano_preload": "ready",
+                "asr_preload": "ready",
+                "asr_preload_profile": self._primary_asr_profile,
             }
+            if self._primary_asr_profile == "nano":
+                updates["nano_preload"] = "ready"
             if timing is not None:
                 if timing.worker_elapsed_ms is not None:
                     updates["preload_worker_ms"] = timing.worker_elapsed_ms
@@ -1153,7 +1209,9 @@ class VoiceDaemon:
                     updates["preload_runtime_load_ms"] = timing.runtime_load_ms
                 if timing.warmup_ms is not None:
                     updates["preload_warmup_ms"] = timing.warmup_ms
-                updates["nano_warmup"] = timing.warmup_status
+                updates["asr_warmup"] = timing.warmup_status
+                if self._primary_asr_profile == "nano":
+                    updates["nano_warmup"] = timing.warmup_status
             self._metrics.record(sequence, **updates)
             self._mark_recording_ready(key)
 
@@ -1823,6 +1881,7 @@ def build_voice_daemon(
         ),
         start_service=dependencies.start_worker_service,
         stop_service=dependencies.stop_worker_service,
+        auto_start_service=False,
     )
     fallback = (
         SocketWorkerClient(
@@ -1832,6 +1891,7 @@ def build_voice_daemon(
             ),
             start_service=dependencies.start_worker_service,
             stop_service=dependencies.stop_worker_service,
+            auto_start_service=False,
         )
         if effective.fallback_asr_profile is not None
         else None
@@ -1858,7 +1918,7 @@ def build_voice_daemon(
         fallback_worker=fallback,
         corrector=corrector,
         scheduler=scheduler,
-        nano_preloader=primary.preload,
+        asr_preloader=primary.preload,
         primary_asr_profile=effective.primary_asr_profile,
         fallback_asr_profile=effective.fallback_asr_profile,
         auto_stop_event=dependencies.auto_stop_event,
