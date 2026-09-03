@@ -59,12 +59,82 @@ def test_daemon_does_not_restart_after_hotkey_grab_failure() -> None:
     assert "RestartPreventExitStatus=2" in service
 
 
-def test_installer_requires_the_current_xpu_runtime_not_only_a_stale_report() -> None:
+def test_installer_requires_and_validates_the_selected_runtime() -> None:
     install = (ROOT / "scripts/install-user.sh").read_text(encoding="utf-8")
-    assert "RUNTIME_MODULES=(torch funasr modelscope transformers Xlib)" in install
-    assert "Nano POC backend is not native_funasr_pytorch" in install
-    assert "XPU runtime imports verified" in install
-    assert "uv sync --inexact" in install
+    assert "--runtime-selection" in install
+    assert "load_runtime_selection" in install
+    assert "RuntimeSelectionError" in install
+    assert "import torch, funasr, modelscope, transformers, Xlib" in install
+    assert "runtime_selection_invalid" in install
+    assert "runtime_import_failed" in install
+    for obsolete in (
+        "POC_REPORT",
+        "poc-report.json",
+        "Nano POC backend",
+        "uv sync --inexact",
+        '${ROOT}/.venv/bin/fun-voice-',
+    ):
+        assert obsolete not in install
+
+
+def test_installer_writes_all_launchers_through_one_closed_function() -> None:
+    install = (ROOT / "scripts/install-user.sh").read_text(encoding="utf-8")
+    assert "install_launcher()" in install
+    assert 'exec \\"${ROOT}/scripts/run-selected-runtime.sh\\"' in install
+    assert install.count('install_launcher "${script}"') == 1
+    assert 'src="${ROOT}/.venv/bin/${script}"' not in install
+
+
+def test_selected_runtime_adapter_only_delegates_to_closed_python_launcher() -> None:
+    adapter = (ROOT / "scripts/run-selected-runtime.sh").read_text(encoding="utf-8")
+    assert "set -euo pipefail" in adapter
+    assert 'python3 -P -m fun_voice.runtime_launcher "$@"' in adapter
+    assert "selection.json" not in adapter
+    assert "load_runtime_selection" not in adapter
+    assert "torch" not in adapter
+
+
+def test_uninstaller_preserves_portable_runtime_and_model_state() -> None:
+    uninstall = (ROOT / "scripts/uninstall-user.sh").read_text(encoding="utf-8")
+    assert "MODELS_DIR=" not in uninstall
+    assert "--purge" not in uninstall
+    assert 'rm -rf "${MODELS_DIR}"' not in uninstall
+    assert "/runtimes" not in uninstall
+    assert "/selection.json" not in uninstall
+
+
+def test_installer_rejects_an_invalid_selection_before_user_writes(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    data_home = tmp_path / "data"
+    home.mkdir()
+    data_home.mkdir()
+    missing = data_home / "fun-voice-ryan/runtime/selection.json"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(data_home),
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts/install-user.sh"),
+            "--runtime-selection",
+            str(missing),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "ERROR(runtime_selection_invalid)" in completed.stderr
+    assert list(home.iterdir()) == []
 
 
 def test_xpu_environment_uses_native_funasr_without_vllm_runtime() -> None:
@@ -749,3 +819,67 @@ def test_user_docs_cover_dtk_build_fallback_and_visual_acceptance() -> None:
     assert "无悬浮窗" in operations
     for expected in ("中下部", "深色", "浅色", "中文", "圆角", "焦点"):
         assert expected in checklist
+
+
+def test_user_docs_describe_portable_first_run_selection() -> None:
+    for relative in ("README.md", "docs/operations.md"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for command in (
+            "scripts/initialize-first-run.sh",
+            "scripts/initialize-first-run.sh --backend cpu",
+            "scripts/initialize-first-run.sh --force-reselect",
+            "fun-voice-selftest --format json",
+        ):
+            assert command in text
+        for policy in (
+            "CUDA → Intel XPU → CPU",
+            "SenseVoice-only",
+            "selection.json",
+            "0700",
+            "0600",
+            "BF16",
+            "FP16",
+            "不回退",
+        ):
+            assert policy in text
+        assert "仓库 `.venv`" in text
+
+
+def test_example_config_leaves_backend_policy_to_first_initialization() -> None:
+    example = (ROOT / "scripts/config.example.toml").read_text(encoding="utf-8")
+    assert 'device = "xpu:0"' not in example
+    assert 'dtype = "bf16"' not in example
+    assert "首次初始化" in example
+    assert "CPU" in example and "不生效" in example
+    for knob in (
+        "max_source_characters",
+        "max_new_tokens",
+        "timeout_seconds",
+        "protected_terms",
+    ):
+        assert knob in example
+
+
+def test_acceptance_checklist_has_mutually_exclusive_backend_sections() -> None:
+    checklist = (ROOT / "docs/acceptance-checklist.md").read_text(
+        encoding="utf-8"
+    )
+    for heading in ("CUDA 机器", "Intel XPU 机器", "纯 CPU 机器"):
+        assert heading in checklist
+    for required in (
+        "fun-voice-worker@nano",
+        "SenseVoice-only",
+        "Qwen",
+        "CAM++",
+        "Super+C",
+        "clipboard",
+        "BF16",
+    ):
+        assert required in checklist
+
+
+def test_xpu_poc_is_documented_as_optional_explicit_diagnostic() -> None:
+    document = (ROOT / "docs/xpu-poc.md").read_text(encoding="utf-8")
+    assert "显式 Intel XPU 诊断" in document
+    assert "不能阻断 CUDA 或 CPU 初始化" in document
+    assert "桌面服务上线的**硬门**" not in document

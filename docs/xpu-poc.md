@@ -1,15 +1,17 @@
-# Fun-ASR-Nano Intel XPU 阻断 POC
+# Fun-ASR-Nano 显式 Intel XPU 诊断
 
-本 POC 是桌面服务上线的**硬门**:九项检查全部通过之前,不得安装或启动任何桌面服务;
-任一失败即停止部署,绝不静默退回 CPU 或切换后端。
+本 POC 是 Intel XPU 路径的可选深度诊断。它对本条命令保持失败关闭：九项检查任一失败
+即返回非零，绝不在诊断内部静默切换后端；但它**不能阻断 CUDA 或 CPU 初始化**，也不再是
+`scripts/initialize-first-run.sh` 的全局安装硬门。日常首次初始化由 backend probe 为实际
+候选完成张量与模型 smoke test，并把通过的结果写入私有 `selection.json`。
 
 当前 Nano 运行时固定为 `native_funasr_pytorch`：通过本地 FunASR
 `AutoModel(..., device="xpu:0")` 调用 PyTorch XPU。此前的 vLLM XPU
 prompt-embedding 路径在本机连续第二次请求会卡死，已不再是可部署后端；旧报告不能作为
 当前版本的放行证据。
 
-> 失败后,**只有人工**可以决定是否研究 llama.cpp / Vulkan 替代路线。脚本与自动化不得
-> 在 POC 失败时自行改走 CPU 或其他后端。
+> 显式诊断失败后，本条命令不会自行改走 CPU 或其他后端；需要日常可用性时，另行执行
+> `scripts/initialize-first-run.sh` 的 auto 或显式 CPU/CUDA 路径。
 
 ## 硬门清单
 
@@ -142,11 +144,11 @@ Level Zero 是 torch-xpu 的底层运行时;若 `torch.xpu.is_available()` 为
 `${XDG_RUNTIME_DIR}/fun-voice-ryan/poc-report.json` 为 `ready=true`，设备为
 `xpu:0`，九项硬门全部为 `pass`；Nano decoder 后端为
 `native_funasr_pytorch`。该报告以 `0600` 保存，只记录设备、门禁指标和样本构成，
-不含音频路径或转写文本，可作为当前桌面服务的放行证据。
+不含音频路径或转写文本，可作为当前 Intel XPU 路径的补充诊断证据。
 
 下表摘录的是该真实运行报告的非敏感指标。任何后续环境、驱动或模型变更后，都必须重新运行
 本节末的 POC；新报告只有仍满足 `ready=true`、九项全 `pass` 且
-`backend="native_funasr_pytorch"` 时才能放行。
+`backend="native_funasr_pytorch"` 时才表示该显式诊断通过。
 
 ### 九项硬门结果
 

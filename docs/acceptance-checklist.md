@@ -6,6 +6,41 @@
 > `x11_hotkey` 在本次 daemon 启动后首次真实按住 `Super+C` 前会是 `fail`；完成第 1 节的
 > 第一次按住/松开后重新运行 `fun-voice-selftest --format json`，应全部 `pass`。
 
+## 0. 选择一个互斥的硬件验收路径
+
+以下三节按机器实际硬件**只执行一节**。不要在一台不支持目标后端的机器上依次运行三种
+显式初始化；显式模式失败不会回退，也不得改变已有 `selection.json`。
+
+### CUDA 机器
+
+- [ ] 执行 `scripts/initialize-first-run.sh --backend cuda`，确认私有 `selection.json`
+      的 backend/device 是 `cuda`/`cuda:0`，dtype 是探测通过的 BF16，硬件不支持时才是 FP16。
+- [ ] 确认 Nano 是 primary、SenseVoiceSmall 是 fallback；有效录音前没有模型进程常驻。
+- [ ] 启用修正时确认 `fun-voice-worker@nano.service`（或实际使用的 SenseVoice worker）
+      已停止，随后才出现 Qwen 进程；说话人请求才按需运行 CAM++。
+- [ ] 按住/松开 `Super+C` 完成一次中英混合输入，确认最终文本上屏并留在 clipboard。
+
+### Intel XPU 机器
+
+- [ ] 执行 `scripts/initialize-first-run.sh --backend xpu`，确认 `selection.json` 是
+      `xpu`/`xpu:0`/BF16，不接受 FP16 或 CPU 静默回退。
+- [ ] 确认 Nano primary、SenseVoiceSmall fallback，且 Qwen 只在 ASR worker 已停止后运行；
+      CAM++ 只在说话人能力实际请求时启动。
+- [ ] `docs/xpu-poc.md` 的九项 POC 可作为显式 Intel XPU 诊断运行，但它不是 CUDA/CPU
+      初始化的前置条件。
+- [ ] 按住/松开 `Super+C` 完成输入，确认最终文本上屏并留在 clipboard。
+
+### 纯 CPU 机器
+
+- [ ] 执行 `scripts/initialize-first-run.sh --backend cpu`，确认 `selection.json` 是
+      `cpu`/`cpu`/FP32，ASR 策略为 **SenseVoice-only** 且没有 fallback。
+- [ ] 确认不存在 `fun-voice-worker@nano` socket、服务进程或模型加载；只允许
+      SenseVoiceSmall worker 按需启动。
+- [ ] 检查 `${XDG_DATA_HOME:-$HOME/.local/share}/fun-voice-ryan/models/models`，确认本次
+      初始化没有下载 Qwen3.5-0.8B 或 CAM++ 快照，也没有 Qwen/CAM++ 进程。
+- [ ] 按住/松开 `Super+C`，确认原始 SenseVoiceSmall 文本经 Fcitx 上屏并写入 clipboard；
+      悬浮窗、焦点保护、长录音切分等非模型桌面行为与加速器路径一致。
+
 ## 1. X11 Super+C 独占、按住录音、松开识别
 
 - [ ] 执行一次 `Super+C` 按住/松开后运行 `fun-voice-selftest --format json`，确认
@@ -67,13 +102,13 @@
 - [ ] **25 分钟提醒**：录音接近 25 分钟时收到一次通知提醒。
 - [ ] **30 分钟停止**：达到 30 分钟硬上限后自动停止，不再继续录音。
 
-## 7. XPU 无 CPU 回退
+## 7. 加速器无静默 CPU 回退
 
-- [ ] 录音输入期间观察 `journalctl --user -u fun-voice-worker@nano`，确认推理设备为
-      `xpu:0`，无「CPU fallback」「decoder device type is cpu」等字样。
+- [ ] 在 CUDA 或 XPU 验收路径中观察 `journalctl --user -u fun-voice-worker@nano`，确认
+      推理设备与 `selection.json` 一致，无「CPU fallback」等字样。
 - [ ] 启用 Qwen 后确认其在 Nano/SenseVoice worker 停止后才运行；停止确认失败时应直接得到
       原始转写，而不应同时驻留两个模型。
-- [ ] `fun-voice-selftest --format json` 中 `xpu_hard_gate` 与 `worker_health` 均为 `pass`。
+- [ ] `fun-voice-selftest --format json` 的 runtime selection 与 worker health 均为 `pass`。
 
 ## 8. 重启后无残留
 

@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # install-user.sh — install Fun Voice Ryan into the current user's home.
 #
-# Hard gate: the Intel XPU POC report must exist and say ready=true before
-# anything is written (the plan forbids installing/starting desktop services
-# before every POC hard gate passes).
+# Hard gate: a private, validated portable runtime selection must identify the
+# interpreter used by every installed launcher before anything is written.
 #
 # Every write target is user-scoped (home or XDG_RUNTIME_DIR); the script never
 # uses sudo and never touches system-wide paths. Each step is idempotent (safe
 # to re-run) and reversible via uninstall-user.sh.
 #
 # Steps:
-#   1. Console scripts            -> ~/.local/bin
+#   1. Selection-aware launchers  -> ~/.local/bin
 #   2. systemd units              -> ~/.config/systemd/user  (replaces symlinks)
 #   3. Fcitx addon .so + .conf    -> ~/.local/lib/fcitx5 and ~/.local/share/fcitx5/addon
 #   4. DTK overlay executable     -> ~/.local/lib/fun-voice-ryan
@@ -37,8 +36,7 @@ CONSOLE_SCRIPTS=(
 )
 SYSTEMD_UNITS=(fun-voice-worker@.service fun-voice-daemon.service)
 
-POC_REPORT="${XDG_RUNTIME_DIR:-}/fun-voice-ryan/poc-report.json"
-RUNTIME_MODULES=(torch funasr modelscope transformers Xlib)
+RUNTIME_SELECTION="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/runtime/selection.json"
 
 # Source artifacts (validated up front so a missing file fails before any write).
 FCITX_SO="${ROOT}/build/fcitx/fcitx5-fun-voice.so"
@@ -48,6 +46,14 @@ DESKTOP_SRC="${ROOT}/systemd/fun-voice-session.desktop"
 FCITX_LIB_ABS="${FCITX_LIB_DIR}/fcitx5-fun-voice"  # no ".so"; fcitx5 appends it
 log() { printf '[install-user] %s\n' "$*"; }
 die() { printf '[install-user] ERROR(%s): %s\n' "$1" "$2" >&2; exit 1; }
+
+if [[ "$#" -eq 0 ]]; then
+    :
+elif [[ "$#" -eq 2 && "$1" == "--runtime-selection" && -n "$2" ]]; then
+    RUNTIME_SELECTION="$2"
+else
+    die "usage" "expected --runtime-selection PATH"
+fi
 
 # Retire only the DDE shortcut created by an older Fun Voice Ryan release.
 # A persisted id alone is not authority to remove a global shortcut: verify
@@ -110,60 +116,42 @@ install_file() {
         || die "copy" "cannot install ${src} -> ${dest}"
 }
 
-# --- 0. Hard gate: XPU POC must be ready -----------------------------------
+# --- 0. Hard gate: validate selection and selected environment -------------
+if [[ ! -e "${RUNTIME_SELECTION}" && ! -L "${RUNTIME_SELECTION}" ]]; then
+    die "runtime_selection_invalid" "portable runtime selection is unavailable"
+fi
+SELECTION_PYTHON="$(PYTHONPATH="${ROOT}/src" python3 -P -c '
+from pathlib import Path
+import sys
+from fun_voice.runtime_selection import RuntimeSelectionError, load_runtime_selection, selection_path
+manifest = Path(sys.argv[1])
+if not manifest.is_absolute() or manifest.name != "selection.json" or manifest.parent.name != "runtime":
+    raise SystemExit(2)
+root = manifest.parent.parent
+if selection_path(root) != manifest:
+    raise SystemExit(2)
+try:
+    selection = load_runtime_selection(root)
+except RuntimeSelectionError:
+    raise SystemExit(2) from None
+print(selection.python)
+' "${RUNTIME_SELECTION}" 2>/dev/null)" \
+    || die "runtime_selection_invalid" "portable runtime selection is invalid"
+
+RUNTIME_IMPORT_CHECK='from pathlib import Path; import sys; from fun_voice.runtime_selection import load_runtime_selection; manifest = Path(sys.argv[1]); selection = load_runtime_selection(manifest.parent.parent); assert Path(sys.executable).resolve() == selection.python.resolve(); import torch, funasr, modelscope, transformers, Xlib'
+if ! PYTHONPATH="${ROOT}/src" "${SELECTION_PYTHON}" -P -c \
+    "${RUNTIME_IMPORT_CHECK}" "${RUNTIME_SELECTION}" >/dev/null 2>&1; then
+    die "runtime_import_failed" "selected runtime imports are unavailable"
+fi
+log "portable runtime selection and imports verified"
+
 if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR}" ]]; then
     die "precondition" "XDG_RUNTIME_DIR is not set or does not exist"
 fi
-if [[ ! -f "${POC_REPORT}" ]]; then
-    die "precondition" \
-        "XPU POC report missing: ${POC_REPORT}. Run scripts/run-nano-xpu-poc.sh first."
-fi
-POC_CHECK="$(python3 - "${POC_REPORT}" <<'PYEOF' || true
-import json, sys
-report = json.load(open(sys.argv[1]))
-required = {
-    "xpu_visible", "nano_decoder_xpu", "nano_encoder_xpu",
-    "nano_adaptor_xpu", "prompt_embeddings_xpu", "decode_10s",
-    "decode_60s", "no_cpu_decoder_fallback", "oom_survives",
-}
-checks = {c["name"]: c.get("status") for c in report.get("checks", [])}
-decoder = next(
-    (c for c in report.get("checks", []) if c.get("name") == "nano_decoder_xpu"),
-    {},
-)
-if report.get("ready") is not True:
-    print("report ready is not True")
-elif set(checks) != required:
-    print(f"gate set mismatch: missing={sorted(required - set(checks))} extra={sorted(set(checks) - required)}")
-elif decoder.get("detail", {}).get("backend") != "native_funasr_pytorch":
-    print("Nano POC backend is not native_funasr_pytorch")
-elif any(s != "pass" for s in checks.values()):
-    print("not all gates pass: " + ", ".join(f"{n}={s}" for n, s in checks.items() if s != "pass"))
-else:
-    print("OK")
-PYEOF
-)"
-if [[ "${POC_CHECK}" != "OK" ]]; then
-    die "precondition" \
-        "XPU POC hard gates not satisfied: ${POC_CHECK}. Run scripts/run-nano-xpu-poc.sh first."
-fi
-log "XPU POC hard gates verified (9/9 pass)"
-
-# A POC report proves a previous run, not that the current virtual environment
-# still contains its XPU runtime. In particular, plain `uv sync` can prune
-# manually installed XPU packages. Refuse deployment before writing user files
-# when the runtime imports are absent.
-for module in "${RUNTIME_MODULES[@]}"; do
-    "${ROOT}/.venv/bin/python" -c "import ${module}" 2>/dev/null \
-        || die "runtime" "missing ${module}; run scripts/create-xpu-env.sh, then uv sync --inexact"
-done
-log "XPU runtime imports verified"
 
 # --- 0b. Source validation (fail fast, before any write) -------------------
-for script in "${CONSOLE_SCRIPTS[@]}"; do
-    [[ -f "${ROOT}/.venv/bin/${script}" ]] \
-        || die "source" "console script missing: ${ROOT}/.venv/bin/${script}"
-done
+[[ -f "${ROOT}/scripts/run-selected-runtime.sh" ]] \
+    || die "source" "selected runtime adapter is missing"
 for unit in "${SYSTEMD_UNITS[@]}"; do
     [[ -f "${ROOT}/systemd/${unit}" ]] \
         || die "source" "systemd unit missing: ${ROOT}/systemd/${unit}"
@@ -176,13 +164,24 @@ done
 [[ -f "${DESKTOP_SRC}" ]] || die "source" "desktop entry missing: ${DESKTOP_SRC}"
 log "all source artifacts present"
 
-# --- 1. Console scripts -> ~/.local/bin ------------------------------------
-mkdir -p "${BIN_DIR}" || die "mkdir" "cannot create ${BIN_DIR}"
+# --- 1. Selection-aware launchers -> ~/.local/bin --------------------------
+install_launcher() {
+    local name="$1"
+    local target="${BIN_DIR}/${name}"
+    install -d -m 700 "${BIN_DIR}"
+    umask 077
+    rm -f "${target}.tmp"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        "exec \"${ROOT}/scripts/run-selected-runtime.sh\" \"${name}\" \"\$@\"" \
+        > "${target}.tmp"
+    chmod 700 "${target}.tmp"
+    mv -f "${target}.tmp" "${target}"
+}
+
 for script in "${CONSOLE_SCRIPTS[@]}"; do
-    src="${ROOT}/.venv/bin/${script}"
-    install_file "${src}" "${BIN_DIR}/${script}" 755
+    install_launcher "${script}"
 done
-log "installed console scripts into ${BIN_DIR}"
+log "installed selected-runtime launchers into ${BIN_DIR}"
 
 # --- 2. systemd units -> ~/.config/systemd/user ----------------------------
 for unit in "${SYSTEMD_UNITS[@]}"; do

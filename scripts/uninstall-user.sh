@@ -7,8 +7,8 @@
 #   3. Remove the six console scripts from ~/.local/bin
 #   4. Remove the runtime sockets and capture shards
 #
-# The model cache and user config are always preserved unless --purge is given,
-# in which case they are deleted after a second confirmation.
+# Model snapshots, portable runtimes, selection state, and user config are
+# always preserved so reinstalling never needs an implicit model download.
 
 set -euo pipefail
 
@@ -18,8 +18,6 @@ FCITX_LIB_DIR="${HOME}/.local/lib/fcitx5"
 FCITX_ADDON_DIR="${HOME}/.local/share/fcitx5/addon"
 OVERLAY_INSTALL_DIR="${HOME}/.local/lib/fun-voice-ryan"
 AUTOSTART_DIR="${HOME}/.config/autostart"
-CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/fun-voice-ryan"
-MODELS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/models"
 
 CONSOLE_SCRIPTS=(
   fun-voice-daemon fun-voice-worker fun-voice-preflight fun-voice-selftest
@@ -42,11 +40,8 @@ else
     FCITX_SOCKET="${XDG_RUNTIME_DIR}/fun-voice-ryan-fcitx.sock"
 fi
 
-PURGE=0
-if [[ "${1:-}" == "--purge" ]]; then
-    PURGE=1
-elif [[ -n "${1:-}" ]]; then
-    die "usage" "unknown argument: $1 (only --purge is supported)"
+if [[ "$#" -ne 0 ]]; then
+    die "usage" "no arguments are supported"
 fi
 
 # remove_file PATH — best-effort removal of a regular file or symlink.
@@ -91,23 +86,6 @@ if [[ -n "${RUNTIME_DIR}" ]]; then
     fi
 fi
 
-# --- 5. Optional purge (model cache + user config) --------------------------
-if [[ "${PURGE}" -eq 1 ]]; then
-    printf '[uninstall-user] WARNING: --purge will permanently delete:\n'
-    printf '  model cache: %s\n' "${MODELS_DIR}"
-    printf '  user config: %s\n' "${CONFIG_DIR}"
-    printf 'Type "DELETE" (without quotes) to confirm: '
-    if ! read -r answer; then
-        printf '\n[uninstall-user] ERROR(abort): purge not confirmed (stdin closed); model cache and config preserved\n' >&2
-        exit 1
-    fi
-    if [[ "${answer}" != "DELETE" ]]; then
-        die "abort" "purge not confirmed; model cache and config preserved"
-    fi
-    rm -rf "${MODELS_DIR}" && log "purged model cache ${MODELS_DIR}"
-    rm -rf "${CONFIG_DIR}" && log "purged user config ${CONFIG_DIR}"
-else
-    log "model cache and user config preserved (use --purge to delete)"
-fi
+log "model snapshots, portable runtimes, selection state, and user config preserved"
 
 log "uninstall complete"
