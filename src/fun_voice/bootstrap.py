@@ -61,7 +61,15 @@ _ASR_WORKER_UNITS = (
     "fun-voice-worker@nano.service",
     "fun-voice-worker@sensevoice.service",
 )
-_MANAGED_UNITS = ("fun-voice-daemon.service", *_ASR_WORKER_UNITS)
+_LEGACY_WORKER_UNIT = "fun-voice-worker.service"
+_MANAGED_UNITS = (
+    "fun-voice-daemon.service",
+    *_ASR_WORKER_UNITS,
+    _LEGACY_WORKER_UNIT,
+)
+_ENABLEMENT_UNITS = frozenset(
+    {"fun-voice-daemon.service", _LEGACY_WORKER_UNIT}
+)
 _TRANSACTION_FILE = ".initialization-transaction.json"
 _MODEL_CACHE_NAMES = {
     "nano": "FunAudioLLM--Fun-ASR-Nano-2512",
@@ -117,6 +125,7 @@ class CommandRunner(Protocol):
 @dataclass(frozen=True, slots=True)
 class _ServiceSnapshot:
     active_units: frozenset[str]
+    enabled_units: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,19 +469,46 @@ def _snapshot_service_state(runner: CommandRunner) -> _ServiceSnapshot:
                 unit,
             )
         )
-        if state.returncode == 0 and state.stdout.strip() in {
+        value = state.stdout.strip()
+        if state.returncode != 0 or value not in {
             "active",
             "activating",
             "reloading",
+            "inactive",
+            "failed",
         }:
+            raise InitializationError("install")
+        if value in {"active", "activating", "reloading"}:
             active.add(unit)
-    return _ServiceSnapshot(frozenset(active))
+    enabled: set[str] = set()
+    for unit in _ENABLEMENT_UNITS:
+        state = runner.run(("systemctl", "--user", "is-enabled", unit))
+        value = state.stdout.strip()
+        if value in {"enabled", "enabled-runtime", "linked", "linked-runtime"}:
+            enabled.add(unit)
+        elif value not in {
+            "disabled",
+            "static",
+            "indirect",
+            "generated",
+            "transient",
+            "masked",
+            "masked-runtime",
+            "alias",
+            "not-found",
+        }:
+            raise InitializationError("install")
+    return _ServiceSnapshot(frozenset(active), frozenset(enabled))
 
 
 def _restore_service_state(
     runner: CommandRunner, snapshot: _ServiceSnapshot
 ) -> None:
-    for unit in (*_ASR_WORKER_UNITS, "fun-voice-daemon.service"):
+    for unit in snapshot.enabled_units:
+        enabled = runner.run(("systemctl", "--user", "enable", unit))
+        if enabled.returncode != 0:
+            raise InitializationError("install")
+    for unit in (*_ASR_WORKER_UNITS, _LEGACY_WORKER_UNIT, "fun-voice-daemon.service"):
         if unit not in snapshot.active_units:
             continue
         started = runner.run(("systemctl", "--user", "start", unit))
@@ -519,6 +555,7 @@ def _write_transaction_journal(
         ),
         "previous_mode": previous_mode,
         "active_units": sorted(services.active_units),
+        "enabled_units": sorted(services.enabled_units),
         "bindings": [
             {
                 "relative_path": item.relative_path,
@@ -588,6 +625,7 @@ def _read_transaction_journal(
             "previous_manifest",
             "previous_mode",
             "active_units",
+            "enabled_units",
             "bindings",
             "model_promotions",
         }:
@@ -595,6 +633,7 @@ def _read_transaction_journal(
         encoded = raw["previous_manifest"]
         mode = raw["previous_mode"]
         units = raw["active_units"]
+        enabled_units = raw["enabled_units"]
         bindings_raw = raw["bindings"]
         promotions_raw = raw["model_promotions"]
         if (
@@ -606,6 +645,12 @@ def _read_transaction_journal(
                 isinstance(unit, str) and unit in _MANAGED_UNITS for unit in units
             )
             or len(set(units)) != len(units)
+            or not isinstance(enabled_units, list)
+            or not all(
+                isinstance(unit, str) and unit in _ENABLEMENT_UNITS
+                for unit in enabled_units
+            )
+            or len(set(enabled_units)) != len(enabled_units)
             or not isinstance(bindings_raw, list)
             or not isinstance(promotions_raw, list)
         ):
@@ -687,7 +732,7 @@ def _read_transaction_journal(
     return (
         previous,
         cast(int | None, mode),
-        _ServiceSnapshot(frozenset(units)),
+        _ServiceSnapshot(frozenset(units), frozenset(enabled_units)),
         tuple(bindings),
         tuple(promotions),
     )
@@ -806,6 +851,56 @@ def _model_promotion_paths(
     return source, snapshots / "master", snapshots / f".previous-master-{plan.token}"
 
 
+def _require_owned_model_directory(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except OSError as exc:
+        raise InitializationError("install") from exc
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.geteuid()
+    ):
+        raise InitializationError("install")
+
+
+def _prepare_owned_model_directory(path: Path) -> None:
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise InitializationError("install") from exc
+    _require_owned_model_directory(path)
+
+
+def _validate_candidate_model_source(root: Path, plan: _ModelPromotionPlan) -> Path:
+    name = _MODEL_CACHE_NAMES[plan.key]
+    current = root
+    for component in (
+        "model-candidates",
+        plan.token,
+        "models",
+        name,
+        "snapshots",
+        "master",
+    ):
+        current /= component
+        _require_owned_model_directory(current)
+    return current
+
+
+def _prepare_canonical_model_destination(
+    root: Path, plan: _ModelPromotionPlan
+) -> tuple[Path, Path]:
+    name = _MODEL_CACHE_NAMES[plan.key]
+    current = root
+    for component in ("models", "models", name, "snapshots"):
+        current /= component
+        _prepare_owned_model_directory(current)
+    return current / "master", current / f".previous-master-{plan.token}"
+
+
 def _plan_candidate_models(
     root: Path,
     candidate_root: Path,
@@ -824,9 +919,8 @@ def _plan_candidate_models(
             if key not in _MODEL_CACHE_NAMES:
                 raise InitializationError("install")
             plan = _ModelPromotionPlan(key, token, False)
-            source, destination, backup = _model_promotion_paths(root, plan)
-            if not source.is_dir() or source.is_symlink():
-                raise InitializationError("install")
+            _validate_candidate_model_source(root, plan)
+            destination, backup = _prepare_canonical_model_destination(root, plan)
             if backup.exists() or backup.is_symlink():
                 raise InitializationError("install")
             plans.append(
@@ -848,11 +942,10 @@ def _promote_candidate_models(
     promotions: list[_ModelPromotion] = []
     try:
         for plan in plans:
-            source, destination, backup_path = _model_promotion_paths(root, plan)
-            snapshots = destination.parent
-            snapshots.mkdir(parents=True, mode=0o700, exist_ok=True)
-            if not source.is_dir() or source.is_symlink():
-                raise InitializationError("install")
+            source = _validate_candidate_model_source(root, plan)
+            destination, backup_path = _prepare_canonical_model_destination(
+                root, plan
+            )
             destination_exists = destination.exists() or destination.is_symlink()
             if destination_exists != plan.had_destination:
                 raise InitializationError("install")
@@ -874,7 +967,8 @@ def _restore_model_promotions(
     root: Path, plans: Sequence[_ModelPromotionPlan]
 ) -> None:
     for plan in reversed(plans):
-        source, destination, backup = _model_promotion_paths(root, plan)
+        source, _, _ = _model_promotion_paths(root, plan)
+        destination, backup = _prepare_canonical_model_destination(root, plan)
         if plan.had_destination:
             if not backup.exists() and not backup.is_symlink():
                 continue
@@ -1064,19 +1158,23 @@ def _run_locked_initialization(
     if successful is None or successful_models is None:
         raise InitializationError("no backend available")
 
-    services = _snapshot_service_state(runner)
-    bindings = _snapshot_deployment_bindings()
-    model_plans = _plan_candidate_models(
-        root, successful_models, successful.model_revisions
-    )
-    _write_transaction_journal(
-        root,
-        previous_bytes=previous_bytes,
-        previous_mode=previous_mode,
-        services=services,
-        bindings=bindings,
-        model_promotions=model_plans,
-    )
+    try:
+        services = _snapshot_service_state(runner)
+        bindings = _snapshot_deployment_bindings()
+        model_plans = _plan_candidate_models(
+            root, successful_models, successful.model_revisions
+        )
+        _write_transaction_journal(
+            root,
+            previous_bytes=previous_bytes,
+            previous_mode=previous_mode,
+            services=services,
+            bindings=bindings,
+            model_promotions=model_plans,
+        )
+    except BaseException:
+        _discard_candidate(successful_models)
+        raise
     promotions: list[_ModelPromotion] = []
     try:
         if previous is not None:

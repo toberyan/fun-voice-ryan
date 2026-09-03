@@ -1023,6 +1023,7 @@ def load_sensevoice_runtime(
     model = AutoModel(
         model=str(sensevoice_model_dir()),
         vad_model=str(vad_model_dir()),
+        vad_kwargs=_funasr_precision_kwargs(selection.dtype),
         device=selected_device,
         **_funasr_precision_kwargs(selection.dtype),
         disable_update=True,

@@ -705,6 +705,38 @@ def test_cpu_sensevoice_loader_uses_selected_cpu_dtype_and_device_type(
     assert runtime.expected_device_type == "cpu"
 
 
+def test_accelerator_sensevoice_passes_selected_dtype_to_nested_vad(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection("xpu")
+    captured: dict[str, object] = {}
+    parameter = SimpleNamespace(
+        device=SimpleNamespace(type="xpu"),
+        dtype="torch.bfloat16",
+        is_floating_point=lambda: True,
+    )
+    model = SimpleNamespace(
+        parameters=lambda: iter([parameter]),
+        vad_model=SimpleNamespace(parameters=lambda: iter([parameter])),
+    )
+
+    def auto_model(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setitem(sys.modules, "funasr", SimpleNamespace(AutoModel=auto_model))
+
+    nano_mod.load_sensevoice_runtime(
+        selection=selection, inference=_inference(selection)
+    )
+
+    assert captured["vad_kwargs"] == {
+        "dtype": "bf16",
+        "bf16": True,
+        "fp16": False,
+    }
+
+
 def test_loaded_sensevoice_health_rechecks_vad_selected_dtype() -> None:
     main_parameter = SimpleNamespace(
         device=SimpleNamespace(type="cpu"),

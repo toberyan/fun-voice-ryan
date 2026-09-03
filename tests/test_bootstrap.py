@@ -45,6 +45,8 @@ class FakeRunner:
         self.calls.append((argv, env))
         if argv[:3] == ("systemctl", "--user", "show"):
             return CommandResult(0, "inactive\n")
+        if argv[:3] == ("systemctl", "--user", "is-enabled"):
+            return CommandResult(1, "disabled\n")
         if "create-runtime-env.sh" in argv[0]:
             backend = argv[argv.index("--backend") + 1]
             runtime = Path(argv[argv.index("--runtime-dir") + 1])
@@ -675,6 +677,98 @@ def test_failed_restart_restores_previously_inactive_daemon_state(
     assert not selection_path(desktop_prerequisites).exists()
 
 
+def test_service_snapshot_failure_aborts_before_deployment_transaction(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "xpu")
+
+    class SnapshotFailure(FakeRunner):
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if (
+                argv[:3] == ("systemctl", "--user", "show")
+                and argv[-1] == "fun-voice-daemon.service"
+            ):
+                return CommandResult(1, "")
+            return result
+
+    runner = SnapshotFailure({"cpu": passed("cpu", "float32")})
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert load_runtime_selection(desktop_prerequisites) == previous
+    assert not (desktop_prerequisites / ".initialization-transaction.json").exists()
+    assert not any(
+        argv[:3] == ("systemctl", "--user", "stop") for argv, _ in runner.calls
+    )
+
+
+def test_failed_upgrade_restores_active_enabled_legacy_worker(
+    desktop_prerequisites: Path,
+) -> None:
+    _write_selection(desktop_prerequisites, "xpu")
+    legacy_unit = Path(os.environ["HOME"]) / (
+        ".config/systemd/user/fun-voice-worker.service"
+    )
+    legacy_unit.parent.mkdir(parents=True, mode=0o700)
+    legacy_unit.write_text("old legacy unit\n", encoding="utf-8")
+    legacy_unit.chmod(0o600)
+
+    class LegacyUpgradeFailure(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"cpu": passed("cpu", "float32")})
+            self.legacy_active = True
+            self.legacy_enabled = True
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if argv[:3] == ("systemctl", "--user", "show"):
+                active = (
+                    argv[-1] == "fun-voice-worker.service" and self.legacy_active
+                )
+                return CommandResult(0, "active\n" if active else "inactive\n")
+            if argv[:3] == ("systemctl", "--user", "is-enabled"):
+                enabled = (
+                    argv[-1] == "fun-voice-worker.service" and self.legacy_enabled
+                )
+                return CommandResult(
+                    0 if enabled else 1,
+                    "enabled\n" if enabled else "disabled\n",
+                )
+            if "install-user.sh" in argv[0]:
+                legacy_unit.unlink()
+                self.legacy_active = False
+                self.legacy_enabled = False
+                return CommandResult(1, "")
+            if (
+                argv[:3] == ("systemctl", "--user", "enable")
+                and argv[-1] == "fun-voice-worker.service"
+            ):
+                self.legacy_enabled = True
+            if (
+                argv[:3] == ("systemctl", "--user", "start")
+                and argv[-1] == "fun-voice-worker.service"
+            ):
+                self.legacy_active = True
+            return result
+
+    runner = LegacyUpgradeFailure()
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    assert legacy_unit.read_text(encoding="utf-8") == "old legacy unit\n"
+    assert runner.legacy_enabled is True
+    assert runner.legacy_active is True
+
+
 def test_persistently_failing_install_restores_exact_launcher_and_daemon_state(
     desktop_prerequisites: Path,
 ) -> None:
@@ -830,6 +924,7 @@ def test_next_run_recovers_model_snapshot_left_by_abrupt_interruption(
         "previous_manifest": base64.b64encode(previous_bytes).decode("ascii"),
         "previous_mode": previous_mode,
         "active_units": [],
+        "enabled_units": [],
         "bindings": bindings,
         "model_promotions": [
             {
@@ -935,6 +1030,30 @@ def test_failed_accelerator_model_candidates_do_not_pollute_cpu_cache(
     }
     candidates = desktop_prerequisites / "model-candidates"
     assert not candidates.exists() or list(candidates.iterdir()) == []
+
+
+def test_model_promotion_rejects_symlinked_canonical_cache_ancestors(
+    desktop_prerequisites: Path,
+    tmp_path: Path,
+) -> None:
+    desktop_prerequisites.mkdir(parents=True, mode=0o700)
+    outside = tmp_path / "outside-cache"
+    master = outside / "models/iic--SenseVoiceSmall/snapshots/master"
+    master.mkdir(parents=True, mode=0o700)
+    sentinel = master / "configuration.json"
+    sentinel.write_text("outside-user-cache", encoding="utf-8")
+    (desktop_prerequisites / "models").symlink_to(
+        outside, target_is_directory=True
+    )
+
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", root=desktop_prerequisites),
+            FakeRunner({"cpu": passed("cpu", "float32")}),
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "outside-user-cache"
+    assert not selection_path(desktop_prerequisites).exists()
 
 
 def test_successful_candidate_is_atomically_promoted_to_immutable_generation(
