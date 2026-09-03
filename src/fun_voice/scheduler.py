@@ -240,11 +240,28 @@ class ModelScheduler:
                 if observed not in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
                     raise ModelProfileError("ASR profile remained active")
                 self._profile_states[other] = observed
-            if self._profile_states[profile] is not ModelLifecycle.READY:
+            try:
+                observed_profile = self._health_profile(profile)
+            except Exception as exc:  # noqa: BLE001 - ASR health must fail closed
+                self._profile_states[profile] = ModelLifecycle.UNKNOWN
+                raise ModelProfileError("ASR profile health was unconfirmed") from exc
+            if observed_profile is ModelLifecycle.READY:
+                self._profile_states[profile] = ModelLifecycle.READY
+            elif observed_profile in {
+                ModelLifecycle.INACTIVE,
+                ModelLifecycle.FAILED,
+                ModelLifecycle.UNKNOWN,
+            }:
                 self._profile_states[profile] = ModelLifecycle.LOADING
                 if not self._start_profile(profile):
                     self._profile_states[profile] = ModelLifecycle.FAILED
                     raise ModelProfileError("ASR profile did not start")
+                if observed_profile is ModelLifecycle.UNKNOWN:
+                    self._profile_states[profile] = ModelLifecycle.UNKNOWN
+                    raise ModelProfileError("ASR profile health was unconfirmed")
+            else:
+                self._profile_states[profile] = observed_profile
+                raise ModelProfileError("ASR profile was not ready")
             try:
                 result = fn()
             except Exception:

@@ -877,6 +877,58 @@ def test_daemon_aggregates_worker_and_preload_stage_durations() -> None:
     assert "你好" not in repr(report)
 
 
+def test_primary_preload_and_final_asr_restart_after_worker_idle_exit() -> None:
+    preload_completed = threading.Event()
+    events: list[str] = []
+    health_states = iter(
+        (
+            ModelLifecycle.READY,
+            ModelLifecycle.READY,
+            ModelLifecycle.INACTIVE,
+            ModelLifecycle.INACTIVE,
+        )
+    )
+    scheduler = ModelScheduler(
+        start_profile=lambda profile: events.append(f"start:{profile}") or True,
+        stop_profile=lambda _profile: True,
+        health_profile=lambda profile: events.append(f"health:{profile}")
+        or next(health_states),
+    )
+
+    def preload() -> PreloadTiming:
+        events.append("preload")
+        preload_completed.set()
+        return PreloadTiming()
+
+    h = Harness(nano_preloader=preload, scheduler=scheduler)
+    try:
+        _started(h)
+        assert preload_completed.wait(timeout=2.0)
+        h.daemon.stop()
+        preload_completed.clear()
+
+        _started(h)
+        assert preload_completed.wait(timeout=2.0)
+        h.daemon.stop()
+
+        assert events == [
+            "health:nano",
+            "preload",
+            "health:nano",
+            "health:nano",
+            "start:nano",
+            "preload",
+            "health:nano",
+            "start:nano",
+        ]
+        assert [fcitx.commits for fcitx in h.fcitx_instances] == [
+            [("tok-123", "你好")],
+            [("tok-123", "你好")],
+        ]
+    finally:
+        scheduler.close()
+
+
 def test_sensevoice_primary_preload_uses_generic_asr_metrics_only() -> None:
     completed_preload = threading.Event()
 

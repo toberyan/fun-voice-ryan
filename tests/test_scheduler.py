@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from fun_voice.contracts import ModelTaskKind, SessionKey
-from fun_voice.scheduler import ModelLifecycle, ModelScheduler
+from fun_voice.scheduler import ModelLifecycle, ModelProfileError, ModelScheduler
 
 
 def _key(generation: int = 1) -> SessionKey:
@@ -327,4 +327,56 @@ def test_asr_profile_is_started_by_scheduler_and_switches_only_after_release() -
         ("stop", "nano"),
         ("start", "sensevoice"),
     ]
+    scheduler.close()
+
+
+def test_asr_restarts_after_a_cached_ready_profile_is_observed_inactive() -> None:
+    health_states = iter((ModelLifecycle.READY, ModelLifecycle.INACTIVE))
+    checked: list[str] = []
+    starts: list[str] = []
+    ran: list[str] = []
+    scheduler = ModelScheduler(
+        start_profile=lambda profile: starts.append(profile) or True,
+        stop_profile=lambda _profile: True,
+        health_profile=lambda profile: checked.append(profile)
+        or next(health_states),
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    first = scheduler.run_asr(key, "nano", lambda: ran.append("first"))
+    assert first.wait(timeout=1.0)
+    second = scheduler.run_asr(key, "nano", lambda: ran.append("second"))
+    assert second.wait(timeout=1.0)
+
+    assert checked == ["nano", "nano"]
+    assert starts == ["nano"]
+    assert ran == ["first", "second"]
+    scheduler.close()
+
+
+def test_asr_unknown_health_denies_callback_when_restart_is_unconfirmed() -> None:
+    health_states = iter((ModelLifecycle.READY, ModelLifecycle.UNKNOWN))
+    checked: list[str] = []
+    starts: list[str] = []
+    ran: list[str] = []
+    scheduler = ModelScheduler(
+        start_profile=lambda profile: starts.append(profile) or True,
+        stop_profile=lambda _profile: True,
+        health_profile=lambda profile: checked.append(profile)
+        or next(health_states),
+    )
+    key = _key()
+    scheduler.activate(key)
+
+    initial = scheduler.run_asr(key, "nano", lambda: ran.append("initial"))
+    assert initial.wait(timeout=1.0)
+    handle = scheduler.run_asr(key, "nano", lambda: ran.append("asr"))
+
+    assert handle.wait(timeout=1.0)
+    with pytest.raises(ModelProfileError, match="health was unconfirmed"):
+        handle.result()
+    assert checked == ["nano", "nano"]
+    assert starts == ["nano"]
+    assert ran == ["initial"]
     scheduler.close()
