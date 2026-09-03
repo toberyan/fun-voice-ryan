@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -324,6 +326,75 @@ def _restore_manifest(
         raise InitializationError("install") from exc
 
 
+def _candidate_runtime_paths(root: Path, backend: Backend) -> tuple[Path, Path]:
+    token = secrets.token_hex(16)
+    runtimes = root / "runtimes"
+    return (
+        runtimes / f".candidate-{backend}-{token}",
+        runtimes / f"{backend}-{token}",
+    )
+
+
+def _discard_candidate(candidate: Path) -> None:
+    try:
+        if candidate.is_symlink():
+            candidate.unlink()
+        elif candidate.exists():
+            shutil.rmtree(candidate)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _initialization_lock(root: Path) -> Iterator[None]:
+    lock_path = root / ".initialize.lock"
+    descriptor: int | None = None
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_details = root.lstat()
+        if (
+            stat.S_ISLNK(root_details.st_mode)
+            or not stat.S_ISDIR(root_details.st_mode)
+            or root_details.st_uid != os.geteuid()
+            or root_details.st_mode & 0o022
+        ):
+            raise InitializationError("lock")
+
+        flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        details = os.fstat(descriptor)
+        path_details = lock_path.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_nlink != 1
+            or (details.st_dev, details.st_ino)
+            != (path_details.st_dev, path_details.st_ino)
+        ):
+            raise InitializationError("lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        path_details = lock_path.lstat()
+        if (details.st_dev, details.st_ino) != (
+            path_details.st_dev,
+            path_details.st_ino,
+        ):
+            raise InitializationError("lock")
+        yield
+    except InitializationError:
+        raise
+    except OSError as exc:
+        raise InitializationError("lock") from exc
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            with suppress(OSError):
+                os.close(descriptor)
+
+
 def run_initialization(
     options: InitializationOptions, runner: CommandRunner
 ) -> RuntimeSelection | tuple[Backend] | tuple[Backend, Backend] | tuple[
@@ -339,6 +410,19 @@ def run_initialization(
     )
     root = options.data_root or default_data_root()
     project_root = options.project_root or Path(__file__).resolve().parents[2]
+    with _initialization_lock(root):
+        return _run_locked_initialization(
+            options, runner, candidates, root, project_root
+        )
+
+
+def _run_locked_initialization(
+    options: InitializationOptions,
+    runner: CommandRunner,
+    candidates: Sequence[Backend],
+    root: Path,
+    project_root: Path,
+) -> RuntimeSelection:
     manifest = selection_path(root)
     previous: RuntimeSelection | None = None
     previous_bytes: bytes | None = None
@@ -357,26 +441,28 @@ def run_initialization(
     models_root = root / "models"
     successful: RuntimeSelection | None = None
     for backend in candidates:
-        runtime = root / "runtimes" / backend
+        candidate, runtime = _candidate_runtime_paths(root, backend)
         build = runner.run(
             (
                 str(project_root / "scripts/create-runtime-env.sh"),
                 "--backend",
                 backend,
                 "--runtime-dir",
-                str(runtime),
+                str(candidate),
                 "--models-root",
                 str(models_root),
             )
         )
         if build.returncode != 0:
+            _discard_candidate(candidate)
             _record_candidate_failure(backend, "environment")
             if options.backend != "auto":
                 raise InitializationError("selected backend failed")
             continue
         probe_result = runner.run(
             (
-                str(runtime / "bin/python"),
+                str(candidate / "bin/python"),
+                "-P",
                 "-m",
                 "fun_voice.backend_probe",
                 "--backend",
@@ -390,11 +476,18 @@ def run_initialization(
         try:
             parsed = _parse_probe(probe_result.stdout, backend)
             if probe_result.returncode == 0 and parsed.status == "pass":
-                successful = _selection_from_probe(backend, runtime, parsed)
-                break
-            category = parsed.error_category or "internal"
+                try:
+                    os.replace(candidate, runtime)
+                except OSError:
+                    category = "environment"
+                else:
+                    successful = _selection_from_probe(backend, runtime, parsed)
+                    break
+            else:
+                category = parsed.error_category or "internal"
         except InitializationError:
             category = "internal"
+        _discard_candidate(candidate)
         _record_candidate_failure(backend, category)
         if options.backend != "auto":
             raise InitializationError("selected backend failed")

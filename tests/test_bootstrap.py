@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
+import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -158,6 +161,7 @@ def test_explicit_backend_does_not_fall_through(
 def _write_selection(root: Path, backend: str) -> RuntimeSelection:
     runtime = root / "runtimes" / backend / "bin"
     runtime.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
     (root / "runtimes").chmod(0o700)
     (root / "runtimes" / backend).chmod(0o700)
     runtime.chmod(0o700)
@@ -371,3 +375,180 @@ def test_install_failure_restores_exact_previous_manifest(
     assert manifest.read_bytes() == previous_bytes
     assert manifest.stat().st_mode & 0o777 == previous_mode
     assert not any(call[0][0] == "systemctl" for call in runner.calls)
+
+
+def test_successful_candidate_is_atomically_promoted_to_immutable_generation(
+    desktop_prerequisites: Path,
+) -> None:
+    runner = FakeRunner({"cpu": passed("cpu", "float32")})
+
+    selected = run_initialization(
+        _options("cpu", root=desktop_prerequisites), runner
+    )
+
+    build_argv = next(
+        argv for argv, _ in runner.calls if "create-runtime-env.sh" in argv[0]
+    )
+    candidate = Path(build_argv[build_argv.index("--runtime-dir") + 1])
+    promoted = selected.python.parent.parent
+    assert candidate.name.startswith(".candidate-cpu-")
+    assert promoted.name.startswith("cpu-")
+    assert len(promoted.name.removeprefix("cpu-")) == 32
+    assert promoted.is_dir()
+    assert not candidate.exists()
+    assert load_runtime_selection(desktop_prerequisites) == selected
+
+
+def test_failed_same_backend_reselection_never_mutates_working_runtime(
+    desktop_prerequisites: Path,
+) -> None:
+    previous = _write_selection(desktop_prerequisites, "cpu")
+    working_runtime = previous.python.parent.parent
+    marker = working_runtime / "working.marker"
+    marker.write_text("working", encoding="utf-8")
+    previous_bytes = selection_path(desktop_prerequisites).read_bytes()
+
+    class DestructiveInstallFailureRunner(FakeRunner):
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            if "create-runtime-env.sh" in argv[0]:
+                target = Path(argv[argv.index("--runtime-dir") + 1])
+                if target == working_runtime:
+                    marker.write_text("mutated", encoding="utf-8")
+            result = super().run(argv, env=env)
+            if "install-user.sh" in argv[0]:
+                return CommandResult(1, "")
+            return result
+
+    runner = DestructiveInstallFailureRunner({"cpu": passed("cpu", "float32")})
+    with pytest.raises(InitializationError, match="^install$"):
+        run_initialization(
+            _options("cpu", force=True, root=desktop_prerequisites), runner
+        )
+
+    build_argv = next(
+        argv for argv, _ in runner.calls if "create-runtime-env.sh" in argv[0]
+    )
+    candidate = Path(build_argv[build_argv.index("--runtime-dir") + 1])
+    assert candidate != working_runtime
+    assert marker.read_text(encoding="utf-8") == "working"
+    assert selection_path(desktop_prerequisites).read_bytes() == previous_bytes
+    assert load_runtime_selection(desktop_prerequisites) == previous
+
+
+def test_concurrent_initializers_are_serialized_before_any_candidate_build(
+    desktop_prerequisites: Path,
+) -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_called = threading.Event()
+    results: list[RuntimeSelection] = []
+    errors: list[BaseException] = []
+
+    class BlockingRunner(FakeRunner):
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            result = super().run(argv, env=env)
+            if "create-runtime-env.sh" in argv[0]:
+                first_started.set()
+                if not release_first.wait(timeout=5):
+                    raise AssertionError("first initializer was not released")
+            return result
+
+    class ObservingRunner(FakeRunner):
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            second_called.set()
+            return super().run(argv, env=env)
+
+    first_runner = BlockingRunner({"cpu": passed("cpu", "float32")})
+    second_runner = ObservingRunner({"cpu": passed("cpu", "float32")})
+
+    def initialize(runner: FakeRunner) -> None:
+        try:
+            result = run_initialization(
+                _options("cpu", root=desktop_prerequisites), runner
+            )
+            assert isinstance(result, RuntimeSelection)
+            results.append(result)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=initialize, args=(first_runner,))
+    second = threading.Thread(target=initialize, args=(second_runner,))
+    first.start()
+    assert first_started.wait(timeout=5)
+    second.start()
+    serialized = not second_called.wait(timeout=0.25)
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert serialized
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert second_runner.calls == []
+
+
+def test_initializer_rejects_symlink_lock_without_running_commands(
+    desktop_prerequisites: Path,
+) -> None:
+    desktop_prerequisites.mkdir(parents=True, mode=0o700)
+    target = desktop_prerequisites.parent / "outside.lock"
+    target.write_text("unrelated", encoding="utf-8")
+    (desktop_prerequisites / ".initialize.lock").symlink_to(target)
+    runner = FakeRunner({"cpu": passed("cpu", "float32")})
+
+    with pytest.raises(InitializationError, match="^lock$"):
+        run_initialization(_options("cpu", root=desktop_prerequisites), runner)
+
+    assert runner.calls == []
+    assert target.read_text(encoding="utf-8") == "unrelated"
+
+
+def test_probe_entrypoint_cannot_be_shadowed_by_current_directory_package(
+    desktop_prerequisites: Path,
+    tmp_path: Path,
+) -> None:
+    forged_cwd = tmp_path / "forged-cwd"
+    forged_package = forged_cwd / "fun_voice"
+    forged_package.mkdir(parents=True)
+    (forged_package / "__init__.py").write_text(
+        "raise RuntimeError('forged package imported')\n", encoding="utf-8"
+    )
+
+    class EntrypointRunner(FakeRunner):
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            if "fun_voice.backend_probe" in argv:
+                module_index = argv.index("-m")
+                command = (sys.executable, *argv[1 : module_index + 2], "--help")
+                completed = subprocess.run(
+                    command,
+                    cwd=forged_cwd,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    return CommandResult(completed.returncode, "")
+            return super().run(argv, env=env)
+
+    runner = EntrypointRunner({"cpu": passed("cpu", "float32")})
+    selected = run_initialization(
+        _options("cpu", root=desktop_prerequisites), runner
+    )
+    probe_argv = next(
+        argv for argv, _ in runner.calls if "fun_voice.backend_probe" in argv
+    )
+
+    assert probe_argv[1:4] == ("-P", "-m", "fun_voice.backend_probe")
+    assert selected.backend == "cpu"

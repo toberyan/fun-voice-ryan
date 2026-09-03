@@ -2,4 +2,4 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHONPATH="${ROOT_DIR}/src" exec python3 -m fun_voice.bootstrap "$@"
+PYTHONPATH="${ROOT_DIR}/src" exec python3 -P -m fun_voice.bootstrap "$@"

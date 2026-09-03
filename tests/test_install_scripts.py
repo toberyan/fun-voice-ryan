@@ -1,8 +1,12 @@
 """Static contract tests for X11 hotkey deployment and legacy DDE retirement."""
 
 import os
+import shutil
 import subprocess
+import tarfile
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -89,7 +93,107 @@ def test_xpu_environment_syncs_the_hashed_lock_before_deployment() -> None:
     assert "--hash=sha256:" in lock
     assert "funasr @" not in lock
     assert "--no-deps" in environment
+    assert "--no-build-isolation" in environment
     assert '"${FUNASR_SRC}"' in environment
+
+
+def test_funasr_install_uses_locked_environment_without_network(
+    tmp_path: Path,
+) -> None:
+    uv = shutil.which("uv")
+    python312 = shutil.which("python3.12")
+    if uv is None or python312 is None:
+        pytest.skip("uv and Python 3.12 are required for the builder regression")
+
+    data_home = tmp_path / "data"
+    runtime = data_home / "fun-voice-ryan/runtimes/cpu"
+    models = data_home / "fun-voice-ryan/models"
+    runtime.parent.mkdir(parents=True, mode=0o700)
+    subprocess.run(
+        [uv, "venv", str(runtime), "--python", python312],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    runtime.chmod(0o700)
+    (runtime / "bin").chmod(0o700)
+    (runtime / "pyvenv.cfg").chmod(0o600)
+    purelib = Path(
+        subprocess.check_output(
+            [
+                str(runtime / "bin/python"),
+                "-I",
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ],
+            text=True,
+        ).strip()
+    )
+    for module in ("torch", "funasr", "modelscope", "transformers", "Xlib"):
+        package = purelib / module
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+
+    archive_source = tmp_path / "archive-source"
+    archive_source.mkdir()
+    (archive_source / "README").write_text("verified source", encoding="utf-8")
+    archive = runtime / ".funasr-src.tar.gz"
+    with tarfile.open(archive, "w:gz") as stream:
+        stream.add(archive_source / "README", arcname="FunASR-pinned/README")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    uv_log = tmp_path / "uv.log"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"${FAKE_UV_LOG}\"\n"
+        "if [[ \"$1 $2\" == 'pip install' "
+        "&& \" $* \" != *' --no-build-isolation '* ]]; then exit 42; fi\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o700)
+    fake_sha = fake_bin / "sha256sum"
+    fake_sha.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_sha.chmod(0o700)
+    network_marker = tmp_path / "network-attempted"
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        f"#!/usr/bin/env bash\ntouch {network_marker}\nexit 99\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o700)
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "XDG_DATA_HOME": str(data_home),
+            "HOME": str(tmp_path / "home"),
+            "UV": str(fake_uv),
+            "FAKE_UV_LOG": str(uv_log),
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+        }
+    )
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts/create-runtime-env.sh"),
+            "--backend",
+            "cpu",
+            "--runtime-dir",
+            str(runtime),
+            "--models-root",
+            str(models),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "pip install" in uv_log.read_text(encoding="utf-8")
+    assert "--no-build-isolation" in uv_log.read_text(encoding="utf-8")
+    assert not network_marker.exists()
 
 
 def test_xpu_environment_rebuilds_funasr_from_the_verified_archive() -> None:
@@ -197,10 +301,51 @@ def test_xpu_builder_is_only_an_explicit_project_venv_wrapper() -> None:
     assert "curl" not in wrapper
 
 
+@pytest.mark.parametrize("target_name", ["home", "project", "unrelated"])
+def test_xpu_wrapper_rejects_non_project_venv_override(
+    tmp_path: Path,
+    target_name: str,
+) -> None:
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/create-xpu-env.sh", scripts / "create-xpu-env.sh")
+    shutil.copy2(
+        ROOT / "scripts/create-runtime-env.sh", scripts / "create-runtime-env.sh"
+    )
+    shutil.copy2(ROOT / "requirements-xpu.lock", project / "requirements-xpu.lock")
+    home = tmp_path / "home"
+    home.mkdir()
+    unrelated = tmp_path / "unrelated/.venv"
+    unrelated.mkdir(parents=True)
+    targets = {"home": home, "project": project, "unrelated": unrelated}
+    data_home = tmp_path / "data"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(data_home),
+            "FUN_VOICE_VENV_DIR": str(targets[target_name]),
+            "UV": "/bin/false",
+        }
+    )
+
+    completed = subprocess.run(
+        [str(scripts / "create-xpu-env.sh")],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "only the repository .venv" in completed.stderr
+
+
 def test_first_run_wrapper_contains_only_bootstrap_entrypoint() -> None:
     wrapper = (ROOT / "scripts/initialize-first-run.sh").read_text(encoding="utf-8")
     assert 'PYTHONPATH="${ROOT_DIR}/src"' in wrapper
-    assert 'python3 -m fun_voice.bootstrap "$@"' in wrapper
+    assert 'python3 -P -m fun_voice.bootstrap "$@"' in wrapper
     for forbidden in (
         "Fun-ASR",
         "SenseVoice",
@@ -211,6 +356,28 @@ def test_first_run_wrapper_contains_only_bootstrap_entrypoint() -> None:
         "rm ",
     ):
         assert forbidden not in wrapper
+
+
+def test_first_run_entrypoint_cannot_be_shadowed_by_current_directory_package(
+    tmp_path: Path,
+) -> None:
+    forged_package = tmp_path / "fun_voice"
+    forged_package.mkdir()
+    (forged_package / "__init__.py").write_text(
+        "raise RuntimeError('forged package imported')\n", encoding="utf-8"
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts/initialize-first-run.sh"), "--dry-run"],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == '{"candidates":["cuda","xpu","cpu"]}'
 
 
 def test_runtime_builder_rejects_unknown_option_without_installing(
@@ -284,6 +451,158 @@ def test_runtime_builder_rejects_symlink_runtime_without_installing(
     )
     assert completed.returncode != 0
     assert "must not be a symlink" in completed.stderr
+
+
+def _run_builder_against_existing_runtime(
+    tmp_path: Path,
+    runtime: Path,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    data_home = tmp_path / "data"
+    fake_uv = tmp_path / "recording-uv"
+    uv_marker = tmp_path / "uv-invoked"
+    fake_uv.write_text(
+        f"#!/usr/bin/env bash\ntouch {uv_marker}\nexit 1\n", encoding="utf-8"
+    )
+    fake_uv.chmod(0o700)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "XDG_DATA_HOME": str(data_home),
+            "HOME": str(tmp_path / "home"),
+            "UV": str(fake_uv),
+        }
+    )
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts/create-runtime-env.sh"),
+            "--backend",
+            "cpu",
+            "--runtime-dir",
+            str(runtime),
+            "--models-root",
+            str(data_home / "fun-voice-ryan/models"),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return completed, uv_marker
+
+
+def _make_runtime_parent_private(runtime: Path) -> None:
+    runtime.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    current = runtime.parent
+    while current.name != "data":
+        current.chmod(0o700)
+        current = current.parent
+
+
+def test_runtime_builder_rejects_existing_python311_before_sync(
+    tmp_path: Path,
+) -> None:
+    uv = shutil.which("uv")
+    python311 = shutil.which("python3.11")
+    if uv is None or python311 is None:
+        pytest.skip("uv and Python 3.11 are required for the validation regression")
+    runtime = tmp_path / "data/fun-voice-ryan/runtimes/cpu"
+    _make_runtime_parent_private(runtime)
+    subprocess.run(
+        [uv, "venv", str(runtime), "--python", python311],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    runtime.chmod(0o700)
+    (runtime / "bin").chmod(0o700)
+    (runtime / "pyvenv.cfg").chmod(0o600)
+
+    completed, uv_marker = _run_builder_against_existing_runtime(
+        tmp_path, runtime
+    )
+
+    assert completed.returncode != 0
+    assert "secure Python 3.12 virtual environment" in completed.stderr
+    assert not uv_marker.exists()
+
+
+def test_runtime_builder_rejects_forged_python_executable_before_sync(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "data/fun-voice-ryan/runtimes/cpu"
+    _make_runtime_parent_private(runtime)
+    (runtime / "bin").mkdir(parents=True, mode=0o700)
+    forged = runtime / "bin/python"
+    forged.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    forged.chmod(0o700)
+    (runtime / "pyvenv.cfg").write_text(
+        "implementation = CPython\n"
+        "version_info = 3.12.0\n"
+        "include-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    (runtime / "pyvenv.cfg").chmod(0o600)
+
+    completed, uv_marker = _run_builder_against_existing_runtime(
+        tmp_path, runtime
+    )
+
+    assert completed.returncode != 0
+    assert "secure Python 3.12 virtual environment" in completed.stderr
+    assert not uv_marker.exists()
+
+
+def test_runtime_builder_rejects_non_venv_path_before_sync(tmp_path: Path) -> None:
+    python312 = shutil.which("python3.12")
+    if python312 is None:
+        pytest.skip("Python 3.12 is required for the validation regression")
+    runtime = tmp_path / "data/fun-voice-ryan/runtimes/cpu"
+    _make_runtime_parent_private(runtime)
+    (runtime / "bin").mkdir(parents=True, mode=0o700)
+    (runtime / "bin/python").symlink_to(python312)
+
+    completed, uv_marker = _run_builder_against_existing_runtime(
+        tmp_path, runtime
+    )
+
+    assert completed.returncode != 0
+    assert "secure Python 3.12 virtual environment" in completed.stderr
+    assert not uv_marker.exists()
+
+
+def test_runtime_builder_rejects_group_writable_external_interpreter(
+    tmp_path: Path,
+) -> None:
+    uv = shutil.which("uv")
+    python312 = shutil.which("python3.12")
+    alternate_groups = [group for group in os.getgroups() if group != os.getegid()]
+    if uv is None or python312 is None or not alternate_groups:
+        pytest.skip("uv, Python 3.12, and a secondary group are required")
+    runtime = tmp_path / "data/fun-voice-ryan/runtimes/cpu"
+    _make_runtime_parent_private(runtime)
+    subprocess.run(
+        [uv, "venv", str(runtime), "--python", python312],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    runtime.chmod(0o700)
+    (runtime / "bin").chmod(0o700)
+    (runtime / "pyvenv.cfg").chmod(0o600)
+    external_python = tmp_path / "python3.12"
+    shutil.copy2(Path(python312).resolve(), external_python)
+    os.chown(external_python, -1, alternate_groups[0])
+    external_python.chmod(0o770)
+    (runtime / "bin/python").unlink()
+    (runtime / "bin/python").symlink_to(external_python)
+
+    completed, uv_marker = _run_builder_against_existing_runtime(
+        tmp_path, runtime
+    )
+
+    assert completed.returncode != 0
+    assert "secure Python 3.12 virtual environment" in completed.stderr
+    assert not uv_marker.exists()
 
 
 def test_xpu_poc_doc_records_the_verified_native_run() -> None:

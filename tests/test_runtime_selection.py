@@ -7,6 +7,8 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -79,6 +81,36 @@ def test_cpu_manifest_round_trip_forbids_accelerator_models(tmp_path: Path) -> N
     assert dict(expected.model_revisions) == {"sensevoice": "master", "vad": "master"}
     with pytest.raises(TypeError):
         expected.model_revisions["qwen"] = "master"  # type: ignore[index]
+
+
+def test_real_uv_venv_interpreter_symlink_is_a_valid_selection(
+    tmp_path: Path,
+) -> None:
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is required for the integration regression")
+
+    root = tmp_path / "data"
+    runtime = root / "runtimes" / "cpu"
+    runtime.parent.mkdir(parents=True, mode=0o700)
+    subprocess.run(
+        [uv, "venv", str(runtime), "--python", "3.12", "--no-project"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for directory in (runtime, runtime / "bin"):
+        directory.chmod(0o700)
+    (runtime / "pyvenv.cfg").chmod(0o600)
+    selection = dataclasses.replace(
+        _selection(tmp_path / "unused"),
+        python=runtime / "bin/python",
+    )
+
+    write_runtime_selection(selection, root)
+
+    assert selection.python.is_symlink()
+    assert load_runtime_selection(root) == selection
 
 
 def test_selection_fingerprint_is_a_canonical_manifest_digest(tmp_path: Path) -> None:

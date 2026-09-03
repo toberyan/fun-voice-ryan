@@ -6,9 +6,11 @@ validate a selection before importing any selected backend's dependencies.
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
+import pwd
 import stat
 import tempfile
 from collections.abc import Mapping
@@ -230,26 +232,28 @@ def _validate_python_path(selection: RuntimeSelection, root: Path) -> None:
     try:
         resolved_root = root.resolve(strict=True)
         allowed_root = resolved_root / "runtimes"
-        resolved_python = selection.python.resolve(strict=True)
     except OSError as exc:
         raise RuntimeSelectionError("selected interpreter is unsafe") from exc
 
+    runtime_name = selection.python.parent.parent.name
+    generation_prefix = f"{selection.backend}-"
+    generation_suffix = runtime_name.removeprefix(generation_prefix)
+    valid_generation = (
+        runtime_name.startswith(generation_prefix)
+        and len(generation_suffix) == 32
+        and all(character in "0123456789abcdef" for character in generation_suffix)
+    )
+    expected_python = allowed_root / runtime_name / "bin" / "python"
     if (
-        selection.python != resolved_python
-        or resolved_python in (resolved_root, allowed_root)
-        or not resolved_python.is_relative_to(allowed_root)
+        selection.python != expected_python
+        or (runtime_name != selection.backend and not valid_generation)
     ):
         raise RuntimeSelectionError("selected interpreter is unsafe")
 
-    relative_path = resolved_python.relative_to(allowed_root)
-    components = [allowed_root]
-    components.extend(
-        allowed_root.joinpath(*relative_path.parts[:index])
-        for index in range(1, len(relative_path.parts) + 1)
-    )
-    for component in components[:-1]:
+    components = [allowed_root, expected_python.parent.parent, expected_python.parent]
+    for component in components:
         _validate_runtime_directory(component)
-    _validate_runtime_interpreter(components[-1])
+    _validate_runtime_interpreter(expected_python)
 
 
 def _validate_runtime_directory(path: Path) -> None:
@@ -263,15 +267,71 @@ def _validate_runtime_directory(path: Path) -> None:
         raise RuntimeSelectionError("selected interpreter is unsafe")
 
 
+def _target_permissions_are_safe(details: os.stat_result) -> bool:
+    if details.st_mode & 0o002 or not details.st_mode & 0o111:
+        return False
+    if not details.st_mode & 0o020:
+        return True
+    if details.st_uid != _current_uid() or details.st_gid != os.getegid():
+        return False
+    try:
+        current_name = pwd.getpwuid(_current_uid()).pw_name
+        group = grp.getgrgid(details.st_gid)
+        primary_users = {
+            account.pw_name
+            for account in pwd.getpwall()
+            if account.pw_gid == details.st_gid
+        }
+    except KeyError:
+        return False
+    return group.gr_mem in ([], [current_name]) and primary_users == {current_name}
+
+
 def _validate_runtime_interpreter(path: Path) -> None:
     details = _lstat(path)
+    if details.st_uid != _current_uid() or not os.access(path, os.X_OK):
+        raise RuntimeSelectionError("selected interpreter is unsafe")
+    if stat.S_ISREG(details.st_mode):
+        if details.st_mode & 0o022 or not details.st_mode & 0o111:
+            raise RuntimeSelectionError("selected interpreter is unsafe")
+        return
+    if not stat.S_ISLNK(details.st_mode):
+        raise RuntimeSelectionError("selected interpreter is unsafe")
+
+    try:
+        target = path.resolve(strict=True)
+        target_details = target.stat()
+    except OSError as exc:
+        raise RuntimeSelectionError("selected interpreter is unsafe") from exc
     if (
-        stat.S_ISLNK(details.st_mode)
-        or not stat.S_ISREG(details.st_mode)
-        or details.st_uid != _current_uid()
-        or details.st_mode & 0o022
-        or not details.st_mode & 0o111
-        or not os.access(path, os.X_OK)
+        not stat.S_ISREG(target_details.st_mode)
+        or target_details.st_uid not in {0, _current_uid()}
+        or not _target_permissions_are_safe(target_details)
+    ):
+        raise RuntimeSelectionError("selected interpreter is unsafe")
+
+    config = path.parent.parent / "pyvenv.cfg"
+    config_details = _lstat(config)
+    if (
+        not stat.S_ISREG(config_details.st_mode)
+        or config_details.st_uid != _current_uid()
+        or config_details.st_mode & 0o022
+        or config_details.st_size > 16_384
+    ):
+        raise RuntimeSelectionError("selected interpreter is unsafe")
+    try:
+        settings = dict(
+            (key.strip(), value.strip())
+            for line in config.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+            for key, value in (line.split("=", 1),)
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise RuntimeSelectionError("selected interpreter is unsafe") from exc
+    if (
+        settings.get("implementation") != "CPython"
+        or not settings.get("version_info", "").startswith("3.12.")
+        or settings.get("include-system-site-packages", "").lower() != "false"
     ):
         raise RuntimeSelectionError("selected interpreter is unsafe")
 

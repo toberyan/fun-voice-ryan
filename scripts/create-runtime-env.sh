@@ -15,9 +15,84 @@ MODELS_ROOT=""
 ALLOW_PROJECT_VENV=0
 FUNASR_DOWNLOAD=""
 FUNASR_STAGE=""
+CURRENT_UID="$(id -u)"
+CURRENT_GID="$(id -g)"
+CURRENT_USER="$(id -un)"
 
 die() { printf '[create-runtime-env] ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '[create-runtime-env] %s\n' "$*"; }
+secure_directory() {
+    local path="$1" owner mode permissions
+    [[ -d "${path}" && ! -L "${path}" ]] || return 1
+    read -r owner mode < <(stat -c '%u %a' -- "${path}") || return 1
+    permissions=$((8#${mode}))
+    [[ "${owner}" == "${CURRENT_UID}" ]] && (( (permissions & 0022) == 0 ))
+}
+secure_regular_file() {
+    local path="$1" owner mode permissions
+    [[ -f "${path}" && ! -L "${path}" ]] || return 1
+    read -r owner mode < <(stat -c '%u %a' -- "${path}") || return 1
+    permissions=$((8#${mode}))
+    [[ "${owner}" == "${CURRENT_UID}" ]] && (( (permissions & 0022) == 0 ))
+}
+prepare_secure_directory() {
+    local path="$1"
+    [[ ! -L "${path}" ]] || return 1
+    if [[ ! -e "${path}" ]]; then
+        mkdir -p -- "${path}" || return 1
+    fi
+    secure_directory "${path}"
+}
+private_current_group() {
+    local gid="$1" record members member account_name account_uid account_gid rest
+    [[ "${gid}" == "${CURRENT_GID}" ]] || return 1
+    record="$(getent group "${gid}")" || return 1
+    members="${record##*:}"
+    IFS=',' read -r -a group_members <<< "${members}"
+    for member in "${group_members[@]}"; do
+        [[ -z "${member}" || "${member}" == "${CURRENT_USER}" ]] || return 1
+    done
+    while IFS=':' read -r account_name _ account_uid account_gid rest; do
+        if [[ "${account_gid}" == "${gid}" && "${account_uid}" != "${CURRENT_UID}" ]]; then
+            return 1
+        fi
+    done < <(getent passwd)
+}
+valid_runtime_environment() {
+    local runtime="$1" python config link_owner target target_owner target_group
+    local target_mode
+    local target_permissions
+    python="${runtime}/bin/python"
+    config="${runtime}/pyvenv.cfg"
+    secure_directory "${runtime}" || return 1
+    secure_directory "${runtime}/bin" || return 1
+    secure_regular_file "${config}" || return 1
+    [[ "$(stat -c '%s' -- "${config}")" -le 16384 ]] || return 1
+    grep -Eq '^[[:space:]]*implementation[[:space:]]*=[[:space:]]*CPython[[:space:]]*$' "${config}" \
+        || return 1
+    grep -Eq '^[[:space:]]*version_info[[:space:]]*=[[:space:]]*3\.12\.[0-9]+[[:space:]]*$' "${config}" \
+        || return 1
+    grep -Eq '^[[:space:]]*include-system-site-packages[[:space:]]*=[[:space:]]*false[[:space:]]*$' "${config}" \
+        || return 1
+    [[ -L "${python}" && -x "${python}" ]] || return 1
+    link_owner="$(stat -c '%u' -- "${python}")" || return 1
+    [[ "${link_owner}" == "${CURRENT_UID}" ]] || return 1
+    target="$(readlink -f -- "${python}")" || return 1
+    [[ -f "${target}" && ! -L "${target}" && -x "${target}" ]] || return 1
+    read -r target_owner target_group target_mode < <(stat -c '%u %g %a' -- "${target}") \
+        || return 1
+    target_permissions=$((8#${target_mode}))
+    [[ "${target_owner}" == "0" || "${target_owner}" == "${CURRENT_UID}" ]] \
+        || return 1
+    (( (target_permissions & 0002) == 0 )) || return 1
+    if (( (target_permissions & 0020) != 0 )); then
+        [[ "${target_owner}" == "${CURRENT_UID}" ]] || return 1
+        private_current_group "${target_group}" || return 1
+    fi
+    "${python}" -I -c \
+        'import os, sys; expected = os.path.realpath(sys.argv[1]); raise SystemExit(0 if sys.version_info[:2] == (3, 12) and os.path.realpath(sys.prefix) == expected and sys.base_prefix != sys.prefix else 1)' \
+        "${runtime}" >/dev/null 2>&1
+}
 cleanup() {
     if [[ -n "${FUNASR_DOWNLOAD}" && -f "${FUNASR_DOWNLOAD}" ]]; then
         rm -f -- "${FUNASR_DOWNLOAD}"
@@ -63,7 +138,10 @@ RUNTIMES_RESOLVED="$(realpath -m "${RUNTIMES_ROOT}")"
 RUNTIME_RESOLVED="$(realpath -m "${RUNTIME_DIR}")"
 MODELS_RESOLVED="$(realpath -m "${MODELS_ROOT}")"
 PROJECT_VENV_RESOLVED="$(realpath -m "${ROOT_DIR}/.venv")"
-if [[ "${ALLOW_PROJECT_VENV}" -eq 0 ]]; then
+if [[ "${ALLOW_PROJECT_VENV}" -eq 1 ]]; then
+    [[ "${RUNTIME_RESOLVED}" == "${PROJECT_VENV_RESOLVED}" ]] \
+        || die "--allow-project-venv permits only the repository .venv"
+else
     case "${RUNTIME_RESOLVED}" in
         "${RUNTIMES_RESOLVED}"/*) ;;
         *) die "runtime directory is outside the application runtimes root" ;;
@@ -75,12 +153,19 @@ fi
     || die "models root is outside the application data root"
 [[ ! -L "${RUNTIME_DIR}" ]] || die "runtime directory must not be a symlink"
 
-mkdir -p "${RUNTIMES_ROOT}" "${RUNTIME_DIR}" "${MODELS_ROOT}"
-chmod 700 "${RUNTIMES_ROOT}" "${RUNTIME_DIR}" "${MODELS_ROOT}"
+prepare_secure_directory "${RUNTIMES_ROOT}" \
+    || die "application runtimes root is unsafe"
+prepare_secure_directory "${MODELS_ROOT}" \
+    || die "models root is unsafe"
 
-if [[ ! -x "${RUNTIME_DIR}/bin/python" ]]; then
+if [[ -e "${RUNTIME_DIR}" || -L "${RUNTIME_DIR}" ]]; then
+    valid_runtime_environment "${RUNTIME_DIR}" \
+        || die "runtime is not a secure Python 3.12 virtual environment"
+else
     log "creating ${BACKEND} Python 3.12 runtime"
-    "${UV}" venv "${RUNTIME_DIR}" --python 3.12
+    "${UV}" venv "${RUNTIME_DIR}" --python 3.12 --no-project
+    valid_runtime_environment "${RUNTIME_DIR}" \
+        || die "runtime is not a secure Python 3.12 virtual environment"
 fi
 PYTHON="${RUNTIME_DIR}/bin/python"
 log "syncing hash-locked ${BACKEND} dependencies"
@@ -116,7 +201,11 @@ if [[ -e "${FUNASR_SRC}" ]]; then
 fi
 mv "${FUNASR_STAGE}" "${FUNASR_SRC}"
 FUNASR_STAGE=""
-"${UV}" pip install --python "${PYTHON}" --no-deps "${FUNASR_SRC}"
+"${UV}" pip install \
+    --python "${PYTHON}" \
+    --no-deps \
+    --no-build-isolation \
+    "${FUNASR_SRC}"
 
 MODELSCOPE_CACHE="${MODELS_ROOT}" "${PYTHON}" - <<'PY'
 import importlib
