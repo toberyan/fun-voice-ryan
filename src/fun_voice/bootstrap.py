@@ -574,6 +574,18 @@ def _sweep_stale_model_candidates(root: Path) -> None:
 def _stop_service(runner: CommandRunner, unit: str) -> None:
     stopped = runner.run(("systemctl", "--user", "stop", unit))
     if stopped.returncode != 0:
+        load_state = runner.run(
+            (
+                "systemctl",
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                unit,
+            )
+        )
+        if load_state.returncode == 0 and load_state.stdout.strip() == "not-found":
+            return
         raise InitializationError("install")
     state = runner.run(
         (
@@ -594,9 +606,7 @@ def _quiesce_model_services(runner: CommandRunner) -> None:
     _stop_service(runner, "fun-voice-daemon.service")
     worker_units = (*_ASR_WORKER_UNITS, _LEGACY_WORKER_UNIT)
     for unit in worker_units:
-        stopped = runner.run(("systemctl", "--user", "stop", unit))
-        if stopped.returncode != 0:
-            raise InitializationError("install")
+        _stop_service(runner, unit)
     for unit in worker_units:
         state = runner.run(
             (
@@ -724,24 +734,7 @@ def _restore_service_state(
 
 def _stop_managed_services_for_restore(runner: CommandRunner) -> None:
     for unit in _MANAGED_UNITS:
-        stopped = runner.run(("systemctl", "--user", "stop", unit))
-        if stopped.returncode != 0:
-            raise InitializationError("install")
-        state = runner.run(
-            (
-                "systemctl",
-                "--user",
-                "show",
-                "--property=ActiveState",
-                "--value",
-                unit,
-            )
-        )
-        if state.returncode != 0 or state.stdout.strip() not in {
-            "inactive",
-            "failed",
-        }:
-            raise InitializationError("install")
+        _stop_service(runner, unit)
 
 
 def _write_transaction_journal(

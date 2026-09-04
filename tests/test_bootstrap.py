@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+import fun_voice.bootstrap as bootstrap
 from fun_voice.backend_probe import ProbeResult
 from fun_voice.bootstrap import (
     CommandResult,
@@ -1001,6 +1002,57 @@ def test_legacy_worker_stop_failure_aborts_before_new_selection_is_published(
 
     assert load_runtime_selection(desktop_prerequisites) == previous
     assert runner.install_calls == 0
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [bootstrap._quiesce_model_services, bootstrap._stop_managed_services_for_restore],
+)
+def test_missing_retired_worker_is_treated_as_already_stopped(
+    operation: Any,
+) -> None:
+    """A removed legacy unit must not block deployment or transaction recovery."""
+
+    class MissingLegacyWorkerRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({})
+
+        def run(
+            self, argv: tuple[str, ...], *, env: dict[str, str] | None = None
+        ) -> CommandResult:
+            self.calls.append((argv, env))
+            if argv == (
+                "systemctl",
+                "--user",
+                "stop",
+                "fun-voice-worker.service",
+            ):
+                return CommandResult(5, "")
+            if argv == (
+                "systemctl",
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                "fun-voice-worker.service",
+            ):
+                return CommandResult(0, "not-found\n")
+            if argv[:3] == ("systemctl", "--user", "show"):
+                return CommandResult(0, "inactive\n")
+            return CommandResult(0, "")
+
+    runner = MissingLegacyWorkerRunner()
+
+    operation(runner)
+
+    assert (
+        "systemctl",
+        "--user",
+        "show",
+        "--property=LoadState",
+        "--value",
+        "fun-voice-worker.service",
+    ) in [argv for argv, _ in runner.calls]
 
 
 def test_interrupt_during_install_rolls_back_before_next_run_can_accept_selection(

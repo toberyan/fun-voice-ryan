@@ -110,6 +110,24 @@ class FakeFsmnVadModel:
         return self.result
 
 
+class AutocastRecorder:
+    """Records whether a fake model call runs under the requested autocast."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.calls: list[tuple[str, object]] = []
+
+    def context(self, *, device_type: str, dtype: object) -> AutocastRecorder:
+        self.calls.append((device_type, dtype))
+        return self
+
+    def __enter__(self) -> None:
+        self.active = True
+
+    def __exit__(self, *_args: object) -> None:
+        self.active = False
+
+
 class SlowEngine:
     """Fake ASR engine that blocks long enough to trip a small timeout."""
 
@@ -362,6 +380,32 @@ def test_native_nano_engine_adapts_repeated_in_memory_slices_without_vllm(
     assert engine.decoder_device_type == "xpu"
 
 
+def test_xpu_bf16_native_nano_generate_runs_under_autocast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = AutocastRecorder()
+
+    class NativeModel(FakeNativeNanoModel):
+        def generate(self, **kwargs: Any) -> list[dict[str, str]]:
+            assert recorder.active
+            return super().generate(**kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            from_numpy=lambda samples: samples,
+            bfloat16="bf16",
+            float16="fp16",
+            autocast=recorder.context,
+        ),
+    )
+
+    engine = NativeNanoEngine(NativeModel(), device="xpu:0", dtype="bf16")
+    assert engine.generate([np.zeros(160, dtype=np.float32)], max_new_tokens=123)
+    assert recorder.calls == [("xpu", "bf16")]
+
+
 def test_native_nano_loader_uses_only_local_snapshot_and_xpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -449,6 +493,33 @@ def test_fsmn_vad_detect_passes_max_single_segment_time() -> None:
         == VAD_MAX_SINGLE_SEGMENT_TIME_MS
     )
     assert VAD_MAX_SINGLE_SEGMENT_TIME_MS == 30000  # 30 s, in milliseconds
+
+
+def test_xpu_bf16_vad_detect_runs_under_autocast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = AutocastRecorder()
+
+    class VadModel(FakeFsmnVadModel):
+        def generate(
+            self, input: Any, cache: Any, is_final: Any, **kwargs: Any
+        ) -> list[dict[str, Any]]:
+            assert recorder.active
+            return super().generate(input, cache, is_final, **kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            bfloat16="bf16", float16="fp16", autocast=recorder.context
+        ),
+    )
+
+    model = VadModel([{"key": "k", "value": [[100, 200]]}])
+    assert FsmnVadSegmenter(model, device="xpu:0", dtype="bf16").detect(
+        _silence(), 16000
+    ) == [(100, 200)]
+    assert recorder.calls == [("xpu", "bf16")]
 
 
 # --- ASR error taxonomy -----------------------------------------------------
@@ -790,6 +861,41 @@ def test_sensevoice_runtime_decodes_raw_pcm_before_model_generate(
         captured[0],
         np.array([-1.0, 0.0, 0.5], dtype=np.float32),
     )
+
+
+def test_xpu_bf16_sensevoice_generate_runs_under_autocast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = AutocastRecorder()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            bfloat16="bf16", float16="fp16", autocast=recorder.context
+        ),
+    )
+    raw_pcm = tmp_path / "captured.pcm"
+    raw_pcm.write_bytes(np.array([0, 0], dtype=np.int16).tobytes())
+    parameter = SimpleNamespace(
+        device=SimpleNamespace(type="xpu"),
+        dtype="torch.bfloat16",
+        is_floating_point=lambda: True,
+    )
+
+    def generate(*, input: object) -> list[dict[str, str]]:
+        assert recorder.active
+        assert isinstance(input, np.ndarray)
+        return [{"key": "sample_0", "text": "ok"}]
+
+    model = SimpleNamespace(
+        parameters=lambda: iter([parameter]),
+        vad_model=SimpleNamespace(parameters=lambda: iter([parameter])),
+        generate=generate,
+    )
+    runtime = nano_mod.SenseVoiceRuntime(model, selection=_selection("xpu"))
+
+    assert runtime.transcribe(str(raw_pcm), sample_rate=16000).text == "ok"
+    assert recorder.calls == [("xpu", "bf16")]
 
 
 def test_sensevoice_runtime_removes_control_tags_from_output(

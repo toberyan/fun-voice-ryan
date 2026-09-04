@@ -29,6 +29,7 @@ import threading
 import time
 import wave
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
@@ -171,7 +172,9 @@ class NativeNanoEngine:
     stable native FunASR/PyTorch path.
     """
 
-    def __init__(self, model: Any) -> None:
+    def __init__(
+        self, model: Any, *, device: str = "cpu", dtype: str = "float32"
+    ) -> None:
         native = getattr(model, "model", None)
         llm = getattr(native, "llm", None)
         llm_model = getattr(llm, "model", None)
@@ -183,6 +186,8 @@ class NativeNanoEngine:
         self.audio_encoder = getattr(native, "audio_encoder", None)
         self.audio_adaptor = getattr(native, "audio_adaptor", None)
         self.embed_tokens = get_embeddings()
+        self.device = device
+        self.dtype = dtype
         if any(
             module is None
             for module in (self.audio_encoder, self.audio_adaptor, self.embed_tokens)
@@ -204,13 +209,14 @@ class NativeNanoEngine:
             torch.from_numpy(np.ascontiguousarray(value, dtype=np.float32))
             for value in inputs
         ]
-        results = self._model.generate(
-            input=samples,
-            cache={},
-            batch_size_s=1,
-            max_length=max_new_tokens,
-            llm_kwargs={"do_sample": False},
-        )
+        with _inference_autocast(self.device, self.dtype):
+            results = self._model.generate(
+                input=samples,
+                cache={},
+                batch_size_s=1,
+                max_length=max_new_tokens,
+                llm_kwargs={"do_sample": False},
+            )
         if not isinstance(results, list):
             raise ModelOutputError("native Nano returned a malformed result list")
         return results
@@ -312,6 +318,17 @@ def _remove_sensevoice_control_tokens(text: str) -> str:
     return SENSEVOICE_CONTROL_TOKEN.sub("", text)
 
 
+def _inference_autocast(device: str, dtype: str) -> Any:
+    """Use the selected low-precision accelerator dtype for FunASR operations."""
+    expected_device_type = device_type(device)
+    if expected_device_type == "cpu" or dtype not in {"bf16", "fp16"}:
+        return nullcontext()
+    import torch
+
+    torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+    return torch.autocast(device_type=expected_device_type, dtype=torch_dtype)
+
+
 def _elapsed_ms(started: float) -> int:
     """Return a non-negative monotonic duration rounded to milliseconds."""
     return max(0, round((time.perf_counter() - started) * 1000))
@@ -381,18 +398,23 @@ class FsmnVadSegmenter:
     bursts yielded ``[[220, 2980]]``). Empty speech yields ``value == []``.
     """
 
-    def __init__(self, model: Any) -> None:
+    def __init__(
+        self, model: Any, *, device: str = "cpu", dtype: str = "float32"
+    ) -> None:
         self._model = model
+        self.device = device
+        self.dtype = dtype
 
     def detect(
         self, samples: np.ndarray, sample_rate: int
     ) -> list[tuple[int, int]]:
-        result = self._model.generate(
-            input=samples,
-            cache={},
-            is_final=True,
-            max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
-        )
+        with _inference_autocast(self.device, self.dtype):
+            result = self._model.generate(
+                input=samples,
+                cache={},
+                is_final=True,
+                max_single_segment_time=VAD_MAX_SINGLE_SEGMENT_TIME_MS,
+            )
         if not result:
             raise ModelOutputError("VAD returned no result")
         first = result[0]
@@ -831,7 +853,7 @@ def load_native_nano_engine(
         expected=expected_device_type,
         expected_dtype=dtype,
     )
-    return NativeNanoEngine(model)
+    return NativeNanoEngine(model, device=device, dtype=dtype)
 
 
 def _load_vad(device: str, dtype: str = "bf16") -> FsmnVadSegmenter:
@@ -851,7 +873,7 @@ def _load_vad(device: str, dtype: str = "bf16") -> FsmnVadSegmenter:
         expected=expected_device_type,
         expected_dtype=dtype,
     )
-    return FsmnVadSegmenter(model)
+    return FsmnVadSegmenter(model, device=device, dtype=dtype)
 
 
 def _assert_funasr_model_device(
@@ -976,7 +998,8 @@ class SenseVoiceRuntime:
             # format.  Passing 16 kHz float samples is an official AutoModel
             # input form and keeps the complete capture-to-ASR path in memory.
             samples = _load_audio_samples(audio, sample_rate)
-            results = self._model.generate(input=samples)
+            with _inference_autocast(self.device, self.dtype):
+                results = self._model.generate(input=samples)
         except NanoRuntimeError as exc:
             self.last_error = exc.error_code
             raise
