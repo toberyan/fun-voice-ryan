@@ -9,6 +9,10 @@ Fun Voice Ryan 是运行在 Deepin DDE X11 上的本地语音输入助手：按�
 纯 CPU 路径为低内存兜底，只使用 SenseVoiceSmall 与 VAD，提交原始识别文本；不下载、
 不启动 Nano、Qwen 或 CAM++。
 
+SenseVoice 的 `<|...|>` 语言、情绪、事件和 ITN 控制元数据会在识别边界移除；桌面提交、
+剪贴板和结构化段落文本只保留识别文字。清理不会将元数据替换为表情，也不会改写普通话、
+英文或代码内容。
+
 当前版本未实现 CAM++ 加载、说话人分离/身份或结构化结果接口；加速器清单中的
 `campplus` revision 及其预下载快照只是后续能力预留，不代表已有可调用的产品能力。
 
@@ -82,13 +86,15 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/fun-voice-ryan/
 ## 使用与诊断
 
 登录后 daemon 常驻但不加载模型；Nano、SenseVoiceSmall 和 Qwen 均按需启动并在空闲时
-卸载。按住 `Super+C` 录音，松开后识别、上屏并更新剪贴板。
+卸载。按住 `Super+C` 录音，松开后识别、上屏并更新剪贴板。DTK 原生悬浮窗会在清空后
+空闲 5 秒退出，守护进程会回收该子进程，不会积累后台的 `fun-voice-overlay` 无响应条目。
 
 ```bash
 fun-voice-selftest --format json
 systemctl --user status fun-voice-daemon.service --no-pager
 journalctl --user -u fun-voice-daemon.service -f
 journalctl --user -u fun-voice-worker@nano.service -f
+journalctl --user -u fun-voice-worker@sensevoice.service -f
 fun-voice-benchmark --manifest /path/to/private-manifest.jsonl
 ```
 

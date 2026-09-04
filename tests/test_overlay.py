@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from fun_voice.config import OverlayConfig
@@ -52,6 +54,34 @@ class FakeProcess:
         if self.returncode is None:
             raise subprocess.TimeoutExpired("fun-voice-overlay", timeout)
         return self.returncode
+
+
+class ReapableFakeProcess(FakeProcess):
+    """A child whose blocking wait returns only after a simulated exit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._exited = threading.Event()
+        self.wait_calls = 0
+
+    def exit_normally(self) -> None:
+        self.returncode = 0
+        self._exited.set()
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls += 1
+        if not self._exited.wait(timeout):
+            raise subprocess.TimeoutExpired("fun-voice-overlay", timeout)
+        return 0
+
+
+def _wait_until(predicate: object, timeout: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if callable(predicate) and predicate():
+            return True
+        time.sleep(0.005)
+    return callable(predicate) and bool(predicate())
 
 
 def decode_frames(writer: FakeWriter) -> list[dict[str, object]]:
@@ -134,6 +164,19 @@ def test_dtk_controller_clear_replaces_transient_text_with_a_text_free_command(
     writer = process.stdin
     assert writer is not None
     assert decode_frames(writer)[-1] == {"command": "clear"}
+
+
+def test_dtk_controller_reaps_a_child_after_its_idle_exit() -> None:
+    process = ReapableFakeProcess()
+    controller = DtkOverlayController(
+        executable=Path("overlay"), popen=lambda _argv: process
+    )
+
+    controller.show(OverlayModel(phase=DaemonState.RECORDING))
+    process.exit_normally()
+
+    assert _wait_until(lambda: controller._process is None)  # noqa: SLF001
+    assert process.wait_calls == 1
 
 
 def test_dtk_controller_does_not_spawn_for_an_oversized_transient_model() -> None:

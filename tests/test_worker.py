@@ -792,6 +792,46 @@ def test_sensevoice_runtime_decodes_raw_pcm_before_model_generate(
     )
 
 
+def test_sensevoice_runtime_removes_control_tags_from_output(
+    tmp_path: Path,
+) -> None:
+    """SenseVoice protocol metadata must never reach desktop text output."""
+    raw_pcm = tmp_path / "captured.pcm"
+    raw_pcm.write_bytes(np.array([0, 0], dtype=np.int16).tobytes())
+    parameter = SimpleNamespace(
+        device=SimpleNamespace(type="cpu"),
+        dtype="torch.float32",
+        is_floating_point=lambda: True,
+    )
+
+    def generate(*, input: object) -> list[dict[str, object]]:
+        assert isinstance(input, np.ndarray)
+        return [
+            {
+                "text": "<|zh|><|NEUTRAL|><|Speech|><|woitn|>请运行 pytest",
+                "sentence_info": [
+                    {
+                        "start": 0,
+                        "end": 500,
+                        "text": "<|en|><|HAPPY|>use Git",
+                    }
+                ],
+            }
+        ]
+
+    model = SimpleNamespace(
+        parameters=lambda: iter([parameter]),
+        vad_model=SimpleNamespace(parameters=lambda: iter([parameter])),
+        generate=generate,
+    )
+    runtime = nano_mod.SenseVoiceRuntime(model, selection=_selection("cpu"))
+
+    transcription = runtime.transcribe(str(raw_pcm), sample_rate=16000)
+
+    assert transcription.text == "请运行 pytest"
+    assert transcription.segments == (Segment(0, 500, "use Git"),)
+
+
 def test_nano_loader_rejects_cpu_selection_before_model_import(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

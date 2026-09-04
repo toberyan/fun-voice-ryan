@@ -193,6 +193,12 @@ class DtkOverlayController:
                 name="dtk-overlay-replies",
                 daemon=True,
             ).start()
+        threading.Thread(
+            target=self._reap_child,
+            args=(process,),
+            name="dtk-overlay-reaper",
+            daemon=True,
+        ).start()
         return process
 
     def _argv(self) -> list[str]:
@@ -240,6 +246,16 @@ class DtkOverlayController:
     def _terminate(process: _OverlayProcess) -> None:
         with suppress(OSError):
             process.terminate()
+
+    def _reap_child(self, process: _OverlayProcess) -> None:
+        """Wait for one owned child so its normal idle exit cannot become a zombie."""
+        try:
+            process.wait()
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        with self._lock:
+            if self._process is process:
+                self._process = None
 
     @staticmethod
     def _drain_replies(stream: IO[Any]) -> None:

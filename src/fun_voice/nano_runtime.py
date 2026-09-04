@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import stat
 import threading
 import time
@@ -54,6 +55,7 @@ MAX_NEW_TOKENS = 512
 WARMUP_SAMPLE_COUNT = 16_000
 MAX_LIVE_WINDOW_MS = 60_000
 MAX_LIVE_PCM_BYTES = 16_000 * 2 * MAX_LIVE_WINDOW_MS // 1000
+SENSEVOICE_CONTROL_TOKEN = re.compile(r"<\|[^|>\r\n]*\|>")
 
 # Model cache layout mirrors scripts/run-nano-xpu-poc.sh:
 #   ${XDG_DATA_HOME:-~/.local/share}/fun-voice-ryan/models/
@@ -303,6 +305,11 @@ def _is_oom_error(exc: BaseException) -> bool:
     name = type(exc).__name__.lower()
     message = str(exc).lower()
     return "outofmemory" in name or "out of memory" in message
+
+
+def _remove_sensevoice_control_tokens(text: str) -> str:
+    """Remove SenseVoice's ``<|...|>`` protocol metadata, preserving text."""
+    return SENSEVOICE_CONTROL_TOKEN.sub("", text)
 
 
 def _elapsed_ms(started: float) -> int:
@@ -993,6 +1000,7 @@ class SenseVoiceRuntime:
                 text = item.get("text", item.get("sentence", ""))
                 if not isinstance(text, str):
                     continue
+                text = _remove_sensevoice_control_tokens(text)
                 parsed.append(
                     Segment(
                         start_ms=int(item.get("start", 0)),
@@ -1004,6 +1012,8 @@ class SenseVoiceRuntime:
         text = first.get("text")
         if not isinstance(text, str):
             text = "".join(segment.text for segment in segments)
+        else:
+            text = _remove_sensevoice_control_tokens(text)
         if not text:
             self.last_error = EmptySpeechError.error_code
             raise EmptySpeechError("SenseVoiceSmall returned empty text")
