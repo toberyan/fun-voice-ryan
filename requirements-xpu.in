@@ -1,0 +1,11 @@
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+--extra-index-url https://download.pytorch.org/whl/xpu
+# compiler option: --index-strategy unsafe-best-match
+
+torch==2.13.0+xpu
+torchaudio==2.11.0+xpu
+modelscope==1.39.1
+transformers==5.16.1
+cryptography
+python-xlib
+secretstorage

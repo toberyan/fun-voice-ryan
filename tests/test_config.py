@@ -19,15 +19,40 @@ from fun_voice.config import (
     ActiveSessionConfig,
     Config,
     ConfigError,
+    EffectiveRuntimeConfig,
     InferenceConfig,
     OverlayConfig,
     ResourcePolicy,
     build_runtime_paths,
+    effective_runtime_config,
     load_config,
     resolve_runtime_dir,
     validate_active_session_config,
+    validate_inference_config,
     validate_overlay_config,
 )
+from fun_voice.runtime_selection import RuntimeSelection
+
+
+def _cpu_selection(root: Path) -> RuntimeSelection:
+    python = root / "runtimes" / "cpu" / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python.chmod(0o700)
+    return RuntimeSelection(
+        schema_version=1,
+        backend="cpu",
+        python=python,
+        device="cpu",
+        dtype="float32",
+        primary_asr_profile="sensevoice",
+        fallback_asr_profile=None,
+        enhanced_enabled=False,
+        speaker_enabled=False,
+        model_revisions={"sensevoice": "master", "vad": "master"},
+        probe_status="pass",
+        selected_at=1,
+    )
 
 
 def test_default_runtime_dir_uses_xdg(
@@ -148,11 +173,58 @@ def test_load_config_parses_toml_overrides(tmp_path: Path) -> None:
     )
 
 
-def test_load_config_rejects_non_xpu_inference_device(tmp_path: Path) -> None:
+def test_load_config_discards_legacy_runtime_device_and_dtype_preferences(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "config.toml"
-    path.write_text('[inference]\ndevice = "cpu"\n', encoding="utf-8")
+    path.write_text(
+        "[inference]\ndevice = 'cpu'\ndtype = 'float32'\n"
+        "[active_session]\ndevice = 'cpu'\n"
+        "[correction]\ndevice = 'cpu'\ndtype = 'float32'\n"
+        "[speaker_identity]\ndevice = 'cpu'\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.inference.device == "xpu:0"
+    assert config.inference.dtype == "bf16"
+    assert config.active_session.device == "xpu:0"
+    assert config.enhanced.correction_device == "xpu:0"
+    assert config.enhanced.correction_dtype == "bf16"
+    assert config.enhanced.identity_device == "xpu:0"
+
+
+def test_inference_validation_uses_legacy_xpu_without_policy_or_cpu_policy(
+    tmp_path: Path,
+) -> None:
+    cpu = InferenceConfig(
+        device="cpu", dtype="float32", allow_sensevoice_fallback=False
+    )
+
     with pytest.raises(ConfigError, match="xpu:0"):
-        load_config(path)
+        validate_inference_config(cpu)
+
+    assert validate_inference_config(cpu, _cpu_selection(tmp_path).policy()) == cpu
+
+
+def test_effective_runtime_config_cpu_overrides_toml_devices(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[inference]\ndevice = 'xpu:0'\n[enhanced]\nenabled = true\n"
+        "[correction]\ndevice = 'xpu:0'\ndtype = 'bf16'\n",
+        encoding="utf-8",
+    )
+
+    effective = effective_runtime_config(load_config(path), _cpu_selection(tmp_path))
+
+    assert isinstance(effective, EffectiveRuntimeConfig)
+    assert effective.inference.device == "cpu"
+    assert effective.inference.dtype == "float32"
+    assert effective.primary_asr_profile == "sensevoice"
+    assert effective.fallback_asr_profile is None
+    assert effective.enhanced.enabled is False
+    assert effective.speaker_enabled is False
 
 
 def test_load_config_parses_overlay_layout(tmp_path: Path) -> None:
@@ -245,44 +317,68 @@ def test_active_session_rejects_window_not_fixed_for_policy(
         )
 
 
-def test_active_session_rejects_non_xpu_and_nonfixed_failsafe() -> None:
+def test_active_session_rejects_non_policy_device_and_nonfixed_failsafe(
+    tmp_path: Path,
+) -> None:
+    policy = _cpu_selection(tmp_path).policy()
     with pytest.raises(ConfigError, match="active_session.device"):
-        validate_active_session_config(
-            ActiveSessionConfig(device="cpu")
-        )
+        validate_active_session_config(ActiveSessionConfig(), policy)
     with pytest.raises(ConfigError, match="worker_failsafe_idle_seconds"):
         validate_active_session_config(
-            ActiveSessionConfig(worker_failsafe_idle_seconds=1799)
+            ActiveSessionConfig(device="cpu", worker_failsafe_idle_seconds=1799),
+            policy,
         )
 
 
-def test_enhanced_inference_rejects_non_xpu_corrector() -> None:
-    with pytest.raises(ConfigError, match="correction.device must be 'xpu:0'"):
+def test_enhanced_inference_rejects_non_policy_corrector(tmp_path: Path) -> None:
+    policy = _cpu_selection(tmp_path).policy()
+    with pytest.raises(
+        ConfigError, match="correction.device must match selected runtime"
+    ):
         config_module.validate_enhanced_inference_config(
-            config_module.EnhancedInferenceConfig(correction_device="cpu")
+            config_module.EnhancedInferenceConfig(), policy
         )
 
 
-def test_enhanced_inference_uses_low_kv_bounds_for_qwen() -> None:
+def test_enhanced_inference_uses_low_kv_bounds_for_qwen(tmp_path: Path) -> None:
+    policy = _cpu_selection(tmp_path).policy()
     value = config_module.validate_enhanced_inference_config(
-        config_module.EnhancedInferenceConfig()
+        config_module.EnhancedInferenceConfig(
+            enabled=False,
+            correction_device="cpu",
+            correction_dtype="float32",
+            identity_device="cpu",
+        ),
+        policy,
     )
 
     assert value.correction_max_source_characters == 512
     assert value.correction_max_new_tokens == 512
-    assert value.enabled is True
+    assert value.enabled is False
 
     with pytest.raises(ConfigError, match="correction.max_new_tokens"):
         config_module.validate_enhanced_inference_config(
             config_module.EnhancedInferenceConfig(
+                enabled=False,
+                correction_device="cpu",
+                correction_dtype="float32",
+                identity_device="cpu",
                 correction_max_new_tokens=513
-            )
+            ),
+            policy,
         )
 
 
-def test_live_qwen_limits_are_loaded_from_config() -> None:
+def test_live_qwen_limits_are_loaded_from_config(tmp_path: Path) -> None:
+    policy = _cpu_selection(tmp_path).policy()
     value = config_module.validate_enhanced_inference_config(
-        config_module.EnhancedInferenceConfig()
+        config_module.EnhancedInferenceConfig(
+            enabled=False,
+            correction_device="cpu",
+            correction_dtype="float32",
+            identity_device="cpu",
+        ),
+        policy,
     )
 
     assert value.correction_timeout_seconds == 30

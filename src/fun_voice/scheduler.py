@@ -1,4 +1,4 @@
-"""Single-owner, priority-ordered scheduler for local XPU model work.
+"""Single-owner, priority-ordered scheduler for local model work.
 
 The scheduler intentionally knows no model API, desktop state or text.  It
 serializes opaque callbacks and makes a completion callback conditional on the
@@ -10,7 +10,9 @@ unpublishable instead.
 from __future__ import annotations
 
 import heapq
+import math
 import threading
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -20,6 +22,9 @@ from typing import Literal
 from fun_voice.contracts import ModelTaskKind, SessionKey
 
 AsrProfile = Literal["nano", "sensevoice"]
+_PROFILE_ORDER: tuple[AsrProfile, AsrProfile] = ("nano", "sensevoice")
+_STARTUP_POLL_SECONDS = 0.05
+_STARTUP_TIMEOUT_SECONDS = 15.0
 
 
 class ModelLifecycle(StrEnum):
@@ -29,6 +34,7 @@ class ModelLifecycle(StrEnum):
     READY = "ready"
     INACTIVE = "inactive"
     FAILED = "failed"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +112,7 @@ _PRIORITY = {
 }
 
 
-class XpuScheduler:
+class ModelScheduler:
     """Run exactly one model callback at a time in approved priority order."""
 
     def __init__(
@@ -115,7 +121,20 @@ class XpuScheduler:
         start_profile: Callable[[AsrProfile], bool] | None = None,
         stop_profile: Callable[[AsrProfile], bool] | None = None,
         health_profile: Callable[[AsrProfile], ModelLifecycle] | None = None,
+        transport_profile: Callable[[AsrProfile], ModelLifecycle] | None = None,
+        allowed_profiles: tuple[AsrProfile, ...] = _PROFILE_ORDER,
+        startup_timeout: float = _STARTUP_TIMEOUT_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        if (
+            not allowed_profiles
+            or any(profile not in _PROFILE_ORDER for profile in allowed_profiles)
+            or len(set(allowed_profiles)) != len(allowed_profiles)
+        ):
+            raise ValueError("allowed ASR profiles are invalid")
+        if not math.isfinite(startup_timeout) or startup_timeout < 0:
+            raise ValueError("ASR startup timeout must be finite and non-negative")
         self._start_profile = (
             start_profile if start_profile is not None else self._deny_profile_start
         )
@@ -125,8 +144,15 @@ class XpuScheduler:
         self._health_profile = (
             health_profile
             if health_profile is not None
-            else lambda _p: ModelLifecycle.FAILED
+            else lambda _p: ModelLifecycle.UNKNOWN
         )
+        self._transport_profile = (
+            transport_profile if transport_profile is not None else self._health_profile
+        )
+        self._allowed_profiles = allowed_profiles
+        self._startup_timeout = startup_timeout
+        self._monotonic = monotonic
+        self._sleep = sleep
         self._condition = threading.Condition()
         self._pending: list[_PendingTask] = []
         self._sequence = 0
@@ -138,7 +164,7 @@ class XpuScheduler:
         self._running: TaskHandle | None = None
         self._closed = False
         self._thread = threading.Thread(
-            target=self._dispatch, name="fun-voice-xpu-scheduler", daemon=True
+            target=self._dispatch, name="fun-voice-model-scheduler", daemon=True
         )
         self._thread.start()
 
@@ -188,23 +214,21 @@ class XpuScheduler:
         """Queue Qwen only after every ASR profile is confirmed gone."""
 
         def guarded() -> CorrectionOutcome:
-            other: AsrProfile = "sensevoice" if profile == "nano" else "nano"
-            for candidate in (profile, other):
-                # Always ask the producing profile to release: its process can
-                # have outlived our local state. A second profile is released
-                # whenever the scheduler has observed it load or become ready.
-                needs_release = (
-                    candidate == profile
-                    or self._profile_states[candidate]
-                    in {ModelLifecycle.LOADING, ModelLifecycle.READY}
-                )
+            if profile not in self._allowed_profiles:
+                return CorrectionOutcome(permitted=False)
+            candidates = (profile,) + tuple(
+                candidate
+                for candidate in self._allowed_profiles
+                if candidate != profile
+            )
+            for candidate in candidates:
                 try:
-                    if needs_release:
-                        if not self._stop_profile(candidate):
-                            return CorrectionOutcome(permitted=False)
-                        state = self._health_profile(candidate)
-                    else:
-                        state = self._profile_states[candidate]
+                    # Scheduler state is not process evidence. Reconcile both
+                    # profiles before Qwen so an unobserved sibling cannot
+                    # retain the selected accelerator.
+                    if not self._stop_profile(candidate):
+                        return CorrectionOutcome(permitted=False)
+                    state = self._health_profile(candidate)
                 except Exception:  # noqa: BLE001 - deny lease on uncertainty
                     return CorrectionOutcome(permitted=False)
                 if state not in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
@@ -237,21 +261,30 @@ class XpuScheduler:
             ModelTaskKind.PROVISIONAL_TAIL,
         }:
             raise ValueError("ASR work must use an ASR task kind")
+        if profile not in self._allowed_profiles:
+            raise ModelProfileError("ASR profile is disallowed by runtime policy")
 
         def guarded() -> object:
-            other: AsrProfile = "sensevoice" if profile == "nano" else "nano"
-            if self._profile_states[other] is not ModelLifecycle.INACTIVE:
-                if not self._stop_profile(other):
-                    raise ModelProfileError("ASR profile release was unconfirmed")
-                observed = self._health_profile(other)
-                if observed not in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
-                    raise ModelProfileError("ASR profile remained active")
-                self._profile_states[other] = observed
-            if self._profile_states[profile] is not ModelLifecycle.READY:
+            self._reconcile_asr_siblings(profile)
+            observed_profile = self._observe_transport(profile)
+            if observed_profile is ModelLifecycle.READY:
+                self._profile_states[profile] = ModelLifecycle.READY
+            elif observed_profile in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
                 self._profile_states[profile] = ModelLifecycle.LOADING
                 if not self._start_profile(profile):
                     self._profile_states[profile] = ModelLifecycle.FAILED
                     raise ModelProfileError("ASR profile did not start")
+                self._wait_for_transport_ready(profile)
+            elif observed_profile is ModelLifecycle.UNKNOWN:
+                self._profile_states[profile] = ModelLifecycle.LOADING
+                if not self._start_profile(profile):
+                    self._profile_states[profile] = ModelLifecycle.FAILED
+                    raise ModelProfileError("ASR profile did not start")
+                self._profile_states[profile] = ModelLifecycle.UNKNOWN
+                raise ModelProfileError("ASR profile health was unconfirmed")
+            else:
+                self._profile_states[profile] = observed_profile
+                raise ModelProfileError("ASR profile was not ready")
             try:
                 result = fn()
             except Exception:
@@ -261,6 +294,65 @@ class XpuScheduler:
             return result
 
         return self.submit(key, kind, guarded)
+
+    def _reconcile_asr_siblings(self, profile: AsrProfile) -> None:
+        """Prove every allowed peer has released before selected ASR starts."""
+        for sibling in self._allowed_profiles:
+            if sibling == profile:
+                continue
+            observed = self._observe_profile(sibling)
+            if observed is ModelLifecycle.UNKNOWN:
+                raise ModelProfileError("ASR sibling health was unconfirmed")
+            if observed in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
+                self._profile_states[sibling] = observed
+                continue
+            if not self._stop_profile(sibling):
+                raise ModelProfileError("ASR sibling release was unconfirmed")
+            confirmed = self._observe_profile(sibling)
+            if confirmed not in {ModelLifecycle.INACTIVE, ModelLifecycle.FAILED}:
+                self._profile_states[sibling] = confirmed
+                raise ModelProfileError("ASR sibling remained active")
+            self._profile_states[sibling] = confirmed
+
+    def _observe_profile(self, profile: AsrProfile) -> ModelLifecycle:
+        """Return a lifecycle probe result while converting errors to UNKNOWN."""
+        return self._observe(self._health_profile, profile)
+
+    def _observe_transport(self, profile: AsrProfile) -> ModelLifecycle:
+        """Return a socket-transport probe result while converting errors to UNKNOWN."""
+        return self._observe(self._transport_profile, profile)
+
+    def _observe(
+        self,
+        probe: Callable[[AsrProfile], ModelLifecycle],
+        profile: AsrProfile,
+    ) -> ModelLifecycle:
+        """Run one untrusted lifecycle probe and retain only its fixed state."""
+        try:
+            observed = probe(profile)
+        except Exception:  # noqa: BLE001 - model work must fail closed
+            observed = ModelLifecycle.UNKNOWN
+        if not isinstance(observed, ModelLifecycle):
+            observed = ModelLifecycle.UNKNOWN
+        self._profile_states[profile] = observed
+        return observed
+
+    def _wait_for_transport_ready(self, profile: AsrProfile) -> None:
+        """Boundedly wait for a started worker to accept socket requests."""
+        deadline = self._monotonic() + self._startup_timeout
+        while True:
+            observed = self._observe_transport(profile)
+            if observed is ModelLifecycle.READY:
+                return
+            if observed is ModelLifecycle.INACTIVE:
+                self._profile_states[profile] = ModelLifecycle.FAILED
+                raise ModelProfileError("ASR profile transport was not ready")
+            if observed is ModelLifecycle.FAILED:
+                raise ModelProfileError("ASR profile transport was not ready")
+            if self._monotonic() >= deadline:
+                self._profile_states[profile] = ModelLifecycle.UNKNOWN
+                raise ModelProfileError("ASR profile transport was not ready")
+            self._sleep(_STARTUP_POLL_SECONDS)
 
     def profile_state(self, profile: AsrProfile) -> ModelLifecycle:
         """Return scheduler-owned profile state without a VRAM/process probe."""

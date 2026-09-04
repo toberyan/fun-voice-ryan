@@ -19,7 +19,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from fun_voice import config
 from fun_voice.nano_runtime import EmptySpeechError
+from fun_voice.runtime_selection import load_runtime_selection
 
 DEVICE = "xpu:0"
 NANO_MODEL_ID = "FunAudioLLM/Fun-ASR-Nano-2512"
@@ -383,9 +385,13 @@ def _edit_distance(reference: str, candidate: str) -> int:
 
 def _default_runtime_factory() -> _PocRuntime:
     """Import the real runtime only for an explicit POC invocation."""
+    selection = load_runtime_selection()
+    if selection.backend != "xpu" or selection.device != DEVICE:
+        raise RuntimeError("incremental POC requires selected XPU runtime")
+    effective = config.effective_runtime_config(config.load_config(), selection)
     from fun_voice.nano_runtime import load_nano_runtime
 
-    return load_nano_runtime(device=DEVICE)
+    return load_nano_runtime(selection=selection, inference=effective.inference)
 
 
 def _default_audio_loader(path: str, sample_rate: int) -> Any:
@@ -413,15 +419,28 @@ def _default_final_tail_probe(
     """
     del runtime, samples
     from fun_voice.contracts import ModelTaskKind, SessionKey
-    from fun_voice.scheduler import ModelLifecycle, XpuScheduler
+    from fun_voice.scheduler import ModelLifecycle, ModelScheduler
 
     blocker_started = threading.Event()
     release_blocker = threading.Event()
     execution_order: list[str] = []
-    scheduler = XpuScheduler(
-        start_profile=lambda _profile: True,
-        stop_profile=lambda _profile: True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+    profile_state = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
+
+    def start_profile(profile: str) -> bool:
+        profile_state[profile] = ModelLifecycle.READY
+        return True
+
+    def stop_profile(profile: str) -> bool:
+        profile_state[profile] = ModelLifecycle.INACTIVE
+        return True
+
+    scheduler = ModelScheduler(
+        start_profile=start_profile,
+        stop_profile=stop_profile,
+        health_profile=lambda profile: profile_state[profile],
     )
     key = SessionKey("incremental-poc", generation=1)
     scheduler.activate(key)

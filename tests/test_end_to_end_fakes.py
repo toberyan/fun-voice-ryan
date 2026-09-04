@@ -206,6 +206,15 @@ class _TextWorker:
         self.transcriptions.append(artifact)
         return Transcription(text=self.text, segments=())
 
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
+
     def close(self) -> None:
         pass
 
@@ -223,6 +232,15 @@ class FlakyWorker:
         if self.calls == 1:
             raise WorkerError(ErrorCode("worker", "oom"), "out of memory")
         return Transcription(text=self.text, segments=())
+
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -541,6 +559,15 @@ class BlockingWorker:
         self.release.wait(timeout=10.0)
         return Transcription(text="你好", segments=())
 
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
+
     def close(self) -> None:
         pass
 
@@ -838,6 +865,44 @@ def test_worker_client_starts_service_then_retries(tmp_path: Path) -> None:
             server_holder["server"].close()
 
 
+def test_worker_client_does_not_retry_profile_start_after_internal_type_error(
+    tmp_path: Path,
+) -> None:
+    starts: list[str] = []
+
+    def start_service(profile: str) -> None:
+        starts.append(profile)
+        raise TypeError("internal callback failure")
+
+    client = SocketWorkerClient(
+        tmp_path / "worker.sock",
+        profile="sensevoice",
+        start_service=start_service,
+    )
+
+    with pytest.raises(TypeError, match="internal callback failure"):
+        client._start_profile_service()  # noqa: SLF001 - callback adapter boundary
+    assert starts == ["sensevoice"]
+
+
+def test_worker_client_start_adapter_supports_a_keyword_only_profile(
+    tmp_path: Path,
+) -> None:
+    starts: list[str] = []
+
+    def start_service(*, profile: str) -> None:
+        starts.append(profile)
+
+    client = SocketWorkerClient(
+        tmp_path / "worker.sock",
+        profile="sensevoice",
+        start_service=start_service,
+    )
+
+    client._start_profile_service()  # noqa: SLF001 - callback adapter boundary
+    assert starts == ["sensevoice"]
+
+
 def test_worker_client_unavailable_after_retry(tmp_path: Path) -> None:
     path = tmp_path / "worker.sock"
     starts: list[None] = []
@@ -942,7 +1007,8 @@ def test_worker_client_fails_closed_for_an_unknown_health_lifecycle(
         },
     )
     try:
-        assert SocketWorkerClient(path, timeout=1.0).health().lifecycle == "failed"
+        with pytest.raises(WorkerError):
+            SocketWorkerClient(path, timeout=1.0).health()
     finally:
         server.close()
 

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from fun_voice import config as config_module
 from fun_voice import incremental_poc as poc_module
+from fun_voice import nano_runtime as nano_module
+from fun_voice.config import Config
 from fun_voice.contracts import Segment, Transcription, WorkerHealth
 from fun_voice.incremental_poc import (
     DEVICE,
@@ -16,11 +20,13 @@ from fun_voice.incremental_poc import (
     IncrementalPocGate,
     IncrementalPocReport,
     _default_final_tail_probe,
+    _default_runtime_factory,
     run_incremental_poc,
     run_local_incremental_poc,
     write_poc_report,
 )
 from fun_voice.nano_runtime import EmptySpeechError
+from fun_voice.runtime_selection import RuntimeSelection
 
 
 def _passing_report(*, created_at: int = 100) -> IncrementalPocReport:
@@ -42,6 +48,103 @@ def _passing_report(*, created_at: int = 100) -> IncrementalPocReport:
         timed_out=False,
         deadlocked=False,
     )
+
+
+def _xpu_selection() -> RuntimeSelection:
+    return RuntimeSelection(
+        schema_version=1,
+        backend="xpu",
+        python=Path("/selected-runtime/bin/python"),
+        device=DEVICE,
+        dtype="bf16",
+        primary_asr_profile="nano",
+        fallback_asr_profile="sensevoice",
+        enhanced_enabled=True,
+        speaker_enabled=True,
+        model_revisions={
+            "nano": "master",
+            "sensevoice": "master",
+            "vad": "master",
+            "qwen": "master",
+            "campplus": "master",
+        },
+        probe_status="pass",
+        selected_at=1,
+    )
+
+
+def _cpu_selection() -> RuntimeSelection:
+    return RuntimeSelection(
+        schema_version=1,
+        backend="cpu",
+        python=Path("/selected-runtime/bin/python"),
+        device="cpu",
+        dtype="float32",
+        primary_asr_profile="sensevoice",
+        fallback_asr_profile=None,
+        enhanced_enabled=False,
+        speaker_enabled=False,
+        model_revisions={"sensevoice": "master", "vad": "master"},
+        probe_status="pass",
+        selected_at=1,
+    )
+
+
+def test_default_poc_runtime_factory_uses_selected_runtime_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _xpu_selection()
+    runtime = object()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        poc_module, "load_runtime_selection", lambda: selection, raising=False
+    )
+    monkeypatch.setattr(
+        poc_module,
+        "config",
+        SimpleNamespace(
+            load_config=Config,
+            effective_runtime_config=config_module.effective_runtime_config,
+        ),
+        raising=False,
+    )
+
+    def load_nano(*, selection: object, inference: object) -> object:
+        captured["selection"] = selection
+        captured["inference"] = inference
+        return runtime
+
+    monkeypatch.setattr(
+        nano_module,
+        "load_nano_runtime",
+        load_nano,
+    )
+
+    assert _default_runtime_factory() is runtime
+    assert captured["selection"] == selection
+    assert captured["inference"].device == DEVICE
+    assert captured["inference"].dtype == "bf16"
+
+
+def test_default_poc_runtime_factory_rejects_non_xpu_before_model_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+    monkeypatch.setattr(
+        poc_module, "load_runtime_selection", _cpu_selection, raising=False
+    )
+
+    def load_nano(**_kwargs: object) -> object:
+        nonlocal called
+        called = True
+        return object()
+
+    monkeypatch.setattr(nano_module, "load_nano_runtime", load_nano)
+
+    with pytest.raises(RuntimeError, match="incremental POC requires selected XPU"):
+        _default_runtime_factory()
+
+    assert called is False
 
 
 def test_poc_gate_allows_only_fresh_report_for_exact_model_device_and_revision(

@@ -1,201 +1,190 @@
 # 运维手册
 
-Fun Voice Ryan 的安装、运行与故障排查。安装脚本为 `scripts/install-user.sh`，
-卸载脚本为 `scripts/uninstall-user.sh`，两者都只操作用户级路径（`~/.local`、
-`~/.config`、`$XDG_RUNTIME_DIR`），全程不 `sudo`、不触碰系统目录。
+Fun Voice Ryan 只在 Deepin DDE X11 用户会话中运行。首次初始化负责验证桌面前提、
+选择硬件后端、创建隔离 Python 环境、下载该后端模型、发布安全清单并安装用户服务；
+无需 `sudo`，也不触碰系统目录。
 
-## 1. 安装前硬件核验（XPU / 驱动）
+## 1. 首次初始化与重新选择
 
-本项目推理依赖 Intel Arc XPU，安装前必须先通过全部九项硬门检查：
-
-1. 确认显卡为 Intel Arc（或带 Arc 核显的 Arrow Lake / Meteor Lake 等），且
-   `ls /dev/dri` 能看到 render 节点。
-2. 确认已安装 Intel GPU compute runtime 与 Level Zero：
-   ```bash
-   clinfo | grep -i "level zero\|device name"   # 或 sycl-ls
-   ```
-3. 运行 POC 脚本，产出 `ready=true` 的报告（安装脚本会读取它作为硬门）：
-   ```bash
-   scripts/run-nano-xpu-poc.sh
-   ```
-   报告位于 `$XDG_RUNTIME_DIR/fun-voice-ryan/poc-report.json`。`ready` 不为
-   `true` 时 `install-user.sh` 会直接拒绝安装；**绝不允许静默退回 CPU**。
-
-## 2. 首次模型下载
-
-模型（Fun-ASR-Nano-2512 与 FSMN-VAD）由 POC 脚本在首次运行时下载到：
-
-```
-~/.local/share/fun-voice-ryan/models
-```
-
-之后 worker 直接复用该缓存，不会重复下载。卸载时该目录默认保留（见第 8 节）。
-
-## 3. 配置来源
-
-配置文件为 `${XDG_CONFIG_HOME:-~/.config}/fun-voice-ryan/config.toml`；不存在时使用
-安全默认值。可从 `scripts/config.example.toml` 复制后修改，daemon 与 worker 都在启动时
-读取它。当前生效的键包括 PipeWire `audio.source`、Fcitx
-`input_method.commit_timeout_ms`（毫秒）及 `input_method.allow_x11_paste_fallback`、Nano
-的 `inference.*`，以及 `enhanced.enabled` 和 Qwen 的
-`correction.max_source_characters`、`max_new_tokens`、`timeout_seconds`、`protected_terms`，
-以及 daemon 读取的 `overlay.vertical_center_ratio`、`overlay.width_px`、
-`overlay.font_scale`。后者的合法范围分别为 `0.50--0.85`、`420--1000` 和
-`0.80--1.80`；已知的 overlay 字段类型错误或越界会明确拒绝 daemon 启动，而不是静默采用布局。
-Qwen 的模型、设备和精度固定，不能改为其他模型或 CPU。
-
-`inference.device` 只能是 `xpu:0`，任何 CPU/CUDA 设置都会拒绝启动，绝不静默回退。
-热键固定为 `<Super>C`，模型固定为 `FunAudioLLM/Fun-ASR-Nano-2512`，Fcitx 主通道固定为
-fcitx5；录音上限、内存阈值和不保留历史均为不可配置的安全约束。卸载默认保留用户配置。
-
-> 另请注意：安装后的 console script（shebang）与 autostart `Exec` 都指向
-> **仓库与 `.venv` 的绝对路径**（当前 `~/workspace/fun-voice-ryan`）。**移动或
-> 删除仓库目录会使语音输入静默失效**；仓库路径变更时请先
-> `scripts/uninstall-user.sh`，再在新位置重新安装。
-
-## 4. 隐私说明
-
-- **不持久化录音或转写文本**：短音频只驻留内存；超过阈值才在
-  `$XDG_RUNTIME_DIR`（用户专属 tmpfs）下以 `0700`/`0600` 权限暂存，任务结束即删除。
-- **日志与通知不含音频内容或转写正文**，只记录长度、状态、错误类别和请求 id。
-- **原始转写始终可用**：仅 Qwen3.5-0.8B 可做一次本地校对；URL、路径、反引号代码、
-  命令选项、版本、`snake_case`、`CamelCase` 和配置技术词必须保留。校对超时、失败或
-  校验不通过时提交原始转写。
-
-## 5. 日志脱敏
-
-应用日志只写「长度、状态、错误类别、请求 id」，不写音频路径或转写正文。
-排查时如果发现某条日志疑似包含正文，请优先当作 bug 报告（隐私红线）。
-
-## 6. 服务诊断（journalctl --user）
-
-安装后有 daemon 与按需 worker template：
+在图形会话中执行：
 
 ```bash
-systemctl --user status fun-voice-worker@nano.service
-systemctl --user status fun-voice-daemon
-journalctl --user -u fun-voice-worker -f
-journalctl --user -u fun-voice-daemon -f
+scripts/initialize-first-run.sh
+scripts/initialize-first-run.sh --backend cpu
+scripts/initialize-first-run.sh --force-reselect
+fun-voice-selftest --format json
 ```
 
-自检入口：
+默认 `auto` 顺序固定为 **CUDA → Intel XPU → CPU**。候选只有在隔离环境安装、设备张量
+探测、模型下载和固定无正文 ASR smoke test 全部通过后才会被选择。显式
+`--backend cuda|xpu|cpu` 只尝试一个候选，失败时不回退，旧的有效 `selection.json` 保持
+不变。驱动、GPU 或依赖版本变化后使用 `--force-reselect`；并发初始化由私有文件锁串行化。
+
+初始化前会检查 `DISPLAY`、X11/DDE 会话、权限安全的 `XDG_RUNTIME_DIR`、PipeWire、
+fcitx5、`uv`、CMake、pkg-config 和数据目录可写性。`--dry-run` 只显示候选顺序，不做这些
+桌面检查，也不写文件。
+
+通过桌面前提检查后，初始化会先验证或构建 Fcitx 插件与 DTK overlay；原生构建失败以
+`native_prerequisite` 类别终止，且发生在运行时创建或模型下载之前。每个硬件候选使用独立
+模型缓存；失败候选整体丢弃，只有最终成功策略允许的快照才提升到正式 `models/`，已有的
+其他用户快照和 revision 保持不变。
+
+选中后端的有效策略是：
+
+| 后端 | 精度 | ASR | 当前可用修正能力 |
+| --- | --- | --- | --- |
+| CUDA | 优先 BF16，探测不支持时允许 FP16 | Nano primary，SenseVoiceSmall fallback | Qwen3.5-0.8B 按需 |
+| Intel XPU | 仅 BF16 | Nano primary，SenseVoiceSmall fallback | Qwen3.5-0.8B 按需 |
+| CPU | FP32 | **SenseVoice-only**，无 fallback | 禁用，不下载 Qwen/CAM++ |
+
+`docs/xpu-poc.md` 的九项 POC 仅为显式 Intel XPU 诊断：该命令自身失败关闭，但不能阻断
+CUDA 或 CPU 初始化。
+
+## 2. 隔离运行时与模型缓存
+
+生产模型依赖不会安装进仓库 `.venv`。仓库 `.venv` 只供开发测试；生产布局为：
+
+```text
+${XDG_DATA_HOME:-$HOME/.local/share}/fun-voice-ryan/
+├── runtimes/
+│   └── {cuda|xpu|cpu}-<32位随机generation>/
+├── runtime/
+│   └── selection.json
+└── models/
+```
+
+`runtime/` 与各运行时目录固定为 `0700`，`selection.json` 固定为 `0600`。清单记录后端、
+解释器、device/dtype、ASR profile、能力集合和精确模型 revision；启动器每次都重新验证
+清单、路径所有权、权限、解释器与策略，任一异常即失败关闭。六个安装启动器只映射到六个
+固定 Python module，不解析任意模块名，也不使用 shell 拼接用户命令。
+
+首次成功探测会一次性下载该后端允许的模型集：CUDA/XPU 下载 Nano、SenseVoiceSmall、
+VAD、Qwen3.5-0.8B，以及作为后续能力预留但当前不会加载的 CAM++ 快照；CPU 只下载
+SenseVoiceSmall 与 VAD。重新安装不会隐式删除或重复下载已有快照。
+
+当前版本没有 CAM++ loader、说话人分离/身份请求，也没有结构化结果 endpoint。
+`selection.json` 的 `speaker_enabled` 仅是后续能力预留位，当前没有对外入口或验收承诺。
+
+## 3. 配置来源与覆盖规则
+
+配置文件为 `${XDG_CONFIG_HOME:-~/.config}/fun-voice-ryan/config.toml`；不存在时使用安全
+默认值，可从 `scripts/config.example.toml` 复制。热键固定为 `<Super>C`，录音上限、
+内存分片阈值与不保留历史是不可配置的安全约束。
+
+TOML 中历史 `inference.device`、`inference.dtype`、`correction.device` 与
+`correction.dtype` 是兼容输入，**被有效 runtime policy 忽略**，不能覆盖
+`selection.json`。`inference.allow_sensevoice_fallback` 也不能让 CPU 启用 Nano。
+只有 `enhanced.enabled = false` 可以进一步关闭 CUDA/XPU 的 Qwen 修正；设为 `true`
+不能在 CPU selection 下启用修正或说话人能力。
+
+仍可配置的 Qwen 偏好包括 `correction.max_source_characters`、`max_new_tokens`、
+`timeout_seconds`、`protected_terms` 和 `enable_thinking`，纯 CPU 下均不生效。overlay
+支持 `vertical_center_ratio`（0.50--0.85）、`width_px`（420--1000）与
+`font_scale`（0.80--1.80）；越界会明确拒绝 daemon 启动。
+
+## 4. 服务与按需模型生命周期
+
+安装后 daemon 由 DDE autostart 在导入 `DISPLAY`、`XAUTHORITY` 和 D-Bus 环境后启动。
+worker template 没有 `[Install]`，不能成为开机模型服务：
+
+```bash
+systemctl --user status fun-voice-daemon.service --no-pager
+systemctl --user status fun-voice-worker@nano.service --no-pager
+systemctl --user status fun-voice-worker@sensevoice.service --no-pager
+journalctl --user -u fun-voice-daemon.service -f
+```
+
+有效录音期间 daemon 会异步**预加载**所选 ASR profile，松键后通过对应私有 socket
+识别。加速器修正必须先**停止 Nano**（或本次实际使用的 SenseVoice worker），确认服务
+已经 `inactive`/`failed` 且 transport 不可达，再启动一次 Qwen 子进程。停止确认失败、
+Qwen 超时/OOM/校验拒绝时直接提交原始转写，绝不让 ASR 与 Qwen 同时抢占设备。
+
+CPU selection 的调度器只允许 SenseVoice profile：不会探测或启动 Nano socket，也不创建
+Qwen child。所有当前可执行模型按需加载并在空闲窗口后卸载；登录本身不占用数 GB 模型内存。
+
+## 5. 自检与故障排查
 
 ```bash
 fun-voice-selftest --format json
 ```
 
-`x11_hotkey` 会在 daemon 成功独占抓取 `Super+C`、且本次启动已经观测到一次真实按下后
-才返回 `pass`。这是预期的验收门：先在 X11 会话中按住并松开一次 `Super+C`，再运行
-自检；它只读取 daemon 内存中的 `registered`、`press_seen` 两个布尔值，不保存按键时间、
-音频或转写文本。该项通过后仍须完成 `docs/acceptance-checklist.md` 的目标应用人工验收。
+自检按当前 `selection.json` 检查后端、有效 policy、桌面链路与允许的 worker。CPU 机器只
+探测 SenseVoice；CUDA/XPU 机器探测对应加速器路径。`x11_hotkey` 要在本次 daemon 启动后
+真实按住/松开一次 `Super+C` 才为 pass，只记录 `registered` 与 `press_seen` 布尔值。
 
-首次有效录音会在录音期间预加载 Nano；若此前没有模型驻留，worker 状态会短暂为
-`activating`。daemon 依赖
-图形会话环境（DISPLAY/XAUTHORITY），由登录时的 autostart 入口导入（见第 8 节）。
+- **清单或依赖失败**：重新执行首次初始化；不要手改 `selection.json` 或把仓库 `.venv`
+  软链到生产 runtime。
+- **Super+C 冲突**：查看 daemon journal；X11 grab 冲突会以退出码 2 失败且不循环重启。
+- **Fcitx 上屏失败**：确认用户 addon 与 `$XDG_RUNTIME_DIR/fun-voice-ryan-fcitx.sock`；
+  Fcitx 失败时按策略写 clipboard，再允许 XTEST Ctrl+V fallback。
+- **模型启动失败**：查看固定错误类别和聚合时延，不要在日志中加入音频路径或识别正文。
 
-### 6.1 DTK 悬浮窗
+显式后端初始化失败不会覆盖当前清单。例如不支持 CUDA 的机器执行
+`scripts/initialize-first-run.sh --backend cuda --force-reselect` 必须非零退出，daemon 继续
+使用此前的安全选择。
 
-悬浮窗由 `~/.local/lib/fun-voice-ryan/fun-voice-overlay` 按需启动，不是 systemd 服务，也
-不会在登录后常驻。它在鼠标所在屏幕的工作区中下部显示状态和临时转写，跟随 DDE 深浅主题；
-`clear` 后 5 秒自动退出。它不获取焦点、不接收鼠标或键盘输入，也不写入剪贴板。
+## 6. DTK 悬浮窗
 
-可在 `[overlay]` 配置 `vertical_center_ratio`（窗口中心高度比例）、`width_px`（固定逻辑
-宽度）和 `font_scale`（状态 18 pt、转写 15 pt、音量 13 pt 的统一倍率）。配置仅在 daemon
-启动时读取；修改后执行本节的重启命令生效。布局重启不会启动 Nano、SenseVoice 或 Qwen，模型
-仍仅由实际语音会话按需拉起。
+悬浮窗位于 `~/.local/lib/fun-voice-ryan/fun-voice-overlay`，按需启动、5 秒无状态后退出，
+不会获取焦点或写剪贴板。二进制缺失或 DTK 运行库异常时，识别和上屏仍继续，但进入
+**无悬浮窗**模式。
 
-如果二进制缺失、DTK 运行库不可用或窗口进程异常，语音识别和最终上屏会继续运行，但会处于
-**无悬浮窗**状态。重新执行以下命令即可恢复：
+重新构建后用首次初始化重新核验并部署：
 
 ```bash
 cmake -S native/dtk-overlay -B build/dtk-overlay
 cmake --build build/dtk-overlay
-scripts/install-user.sh
-systemctl --user restart fun-voice-daemon.service
+scripts/initialize-first-run.sh --force-reselect
 ```
 
-### 6.2 内存时延诊断
+## 7. 内存与时延诊断
 
-daemon 的 owner-only control socket 支持 `{"op":"metrics"}`。它只返回当前进程最近
-128 次会话的聚合计数、P50/P95 与固定枚举直方图；不会返回会话明细，也不会包含音频、文本、
-路径、窗口信息或模型异常原文。重启 daemon 会清空这些内存指标。
+daemon 的 owner-only control socket 只返回最近 128 次会话的聚合计数、P50/P95 和固定
+枚举，不返回音频、文本、路径、窗口信息或模型异常原文：
 
-- `preload_runtime_load_ms` 是 worker 内 Nano/VAD/runtime 构造耗时；
-  `preload_warmup_ms` 是构造完成后对固定一秒静音 PCM 的一次生成预热，二者均在录音期发生。
-  `nano_warmup=failed` 只表示这次预热不可用，真实 ASR 仍会继续使用已加载的 Nano。
-- `asr_queue_transport_ms` 是 daemon 端 ASR 总耗时扣除 worker 执行耗时后的外部等待；
-  `asr_audio_load_ms`、`asr_vad_ms`、`asr_generate_ms` 分别定位音频读取、VAD 和 Nano 生成。
-  `asr_release_ms` 是启动 Qwen 前确认对应 ASR worker 已停止的耗时。
-- `correction_model_load_ms`、`correction_generate_ms`、`correction_validate_ms` 分别表示
-  一次 Qwen3.5-0.8B 子进程的加载、生成和确定性校验耗时。`correction_rejection` 仅为固定原因，
-  例如 `envelope_missing`、`similarity`、`protected_token`、`oom` 或 `timeout`；它不携带候选
-  文本或被保护的技术词。任何此类拒绝仍提交原始 ASR 文本。
+- `preload_runtime_load_ms` / `preload_warmup_ms`：按需 runtime 构造与固定静音预热；
+- `asr_audio_load_ms` / `asr_vad_ms` / `asr_generate_ms`：读取、VAD、推理；
+- `asr_queue_transport_ms` / `asr_release_ms`：外部排队与释放 ASR worker；
+- `correction_model_load_ms` / `correction_generate_ms` / `correction_validate_ms`：
+  加速器 Qwen 单次修正阶段，CPU 不产生这些指标。
 
-使用这些字段先判断瓶颈是否在 runtime 加载、首次预热、ASR 推理、worker 交换，还是 Qwen
-加载；不要为了追求单次时延在登录时常驻 Nano/Qwen，或让两个模型同时占用 XPU。
+不要为了单次冷启动数字恢复登录常驻模型。若录音交互慢，先区分是模型冷加载、ASR、
+worker 交换、Qwen 还是输入法提交，再调整现有空闲策略。
 
-## 7. 本地准确率与时延基准
+## 8. 本地准确率与时延基准
 
-仅在你明确执行时运行基准。清单为本机自有的 JSONL 文件，每行包含安全类别名
-（如 `mixed`）、16 kHz 单声道 WAV/PCM 的绝对路径、参考文本，以及可选的技术词
-`terms`。它不应加入仓库。示例命令：
+基准只在显式执行时加载模型。私有 JSONL 清单每行包含类别、16 kHz 单声道音频绝对路径、
+参考文本和可选术语；不得提交到仓库：
 
 ```bash
 fun-voice-benchmark --manifest /path/to/private-manifest.jsonl \
   --output /path/to/private-benchmark-report.json
 ```
 
-命令会依次测量首个请求的冷启动和后续请求的热态时延，计算字级 CER、技术词精确率
-与标点 P/R/F1。清单、音频、参考文本和识别结果只保留在该进程内用于评分；终端输出和
-可选报告都只包含类别级计数、P50/P95 聚合值。显式指定的报告权限固定为 `0600`。
+输出只含类别级 CER、术语准确率、标点 P/R/F1 与冷/热 P50/P95 聚合值，可选报告固定
+`0600`。命令严格使用当前 selection 的 primary profile 和 daemon 相同的 worker 生命周期：
+加速器测 Nano 原始结果，CPU 测 SenseVoice 原始结果。当前命令不提供 Qwen 对照模式。
 
-基准先采集不含 Qwen 的 Nano ASR 基线；日常输入链路则在 PipeWire 录音成功后异步**预加载**
-Nano。松键后 worker 对预加载与转写串行执行。若启用校对，daemon 必须先**停止 Nano**（若
-本次使用备用模型则停止 SenseVoice）并确认对应 user service 已是 `inactive` 或 `failed`，
-才启动一次 Qwen3.5-0.8B 子进程。任何停止确认失败都会跳过 Qwen、直接提交原始转写；Qwen
-退出后，下一次有效录音才会重新预加载 Nano。此顺序不依赖不可靠的跨进程显存读数。
+## 9. 隐私与长录音
 
-## 8. X11 热键 / Fcitx 故障处理
-
-- **Fcitx addon 未加载**：确认 fcitx5 正在运行，且
-  `~/.local/lib/fcitx5/fcitx5-fun-voice.so` 与
-  `~/.local/share/fcitx5/addon/fcitx5-fun-voice.conf` 已就位；重启 fcitx5 后
-  观察 `$XDG_RUNTIME_DIR/fun-voice-ryan-fcitx.sock` 是否出现。
-- **Super+C 失效或 daemon 启动失败**：查看
-  `journalctl --user -u fun-voice-daemon.service -b --no-pager`。若出现
-  `X11 hotkey unavailable`，说明另一个 X11 客户端已抢占该组合；停止或改配冲突客户端后
-  执行 `systemctl --user restart fun-voice-daemon.service`。退出码 `2` 是确定的冲突失败，
-  systemd 不会对它循环重启。
-- **自检的 `x11_hotkey` 未通过**：先确认 `registered=true`；若 `press_seen=false`，在
-  任意输入框按住并松开一次 `Super+C` 后重新执行自检。不要将它改成切换式录音。
-- **上屏失败回退**：Fcitx 提交失败时会回退到剪贴板（需要 `xclip`/`xsel`），
-  再失败会尝试 XTEST（Ctrl+V，需要 python-xlib 且 X 可连接）。
-- **daemon 反复失败**：`journalctl --user -u fun-voice-daemon` 查看退出原因；
-  常见为缺少 `DISPLAY`（需重启会话让 autostart 入口导入环境）。
-
-## 9. 如何保持 Super+C 可用
-
-- 不要让其他 X11 全局热键工具抢占 `Super+C`。
-- daemon 在启动时会原子抓取含 Caps Lock、Num Lock、Scroll Lock 变体的 `Super+C`；任何
-  一个变体冲突都会使整个服务以退出码 `2` 失败，而不会退回到轮询、切换录音或 raw input。
-- 重启 daemon 后应重新执行一次按住/松开，再以 `fun-voice-selftest --format json` 确认
-  `x11_hotkey` 为 `pass`。
+- 短音频只在内存处理；超过阈值后才在 `$XDG_RUNTIME_DIR` 用户专属 tmpfs 以
+  `0700`/`0600` 切分，结束后删除。
+- 10 分钟后按固定 60 秒分片识别并按时间顺序拼接；25 分钟提醒一次，30 分钟强制停止。
+- 日志、通知、probe 与 selftest 均不包含语音、转写正文或模型绝对路径。
+- 最终上屏文本（修正成功时为修正文本，否则为原始 ASR）留在剪贴板；当前版本尚未提供
+  结构化结果接口。
 
 ## 10. 卸载
 
 ```bash
-scripts/uninstall-user.sh            # 保留模型缓存与用户配置
-scripts/uninstall-user.sh --purge    # 二次确认后连模型缓存与配置一并删除
+scripts/uninstall-user.sh
 ```
 
-卸载会停止并 disable 两个 systemd 服务、移除 unit/desktop/addon 文件、
-`~/.local/bin` 下的 6 个 console script，以及
-`$XDG_RUNTIME_DIR/fun-voice-ryan/` 下的 daemon/worker socket、fcitx socket 与
-capture 分片。
+卸载会停止服务并移除六个启动器、systemd unit、autostart、Fcitx addon、DTK 二进制、
+runtime socket 与 capture 分片。模型快照、`runtimes/`、`runtime/selection.json` 和用户配置
+始终保留，没有删除模型的隐式选项。
 
 ## 11. Wayland 非支持声明
 
-首版**不支持 Wayland**。本项目依赖 X11 焦点查询（`_NET_ACTIVE_WINDOW`）、
-C 键物理状态查询与 XTEST 注入，这些能力在 Wayland 会话下不可用。请在
-Deepin DDE **X11** 会话下使用；Wayland 会话下安装脚本可执行，但 daemon 的 X11
-热键、焦点校验与 Fcitx 上屏链路无法正常工作。
+首版不支持 Wayland。X11 焦点查询、`Super+C` 原子 grab、C 键物理状态与 XTEST fallback
+在 Wayland 下不可用；请使用 Deepin DDE X11 会话。

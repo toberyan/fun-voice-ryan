@@ -8,5 +8,3 @@ Type=simple
 ExecStart=%h/.local/bin/fun-voice-worker --profile %i
 Restart=no
 TimeoutStopSec=30
-Environment=MODELSCOPE_CACHE=%h/.local/share/fun-voice-ryan/models
-Environment=FUN_VOICE_MODELS_ROOT=%h/.local/share/fun-voice-ryan/models

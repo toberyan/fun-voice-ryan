@@ -7,8 +7,8 @@
 #   3. Remove the six console scripts from ~/.local/bin
 #   4. Remove the runtime sockets and capture shards
 #
-# The model cache and user config are always preserved unless --purge is given,
-# in which case they are deleted after a second confirmation.
+# Model snapshots, portable runtimes, selection state, and user config are
+# always preserved so reinstalling never needs an implicit model download.
 
 set -euo pipefail
 
@@ -18,8 +18,6 @@ FCITX_LIB_DIR="${HOME}/.local/lib/fcitx5"
 FCITX_ADDON_DIR="${HOME}/.local/share/fcitx5/addon"
 OVERLAY_INSTALL_DIR="${HOME}/.local/lib/fun-voice-ryan"
 AUTOSTART_DIR="${HOME}/.config/autostart"
-CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/fun-voice-ryan"
-MODELS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/fun-voice-ryan/models"
 
 CONSOLE_SCRIPTS=(
   fun-voice-daemon fun-voice-worker fun-voice-preflight fun-voice-selftest
@@ -30,23 +28,43 @@ SYSTEMD_SERVICES=(fun-voice-worker.service fun-voice-worker@nano.service fun-voi
 log() { printf '[uninstall-user] %s\n' "$*"; }
 die() { printf '[uninstall-user] ERROR(%s): %s\n' "$1" "$2" >&2; exit 1; }
 
-# Guard the runtime paths: with XDG_RUNTIME_DIR unset, ${VAR:-}/fun-voice-ryan
-# would collapse to the root-level "/fun-voice-ryan". Never touch those paths
-# unless the runtime dir is valid (mirrors the install script's precondition).
-if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR}" ]]; then
+if [[ "$#" -ne 0 ]]; then
+    die "usage" "no arguments are supported"
+fi
+
+private_owned_directory() {
+    local path="$1" mode
+    if [[ ! -d "${path}" || -L "${path}" || ! -O "${path}" ]]; then
+        return 1
+    fi
+    mode="$(stat -c '%a' -- "${path}" 2>/dev/null)" || return 1
+    [[ "${mode}" == "700" ]]
+}
+
+# Validate the entire recursive-cleanup boundary before removing any installed
+# artifact. An unset/nonexistent session root has nothing to clean; a present
+# but shared or redirected tree is an error, because its contents are not
+# demonstrably application-owned.
+RUNTIME_DIR=""
+FCITX_SOCKET=""
+if [[ -z "${XDG_RUNTIME_DIR:-}" \
+    || ( ! -e "${XDG_RUNTIME_DIR}" && ! -L "${XDG_RUNTIME_DIR}" ) ]]; then
     log "XDG_RUNTIME_DIR is not set or does not exist; skipping runtime cleanup"
-    RUNTIME_DIR=""
-    FCITX_SOCKET=""
+elif [[ "${XDG_RUNTIME_DIR}" != /* ]] \
+    || ! private_owned_directory "${XDG_RUNTIME_DIR}"; then
+    die "runtime-safety" "XDG_RUNTIME_DIR is not a private owned directory"
 else
     RUNTIME_DIR="${XDG_RUNTIME_DIR}/fun-voice-ryan"
     FCITX_SOCKET="${XDG_RUNTIME_DIR}/fun-voice-ryan-fcitx.sock"
-fi
-
-PURGE=0
-if [[ "${1:-}" == "--purge" ]]; then
-    PURGE=1
-elif [[ -n "${1:-}" ]]; then
-    die "usage" "unknown argument: $1 (only --purge is supported)"
+    if [[ -e "${RUNTIME_DIR}" || -L "${RUNTIME_DIR}" ]]; then
+        private_owned_directory "${RUNTIME_DIR}" \
+            || die "runtime-safety" "application runtime directory is unsafe"
+        CAPTURE_DIR="${RUNTIME_DIR}/capture"
+        if [[ -e "${CAPTURE_DIR}" || -L "${CAPTURE_DIR}" ]]; then
+            private_owned_directory "${CAPTURE_DIR}" \
+                || die "runtime-safety" "capture directory is unsafe"
+        fi
+    fi
 fi
 
 # remove_file PATH — best-effort removal of a regular file or symlink.
@@ -87,27 +105,11 @@ if [[ -n "${RUNTIME_DIR}" ]]; then
     done
     remove_file "${FCITX_SOCKET}"
     if [[ -d "${RUNTIME_DIR}/capture" ]]; then
-        rm -rf "${RUNTIME_DIR}/capture" && log "removed capture shards under ${RUNTIME_DIR}/capture"
+        rm -rf -- "${RUNTIME_DIR}/capture" \
+            && log "removed capture shards under ${RUNTIME_DIR}/capture"
     fi
 fi
 
-# --- 5. Optional purge (model cache + user config) --------------------------
-if [[ "${PURGE}" -eq 1 ]]; then
-    printf '[uninstall-user] WARNING: --purge will permanently delete:\n'
-    printf '  model cache: %s\n' "${MODELS_DIR}"
-    printf '  user config: %s\n' "${CONFIG_DIR}"
-    printf 'Type "DELETE" (without quotes) to confirm: '
-    if ! read -r answer; then
-        printf '\n[uninstall-user] ERROR(abort): purge not confirmed (stdin closed); model cache and config preserved\n' >&2
-        exit 1
-    fi
-    if [[ "${answer}" != "DELETE" ]]; then
-        die "abort" "purge not confirmed; model cache and config preserved"
-    fi
-    rm -rf "${MODELS_DIR}" && log "purged model cache ${MODELS_DIR}"
-    rm -rf "${CONFIG_DIR}" && log "purged user config ${CONFIG_DIR}"
-else
-    log "model cache and user config preserved (use --purge to delete)"
-fi
+log "model snapshots, portable runtimes, selection state, and user config preserved"
 
 log "uninstall complete"

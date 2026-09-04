@@ -16,6 +16,8 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 
+from fun_voice.runtime_selection import AsrProfile, RuntimePolicy, RuntimeSelection
+
 # --- Permission policy ------------------------------------------------------
 
 DIRECTORY_MODE = 0o700
@@ -160,6 +162,19 @@ class Config:
     active_session: ActiveSessionConfig = field(default_factory=ActiveSessionConfig)
     enhanced: EnhancedInferenceConfig = field(default_factory=EnhancedInferenceConfig)
     overlay: OverlayConfig = field(default_factory=OverlayConfig)
+
+
+@dataclass(frozen=True)
+class EffectiveRuntimeConfig:
+    """User preferences bounded by one immutable selected-runtime policy."""
+
+    selection: RuntimeSelection
+    inference: InferenceConfig
+    active_session: ActiveSessionConfig
+    enhanced: EnhancedInferenceConfig
+    primary_asr_profile: AsrProfile
+    fallback_asr_profile: AsrProfile | None
+    speaker_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -313,10 +328,25 @@ def _protected_terms(value: object) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def validate_inference_config(inference: InferenceConfig) -> InferenceConfig:
-    """Validate XPU-only settings and bounded legacy Nano compatibility keys."""
-    if inference.device != XPU_DEVICE:
-        raise ConfigError(f"inference.device must be {XPU_DEVICE!r}")
+def validate_inference_config(
+    inference: InferenceConfig, policy: RuntimePolicy | None = None
+) -> InferenceConfig:
+    """Validate bounded settings and, when supplied, a selected-runtime policy."""
+    expected_device = XPU_DEVICE if policy is None else policy.device
+    if inference.device != expected_device:
+        if policy is None:
+            raise ConfigError(f"inference.device must be {XPU_DEVICE!r}")
+        raise ConfigError("inference.device must match selected runtime")
+    if policy is not None:
+        if inference.dtype != policy.dtype:
+            raise ConfigError("inference.dtype must match selected runtime")
+        if (
+            inference.allow_sensevoice_fallback
+            != (policy.fallback_asr_profile == "sensevoice")
+        ):
+            raise ConfigError(
+                "inference.allow_sensevoice_fallback must match selected runtime"
+            )
     if not 0.10 <= inference.gpu_memory_utilization <= 0.20:
         raise ConfigError(
             "inference.gpu_memory_utilization must be in [0.10, 0.20]"
@@ -330,10 +360,15 @@ def validate_inference_config(inference: InferenceConfig) -> InferenceConfig:
     return inference
 
 
-def validate_active_session_config(value: ActiveSessionConfig) -> ActiveSessionConfig:
-    """Validate the bounded, XPU-only active-session product policy."""
-    if value.device != XPU_DEVICE:
-        raise ConfigError("active_session.device must be 'xpu:0'")
+def validate_active_session_config(
+    value: ActiveSessionConfig, policy: RuntimePolicy | None = None
+) -> ActiveSessionConfig:
+    """Validate bounded active-session settings against an optional policy."""
+    expected_device = XPU_DEVICE if policy is None else policy.device
+    if value.device != expected_device:
+        if policy is None:
+            raise ConfigError("active_session.device must be 'xpu:0'")
+        raise ConfigError("active_session.device must match selected runtime")
     expected_idle = _ACTIVE_IDLE_SECONDS.get(value.policy)
     if expected_idle is None or value.active_idle_seconds != expected_idle:
         raise ConfigError(
@@ -347,21 +382,29 @@ def validate_active_session_config(value: ActiveSessionConfig) -> ActiveSessionC
 
 
 def validate_enhanced_inference_config(
-    value: EnhancedInferenceConfig,
+    value: EnhancedInferenceConfig, policy: RuntimePolicy | None = None
 ) -> EnhancedInferenceConfig:
     """Reject unsupported enhanced-service settings before startup.
 
     The result API intentionally has fixed capacity and lifetime: allowing a
     longer retention period would change the local privacy boundary.
     """
-    if value.correction_device != XPU_DEVICE:
-        raise ConfigError("correction.device must be 'xpu:0'")
-    if value.identity_device != XPU_DEVICE:
-        raise ConfigError("speaker_identity.device must be 'xpu:0'")
+    expected_device = XPU_DEVICE if policy is None else policy.device
+    expected_dtype = "bf16" if policy is None else policy.dtype
+    if value.correction_device != expected_device:
+        if policy is None:
+            raise ConfigError("correction.device must be 'xpu:0'")
+        raise ConfigError("correction.device must match selected runtime")
+    if value.correction_dtype != expected_dtype:
+        if policy is None:
+            raise ConfigError("correction.dtype must be 'bf16'")
+        raise ConfigError("correction.dtype must match selected runtime")
+    if value.identity_device != expected_device:
+        if policy is None:
+            raise ConfigError("speaker_identity.device must be 'xpu:0'")
+        raise ConfigError("speaker_identity.device must match selected runtime")
     if value.correction_model != "Qwen/Qwen3.5-0.8B":
         raise ConfigError("correction.model must be 'Qwen/Qwen3.5-0.8B'")
-    if value.correction_dtype != "bf16":
-        raise ConfigError("correction.dtype must be 'bf16'")
     if not 1 <= value.correction_max_source_characters <= 512:
         raise ConfigError("correction.max_source_characters must be in [1, 512]")
     if not 1 <= value.correction_max_new_tokens <= 512:
@@ -379,6 +422,47 @@ def validate_enhanced_inference_config(
             "enhanced result retention is fixed at 8 entries / 600 seconds"
         )
     return replace(value, correction_protected_terms=protected_terms)
+
+
+def effective_runtime_config(
+    user: Config, selection: RuntimeSelection
+) -> EffectiveRuntimeConfig:
+    """Apply deployment-owned runtime choices to bounded TOML preferences."""
+    policy = selection.policy()
+    inference = validate_inference_config(
+        replace(
+            user.inference,
+            device=policy.device,
+            dtype=policy.dtype,
+            allow_sensevoice_fallback=policy.fallback_asr_profile == "sensevoice",
+        ),
+        policy,
+    )
+    active = validate_active_session_config(
+        replace(user.active_session, device=policy.device), policy
+    )
+    enhanced = validate_enhanced_inference_config(
+        replace(
+            user.enhanced,
+            enabled=user.enhanced.enabled and policy.enhanced_enabled,
+            correction_device=policy.device,
+            correction_dtype=policy.dtype,
+            identity_enabled=(
+                user.enhanced.identity_enabled and policy.speaker_enabled
+            ),
+            identity_device=policy.device,
+        ),
+        policy,
+    )
+    return EffectiveRuntimeConfig(
+        selection,
+        inference,
+        active,
+        enhanced,
+        policy.primary_asr_profile,
+        policy.fallback_asr_profile,
+        enhanced.identity_enabled,
+    )
 
 
 def validate_overlay_config(value: OverlayConfig) -> OverlayConfig:
@@ -434,87 +518,99 @@ def load_config(path: str | Path | None = None) -> Config:
         configured_failsafe = max(legacy_value, WORKER_FAILSAFE_IDLE_SECONDS)
 
     inference_config = validate_inference_config(
-        InferenceConfig(
-            device=_str(inference.get("device"), XPU_DEVICE),
-            dtype=_str(inference.get("dtype"), "bf16"),
-            gpu_memory_utilization=_float(
-                inference.get("gpu_memory_utilization"), 0.15
+        replace(
+            InferenceConfig(
+                device=_str(inference.get("device"), XPU_DEVICE),
+                dtype=_str(inference.get("dtype"), "bf16"),
+                gpu_memory_utilization=_float(
+                    inference.get("gpu_memory_utilization"), 0.15
+                ),
+                max_model_len=_positive_int(
+                    inference.get("max_model_len"),
+                    key="inference.max_model_len",
+                    default=1536,
+                ),
+                worker_failsafe_idle_seconds=_positive_int(
+                    configured_failsafe,
+                    key="inference.worker_failsafe_idle_seconds",
+                    default=WORKER_FAILSAFE_IDLE_SECONDS,
+                ),
+                allow_sensevoice_fallback=_bool(
+                    inference.get("allow_sensevoice_fallback"), True
+                ),
+                enforce_eager=_bool(inference.get("enforce_eager"), True),
             ),
-            max_model_len=_positive_int(
-                inference.get("max_model_len"),
-                key="inference.max_model_len",
-                default=1536,
-            ),
-            worker_failsafe_idle_seconds=_positive_int(
-                configured_failsafe,
-                key="inference.worker_failsafe_idle_seconds",
-                default=WORKER_FAILSAFE_IDLE_SECONDS,
-            ),
-            allow_sensevoice_fallback=_bool(
-                inference.get("allow_sensevoice_fallback"), True
-            ),
-            enforce_eager=_bool(inference.get("enforce_eager"), True),
+            device=XPU_DEVICE,
+            dtype="bf16",
         )
     )
     active_policy = _resource_policy(
         active_session.get("policy"), ResourcePolicy.BALANCED
     )
     active_config = validate_active_session_config(
-        ActiveSessionConfig(
-            policy=active_policy,
-            active_idle_seconds=_positive_int(
-                active_session.get("active_idle_seconds"),
-                key="active_session.active_idle_seconds",
-                default=_ACTIVE_IDLE_SECONDS[active_policy],
+        replace(
+            ActiveSessionConfig(
+                policy=active_policy,
+                active_idle_seconds=_positive_int(
+                    active_session.get("active_idle_seconds"),
+                    key="active_session.active_idle_seconds",
+                    default=_ACTIVE_IDLE_SECONDS[active_policy],
+                ),
+                worker_failsafe_idle_seconds=inference_config.worker_failsafe_idle_seconds,
+                provisional_enabled=_bool(
+                    active_session.get("provisional_enabled"), False
+                ),
+                device=_str(active_session.get("device"), XPU_DEVICE),
             ),
-            worker_failsafe_idle_seconds=inference_config.worker_failsafe_idle_seconds,
-            provisional_enabled=_bool(
-                active_session.get("provisional_enabled"), False
-            ),
-            device=_str(active_session.get("device"), XPU_DEVICE),
+            device=XPU_DEVICE,
         )
     )
     enhanced_config = validate_enhanced_inference_config(
-        EnhancedInferenceConfig(
-            enabled=_bool(enhanced.get("enabled"), True),
-            result_ttl_seconds=_positive_int(
-                enhanced.get("result_ttl_seconds"),
-                key="enhanced.result_ttl_seconds",
-                default=600,
+        replace(
+            EnhancedInferenceConfig(
+                enabled=_bool(enhanced.get("enabled"), True),
+                result_ttl_seconds=_positive_int(
+                    enhanced.get("result_ttl_seconds"),
+                    key="enhanced.result_ttl_seconds",
+                    default=600,
+                ),
+                result_max_entries=_positive_int(
+                    enhanced.get("result_max_entries"),
+                    key="enhanced.result_max_entries",
+                    default=8,
+                ),
+                correction_model=_str(
+                    correction.get("model"), "Qwen/Qwen3.5-0.8B"
+                ),
+                correction_device=_str(correction.get("device"), XPU_DEVICE),
+                correction_dtype=_str(correction.get("dtype"), "bf16"),
+                correction_max_source_characters=_positive_int(
+                    correction.get("max_source_characters"),
+                    key="correction.max_source_characters",
+                    default=512,
+                ),
+                correction_max_new_tokens=_positive_int(
+                    correction.get("max_new_tokens"),
+                    key="correction.max_new_tokens",
+                    default=512,
+                ),
+                correction_timeout_seconds=_positive_int(
+                    correction.get("timeout_seconds"),
+                    key="correction.timeout_seconds",
+                    default=30,
+                ),
+                correction_protected_terms=_protected_terms(
+                    correction.get("protected_terms")
+                ),
+                correction_enable_thinking=_bool(
+                    correction.get("enable_thinking"), False
+                ),
+                identity_enabled=_bool(speaker_identity.get("enabled"), False),
+                identity_device=_str(speaker_identity.get("device"), XPU_DEVICE),
             ),
-            result_max_entries=_positive_int(
-                enhanced.get("result_max_entries"),
-                key="enhanced.result_max_entries",
-                default=8,
-            ),
-            correction_model=_str(
-                correction.get("model"), "Qwen/Qwen3.5-0.8B"
-            ),
-            correction_device=_str(correction.get("device"), XPU_DEVICE),
-            correction_dtype=_str(correction.get("dtype"), "bf16"),
-            correction_max_source_characters=_positive_int(
-                correction.get("max_source_characters"),
-                key="correction.max_source_characters",
-                default=512,
-            ),
-            correction_max_new_tokens=_positive_int(
-                correction.get("max_new_tokens"),
-                key="correction.max_new_tokens",
-                default=512,
-            ),
-            correction_timeout_seconds=_positive_int(
-                correction.get("timeout_seconds"),
-                key="correction.timeout_seconds",
-                default=30,
-            ),
-            correction_protected_terms=_protected_terms(
-                correction.get("protected_terms")
-            ),
-            correction_enable_thinking=_bool(
-                correction.get("enable_thinking"), False
-            ),
-            identity_enabled=_bool(speaker_identity.get("enabled"), False),
-            identity_device=_str(speaker_identity.get("device"), XPU_DEVICE),
+            correction_device=XPU_DEVICE,
+            correction_dtype="bf16",
+            identity_device=XPU_DEVICE,
         )
     )
     overlay_config = validate_overlay_config(

@@ -40,6 +40,9 @@ _TIMING_FIELDS: Final = frozenset(
 _ENUM_FIELDS: Final = frozenset(
     {
         "asr_profile",
+        "asr_preload",
+        "asr_warmup",
+        "asr_preload_profile",
         "nano_preload",
         "nano_warmup",
         "correction",
@@ -54,6 +57,10 @@ _ENUM_FIELDS: Final = frozenset(
     }
 )
 _ALLOWED_ASR_PROFILES: Final = frozenset({"nano", "sensevoice"})
+_ALLOWED_ASR_PRELOAD: Final = frozenset(
+    {"not_requested", "scheduled", "ready", "failed"}
+)
+_ALLOWED_ASR_WARMUP: Final = frozenset({"not_requested", "ready", "failed"})
 _ALLOWED_NANO_PRELOAD: Final = frozenset(
     {"not_requested", "scheduled", "ready", "failed"}
 )
@@ -132,8 +139,11 @@ class SessionMetric:
     commit_ms: int | None = None
     end_to_end_ms: int | None = None
     asr_profile: str | None = None
-    nano_preload: str = "not_requested"
-    nano_warmup: str = "not_requested"
+    asr_preload: str | None = None
+    asr_warmup: str | None = None
+    asr_preload_profile: str | None = None
+    nano_preload: str | None = None
+    nano_warmup: str | None = None
     correction: str = "disabled"
     correction_rejection: str | None = None
     error_code: str | None = None
@@ -197,6 +207,9 @@ class MetricsLedger:
 
         for field in (
             "asr_profile",
+            "asr_preload",
+            "asr_warmup",
+            "asr_preload_profile",
             "nano_preload",
             "nano_warmup",
             "correction",
@@ -233,6 +246,21 @@ class MetricsLedger:
             and updates["asr_profile"] not in _ALLOWED_ASR_PROFILES
         ):
             raise ValueError("invalid asr_profile")
+        if (
+            "asr_preload" in updates
+            and updates["asr_preload"] not in _ALLOWED_ASR_PRELOAD
+        ):
+            raise ValueError("invalid asr_preload")
+        if (
+            "asr_warmup" in updates
+            and updates["asr_warmup"] not in _ALLOWED_ASR_WARMUP
+        ):
+            raise ValueError("invalid asr_warmup")
+        if (
+            "asr_preload_profile" in updates
+            and updates["asr_preload_profile"] not in _ALLOWED_ASR_PROFILES
+        ):
+            raise ValueError("invalid asr_preload_profile")
         if (
             "nano_preload" in updates
             and updates["nano_preload"] not in _ALLOWED_NANO_PRELOAD

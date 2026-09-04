@@ -1,4 +1,4 @@
-"""Conservative process-level lease for serial ASR and Qwen XPU use."""
+"""Conservative process-level lease for serial ASR and Qwen accelerator use."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from typing import Literal
 AsrProfile = Literal["nano", "sensevoice"]
 
 
-class XpuLeaseCoordinator:
-    """Permit Qwen only after the profile that produced ASR has stopped.
+class ModelLeaseCoordinator:
+    """Permit Qwen only after ASR has yielded the selected accelerator.
 
     The supplied callback must return ``True`` only after systemd has observed
     that the exact template instance is inactive.  There is intentionally no
-    optimistic VRAM probe or fallback model path.
+    optimistic selected-accelerator probe or fallback model path.
     """
 
     def __init__(self, *, stop_service: Callable[[AsrProfile], bool]) -> None:

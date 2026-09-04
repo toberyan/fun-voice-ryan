@@ -10,6 +10,7 @@ on every path.
 from __future__ import annotations
 
 import signal
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from fun_voice import config
 from fun_voice import daemon as daemon_mod
 from fun_voice.capture import CaptureConfig, CaptureError
 from fun_voice.config import Config
@@ -30,6 +32,7 @@ from fun_voice.contracts import (
     ErrorCode,
     FocusSnapshot,
     PreloadTiming,
+    SessionKey,
     Transcription,
     WorkerHealth,
 )
@@ -59,7 +62,8 @@ from fun_voice.desktop import (
 )
 from fun_voice.fcitx import FcitxClient, FcitxCommitError
 from fun_voice.overlay import OverlayModel
-from fun_voice.scheduler import ModelLifecycle, XpuScheduler
+from fun_voice.runtime_selection import RuntimeSelection, RuntimeSelectionError
+from fun_voice.scheduler import ModelLifecycle, ModelScheduler
 
 ARTIFACT = CaptureArtifact(
     audio="/proc/self/fd/3", sample_rate=16000, channels=1, format="s16le",
@@ -246,6 +250,15 @@ class FakeWorker:
             raise self.error
         return self.result or Transcription(text=self.text, segments=())
 
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
+
     def close(self) -> None:
         self.closed = True
 
@@ -292,12 +305,14 @@ class Harness:
         fallback_worker: FakeWorker | None = None,
         corrector: FakeCorrector | None = None,
         overlay: FakeOverlay | None = None,
-        xpu_lease: AllowingLease | RejectingLease | None = None,
+        model_lease: AllowingLease | RejectingLease | None = None,
         nano_preloader: Callable[[], PreloadTiming | None] | None = None,
+        asr_preloader: Callable[[], PreloadTiming | None] | None = None,
+        primary_asr_profile: str = "nano",
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         capture_config: CaptureConfig | None = None,
-        scheduler: XpuScheduler | None = None,
+        scheduler: ModelScheduler | None = None,
     ) -> None:
         self.guard = guard if guard is not None else FakeGuard()
         self.recorder = recorder if recorder is not None else FakeRecorder()
@@ -331,12 +346,14 @@ class Harness:
             fallback_worker=fallback_worker,
             corrector=self.corrector,
             overlay=self.overlay,
-            xpu_lease=(
-                xpu_lease if xpu_lease is not None else AllowingLease()
+            model_lease=(
+                model_lease if model_lease is not None else AllowingLease()
                 if corrector is not None
                 else None
             ),
             nano_preloader=nano_preloader,
+            asr_preloader=asr_preloader,
+            primary_asr_profile=primary_asr_profile,  # type: ignore[arg-type]
             monotonic=monotonic if monotonic is not None else time.monotonic,
             sleep=sleep if sleep is not None else time.sleep,
             capture_config=(
@@ -353,6 +370,212 @@ class Harness:
 
 def _started(harness: Harness) -> None:
     assert harness.daemon.start_if_idle() == "started"
+
+
+def _cpu_selection() -> RuntimeSelection:
+    return RuntimeSelection(
+        schema_version=1,
+        backend="cpu",
+        python=Path("/runtime/cpu/bin/python"),
+        device="cpu",
+        dtype="float32",
+        primary_asr_profile="sensevoice",
+        fallback_asr_profile=None,
+        enhanced_enabled=False,
+        speaker_enabled=False,
+        model_revisions={"sensevoice": "master", "vad": "master"},
+        probe_status="pass",
+        selected_at=1,
+    )
+
+
+def _accelerator_selection() -> RuntimeSelection:
+    return RuntimeSelection(
+        schema_version=1,
+        backend="xpu",
+        python=Path("/runtime/xpu/bin/python"),
+        device="xpu:0",
+        dtype="bf16",
+        primary_asr_profile="nano",
+        fallback_asr_profile="sensevoice",
+        enhanced_enabled=True,
+        speaker_enabled=True,
+        model_revisions={
+            "nano": "master",
+            "sensevoice": "master",
+            "vad": "master",
+            "qwen": "master",
+            "campplus": "master",
+        },
+        probe_status="pass",
+        selected_at=1,
+    )
+
+
+class _PolicyWorker(FakeWorker):
+    def preload(self) -> PreloadTiming:
+        return PreloadTiming()
+
+    def health(self) -> WorkerHealth:
+        return WorkerHealth(
+            version="test",
+            xpu_ready=False,
+            model_ready=False,
+            device="cpu",
+            lifecycle="inactive",
+        )
+
+
+def _recording_worker_factory(
+    created_workers: list[tuple[str, Path]], worker: _PolicyWorker
+) -> Callable[..., _PolicyWorker]:
+    def factory(*_args: object, **kwargs: object) -> _PolicyWorker:
+        profile = kwargs.get("profile")
+        socket_path = kwargs.get("socket_path")
+        assert isinstance(profile, str)
+        assert isinstance(socket_path, Path)
+        created_workers.append((profile, socket_path))
+        return worker
+
+    return factory
+
+
+def _daemon_dependencies(fcitx: FakeFcitx) -> object:
+    started_profiles: set[str] = set()
+
+    def start_worker(profile: str) -> bool:
+        started_profiles.add(profile)
+        return True
+
+    def health_worker(profile: str) -> ModelLifecycle:
+        return (
+            ModelLifecycle.READY
+            if profile in started_profiles
+            else ModelLifecycle.INACTIVE
+        )
+
+    paths = config.RuntimePaths(
+        runtime_dir=Path("/runtime"),
+        worker_socket=Path("/runtime/worker.sock"),
+        daemon_socket=Path("/runtime/daemon.sock"),
+        fcitx_socket=Path("/runtime/fcitx.sock"),
+    )
+    return daemon_mod.DaemonDependencies(
+        paths=paths,
+        guard=FakeGuard(),
+        recorder=FakeRecorder(),
+        fcitx_factory=lambda: fcitx,
+        clipboard=FakeClipboard(),
+        injector=FakeInjector(),
+        notifier=FakeNotifier(),
+        overlay=FakeOverlay(),
+        start_worker_service=start_worker,
+        stop_worker_service=lambda _profile: True,
+        health_worker_profile=health_worker,
+        capture_config=CaptureConfig(),
+    )
+
+
+def _must_not_construct(*_args: object, **_kwargs: object) -> object:
+    raise AssertionError("Qwen must not be constructed for a CPU runtime")
+
+
+def test_daemon_cpu_registers_only_sensevoice_and_never_constructs_qwen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_workers: list[tuple[str, Path]] = []
+    worker = _PolicyWorker()
+    monkeypatch.setattr(
+        daemon_mod,
+        "SocketWorkerClient",
+        _recording_worker_factory(created_workers, worker),
+    )
+    monkeypatch.setattr(daemon_mod, "OnDemandQwenCorrector", _must_not_construct)
+
+    daemon = daemon_mod.build_voice_daemon(
+        _daemon_dependencies(FakeFcitx()), selection=_cpu_selection()
+    )
+    try:
+        assert created_workers == [
+            ("sensevoice", Path("/runtime/worker-sensevoice.sock"))
+        ]
+        assert daemon._fallback_worker is None  # noqa: SLF001 - policy boundary
+        assert daemon._corrector is None  # noqa: SLF001 - policy boundary
+        assert daemon._scheduler._allowed_profiles == (  # noqa: SLF001 - policy boundary
+            "sensevoice",
+        )
+    finally:
+        daemon.shutdown()
+
+
+def test_cpu_asr_commits_raw_text_without_correction_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_workers: list[tuple[str, Path]] = []
+    worker = _PolicyWorker(text="get commit")
+    fcitx = FakeFcitx()
+    monkeypatch.setattr(
+        daemon_mod,
+        "SocketWorkerClient",
+        _recording_worker_factory(created_workers, worker),
+    )
+    monkeypatch.setattr(daemon_mod, "OnDemandQwenCorrector", _must_not_construct)
+
+    daemon = daemon_mod.build_voice_daemon(
+        _daemon_dependencies(fcitx), selection=_cpu_selection()
+    )
+    try:
+        assert daemon.start_if_idle() == "started"
+        daemon.stop()
+        assert fcitx.commits == [("tok-123", "get commit")]
+        assert [profile for profile, _path in created_workers] == ["sensevoice"]
+    finally:
+        daemon.shutdown()
+
+
+def test_daemon_accelerator_uses_distinct_nano_and_sensevoice_sockets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_workers: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        daemon_mod,
+        "SocketWorkerClient",
+        _recording_worker_factory(created_workers, _PolicyWorker()),
+    )
+
+    daemon = daemon_mod.build_voice_daemon(
+        _daemon_dependencies(FakeFcitx()), selection=_accelerator_selection()
+    )
+    try:
+        assert created_workers == [
+            ("nano", Path("/runtime/worker.sock")),
+            ("sensevoice", Path("/runtime/worker-sensevoice.sock")),
+        ]
+    finally:
+        daemon.shutdown()
+
+
+def test_daemon_clients_leave_service_start_to_the_model_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client_options: list[dict[str, object]] = []
+
+    def worker_factory(*_args: object, **kwargs: object) -> _PolicyWorker:
+        client_options.append(dict(kwargs))
+        return _PolicyWorker()
+
+    monkeypatch.setattr(daemon_mod, "SocketWorkerClient", worker_factory)
+
+    daemon = daemon_mod.build_voice_daemon(
+        _daemon_dependencies(FakeFcitx()), selection=_accelerator_selection()
+    )
+    try:
+        assert [options["auto_start_service"] for options in client_options] == [
+            False,
+            False,
+        ]
+    finally:
+        daemon.shutdown()
 
 
 # --- State machine -----------------------------------------------------------
@@ -393,10 +616,16 @@ def test_start_notifies_recording() -> None:
 def test_cold_start_shows_preparing_until_nano_preload_finishes() -> None:
     preload_started = threading.Event()
     release_preload = threading.Event()
-    scheduler = XpuScheduler(
-        start_profile=lambda _profile: True,
+    profiles = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
+    scheduler = ModelScheduler(
+        start_profile=lambda profile: (
+            profiles.__setitem__(profile, ModelLifecycle.READY) or True
+        ),
         stop_profile=lambda _profile: True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+        health_profile=lambda profile: profiles[profile],
     )
 
     def preload() -> None:
@@ -506,7 +735,9 @@ def test_worker_stop_confirms_inactive_before_qwen(
 
     monkeypatch.setattr(daemon_mod.subprocess, "run", run)
 
-    assert daemon_mod.default_stop_worker_service("nano") is True
+    assert daemon_mod.default_stop_worker_service(
+        "nano", selection=_accelerator_selection()
+    ) is True
     assert calls == [
         ["systemctl", "--user", "stop", "fun-voice-worker@nano.service"],
         [
@@ -518,6 +749,87 @@ def test_worker_stop_confirms_inactive_before_qwen(
             "fun-voice-worker@nano.service",
         ],
     ]
+
+
+def test_default_service_helpers_fail_closed_when_selection_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(
+        daemon_mod,
+        "load_runtime_selection",
+        lambda: (_ for _ in ()).throw(RuntimeSelectionError("missing")),
+    )
+    monkeypatch.setattr(
+        daemon_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: calls.append(object()),
+    )
+
+    assert daemon_mod.default_start_worker_service("nano") is False
+    assert daemon_mod.default_stop_worker_service("nano") is False
+    assert daemon_mod.default_health_worker_profile("nano") is ModelLifecycle.UNKNOWN
+    assert calls == []
+
+
+@pytest.mark.parametrize("health_failure", ["timeout", "nonzero", "unknown"])
+def test_uncertain_worker_health_denies_qwen_after_asr_release(
+    monkeypatch: pytest.MonkeyPatch, health_failure: str
+) -> None:
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        if health_failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 5.0)
+        if health_failure == "nonzero":
+            return SimpleNamespace(returncode=1, stdout="")
+        return SimpleNamespace(returncode=0, stdout="unrecognized\n")
+
+    monkeypatch.setattr(daemon_mod.subprocess, "run", run)
+    scheduler = ModelScheduler(
+        stop_profile=lambda _profile: True,
+        health_profile=lambda profile: daemon_mod.default_health_worker_profile(
+            profile, selection=_accelerator_selection()
+        ),
+    )
+    key = SessionKey(session_id="health-uncertain", generation=1)
+    scheduler.activate(key)
+    qwen_calls: list[str] = []
+    try:
+        task = scheduler.run_correction(
+            key, "nano", lambda: qwen_calls.append("qwen")
+        )
+        assert task.wait(timeout=1.0)
+        assert qwen_calls == []
+        assert getattr(task.result(), "permitted", None) is False
+    finally:
+        scheduler.close()
+
+
+def test_confirmed_failed_worker_allows_qwen_after_asr_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        daemon_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="failed\n"),
+    )
+    scheduler = ModelScheduler(
+        stop_profile=lambda _profile: True,
+        health_profile=lambda profile: daemon_mod.default_health_worker_profile(
+            profile, selection=_accelerator_selection()
+        ),
+    )
+    key = SessionKey(session_id="health-confirmed-failed", generation=1)
+    scheduler.activate(key)
+    qwen_calls: list[str] = []
+    try:
+        task = scheduler.run_correction(
+            key, "nano", lambda: qwen_calls.append("qwen")
+        )
+        assert task.wait(timeout=1.0)
+        assert qwen_calls == ["qwen"]
+        assert getattr(task.result(), "permitted", None) is True
+    finally:
+        scheduler.close()
 
 
 def test_systemd_profile_supervisor_confirms_worker_health_after_stop() -> None:
@@ -551,6 +863,26 @@ def test_systemd_profile_supervisor_confirms_worker_health_after_stop() -> None:
     assert supervisor.health_profile("nano") is ModelLifecycle.INACTIVE
     assert started == ["nano"]
     assert stopped == ["nano"]
+
+
+def test_systemd_profile_supervisor_accepts_transport_before_lazy_model_load() -> None:
+    class LazyWorker:
+        def health(self) -> WorkerHealth:
+            return WorkerHealth(
+                version="test",
+                xpu_ready=False,
+                model_ready=False,
+                device="cpu",
+                lifecycle="inactive",
+            )
+
+    supervisor = daemon_mod.SystemdModelProfileSupervisor(
+        workers={"sensevoice": LazyWorker()},
+        service_lifecycle=lambda _profile: ModelLifecycle.READY,
+    )
+
+    assert supervisor.health_profile("sensevoice") is ModelLifecycle.READY
+    assert supervisor.transport_profile("sensevoice") is ModelLifecycle.READY
 
 
 def test_completed_session_metrics_contain_only_aggregate_stage_data() -> None:
@@ -603,6 +935,104 @@ def test_daemon_aggregates_worker_and_preload_stage_durations() -> None:
     assert report["asr_vad_ms"] == {"p50": 5, "p95": 5}
     assert report["asr_generate_ms"] == {"p50": 9, "p95": 9}
     assert "你好" not in repr(report)
+
+
+def test_primary_preload_and_final_asr_restart_after_worker_idle_exit() -> None:
+    preload_completed = threading.Event()
+    events: list[str] = []
+    health_states = iter(
+        (
+            ModelLifecycle.READY,
+            ModelLifecycle.READY,
+            ModelLifecycle.INACTIVE,
+            ModelLifecycle.READY,
+            ModelLifecycle.INACTIVE,
+            ModelLifecycle.READY,
+        )
+    )
+    scheduler = ModelScheduler(
+        allowed_profiles=("nano",),
+        start_profile=lambda profile: events.append(f"start:{profile}") or True,
+        stop_profile=lambda _profile: True,
+        health_profile=lambda profile: (
+            events.append(f"health:{profile}") or next(health_states)
+        ),
+    )
+
+    def preload() -> PreloadTiming:
+        events.append("preload")
+        preload_completed.set()
+        return PreloadTiming()
+
+    h = Harness(nano_preloader=preload, scheduler=scheduler)
+    try:
+        _started(h)
+        assert preload_completed.wait(timeout=2.0)
+        h.daemon.stop()
+        preload_completed.clear()
+
+        _started(h)
+        assert preload_completed.wait(timeout=2.0)
+        h.daemon.stop()
+
+        assert events == [
+            "health:nano",
+            "preload",
+            "health:nano",
+            "health:nano",
+            "start:nano",
+            "health:nano",
+            "preload",
+            "health:nano",
+            "start:nano",
+            "health:nano",
+        ]
+        assert [fcitx.commits for fcitx in h.fcitx_instances] == [
+            [("tok-123", "你好")],
+            [("tok-123", "你好")],
+        ]
+    finally:
+        scheduler.close()
+
+
+def test_sensevoice_primary_preload_uses_generic_asr_metrics_only() -> None:
+    completed_preload = threading.Event()
+
+    def preload() -> PreloadTiming:
+        completed_preload.set()
+        return PreloadTiming(warmup_status="ready")
+
+    h = Harness(
+        worker=FakeWorker(
+            transcription=Transcription(text="你好", segments=(), engine="sensevoice")
+        ),
+        asr_preloader=preload,
+        primary_asr_profile="sensevoice",
+    )
+    _started(h)
+    assert completed_preload.wait(timeout=2.0)
+    h.daemon.stop()
+
+    report = h.daemon.dispatch({"op": "metrics"})
+
+    assert report["asr_preload"] == {"ready": 1}
+    assert report["asr_warmup"] == {"ready": 1}
+    assert report["asr_preload_profile"] == {"sensevoice": 1}
+    assert "nano_preload" not in report
+    assert "nano_warmup" not in report
+
+
+def test_nano_primary_keeps_legacy_preload_metrics_for_compatible_consumers() -> None:
+    h = Harness()
+    _started(h)
+    h.daemon.stop()
+
+    report = h.daemon.dispatch({"op": "metrics"})
+
+    assert report["asr_preload"] == {"not_requested": 1}
+    assert report["asr_preload_profile"] == {"nano": 1}
+    assert report["nano_preload"] == {"not_requested": 1}
+    assert report["nano_warmup"] == {"not_requested": 1}
 
 
 def test_daemon_requests_nano_preload_only_after_capture_starts(
@@ -861,10 +1291,18 @@ def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> Non
             corrector_threads.append(threading.current_thread().name)
             return super().correct(raw_text)
 
-    scheduler = XpuScheduler(
-        start_profile=lambda _profile: True,
-        stop_profile=lambda _profile: True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+    profiles = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
+    scheduler = ModelScheduler(
+        start_profile=lambda profile: (
+            profiles.__setitem__(profile, ModelLifecycle.READY) or True
+        ),
+        stop_profile=lambda profile: (
+            profiles.__setitem__(profile, ModelLifecycle.INACTIVE) or True
+        ),
+        health_profile=lambda profile: profiles[profile],
     )
     h = Harness(
         worker=ThreadWorker(text="get commit"),
@@ -875,8 +1313,8 @@ def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> Non
         _started(h)
         h.daemon.stop()
 
-        assert worker_threads == ["fun-voice-xpu-scheduler"]
-        assert corrector_threads == ["fun-voice-xpu-scheduler"]
+        assert worker_threads == ["fun-voice-model-scheduler"]
+        assert corrector_threads == ["fun-voice-model-scheduler"]
         assert h.clipboard.writes == ["git commit"]
     finally:
         scheduler.close()
@@ -885,10 +1323,25 @@ def test_daemon_routes_asr_and_qwen_through_the_single_scheduler_thread() -> Non
 def test_daemon_routes_model_load_fallback_through_scheduler_profile_switch() -> None:
     starts: list[str] = []
     stops: list[str] = []
-    scheduler = XpuScheduler(
-        start_profile=lambda profile: starts.append(profile) or True,
-        stop_profile=lambda profile: stops.append(profile) or True,
-        health_profile=lambda _profile: ModelLifecycle.INACTIVE,
+    profiles = {
+        "nano": ModelLifecycle.INACTIVE,
+        "sensevoice": ModelLifecycle.INACTIVE,
+    }
+
+    def start(profile: str) -> bool:
+        starts.append(profile)
+        profiles[profile] = ModelLifecycle.READY
+        return True
+
+    def stop(profile: str) -> bool:
+        stops.append(profile)
+        profiles[profile] = ModelLifecycle.INACTIVE
+        return True
+
+    scheduler = ModelScheduler(
+        start_profile=start,
+        stop_profile=stop,
+        health_profile=lambda profile: profiles[profile],
     )
     fallback = FakeWorker(text="备用结果")
     h = Harness(
@@ -927,7 +1380,7 @@ def test_daemon_skips_qwen_and_commits_raw_when_release_is_unconfirmed() -> None
     h = Harness(
         worker=FakeWorker(text="get commit"),
         corrector=corrector,
-        xpu_lease=RejectingLease(),
+        model_lease=RejectingLease(),
     )
 
     _started(h)
