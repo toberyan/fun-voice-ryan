@@ -757,6 +757,41 @@ def test_loaded_sensevoice_health_rechecks_vad_selected_dtype() -> None:
     assert runtime.health().model_ready is False
 
 
+def test_sensevoice_runtime_decodes_raw_pcm_before_model_generate(
+    tmp_path: Path,
+) -> None:
+    """Captured s16le PCM must reach FunASR as 16 kHz float samples."""
+    raw_pcm = tmp_path / "captured.pcm"
+    raw_pcm.write_bytes(np.array([-32768, 0, 16384], dtype=np.int16).tobytes())
+    parameter = SimpleNamespace(
+        device=SimpleNamespace(type="cpu"),
+        dtype="torch.float32",
+        is_floating_point=lambda: True,
+    )
+    captured: list[object] = []
+
+    def generate(*, input: object) -> list[dict[str, str]]:
+        captured.append(input)
+        return [{"key": "sample_0", "text": "ok"}]
+
+    model = SimpleNamespace(
+        parameters=lambda: iter([parameter]),
+        vad_model=SimpleNamespace(parameters=lambda: iter([parameter])),
+        generate=generate,
+    )
+    runtime = nano_mod.SenseVoiceRuntime(model, selection=_selection("cpu"))
+
+    transcription = runtime.transcribe(str(raw_pcm), sample_rate=16000)
+
+    assert transcription.text == "ok"
+    assert len(captured) == 1
+    assert isinstance(captured[0], np.ndarray)
+    np.testing.assert_allclose(
+        captured[0],
+        np.array([-1.0, 0.0, 0.5], dtype=np.float32),
+    )
+
+
 def test_nano_loader_rejects_cpu_selection_before_model_import(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

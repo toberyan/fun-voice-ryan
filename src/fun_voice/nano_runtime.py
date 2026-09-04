@@ -954,7 +954,7 @@ class SenseVoiceRuntime:
     def transcribe(
         self, audio: str, *, sample_rate: int = 16000, timeout: float | None = None
     ) -> Transcription:
-        del sample_rate, timeout
+        del timeout
         if self._closed:
             raise ModelLoadError("SenseVoiceSmall runtime is closed")
         try:
@@ -963,7 +963,13 @@ class SenseVoiceRuntime:
                 expected=self.expected_device_type,
                 expected_dtype=self.dtype,
             )
-            results = self._model.generate(input=audio)
+            # PipeWire capture is raw s16le PCM in an anonymous memory-backed
+            # file.  FunASR treats a string input as a container path and
+            # delegates decoding to ffmpeg, which cannot infer raw PCM's
+            # format.  Passing 16 kHz float samples is an official AutoModel
+            # input form and keeps the complete capture-to-ASR path in memory.
+            samples = _load_audio_samples(audio, sample_rate)
+            results = self._model.generate(input=samples)
         except NanoRuntimeError as exc:
             self.last_error = exc.error_code
             raise
